@@ -1,20 +1,16 @@
 
 use super::Effect;
-use crate::engine::character::CharacterId;
-use crate::engine::terminal::Terminal;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{
+    CharacterId, CharacterVisual, EffectCharacter, Frame, Scene, Terminal,
+};
+use crate::utils::{Color, Gradient, Style};
 
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Sweep;
 
 impl Sweep {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for Sweep {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -24,98 +20,111 @@ impl Effect for Sweep {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let lines: Vec<Vec<char>> = input
+            .lines()
+            .map(|line| line.trim_end_matches('\r').chars().collect())
+            .collect();
 
-        if terminal.characters().is_empty() {
+        let width = lines.iter().map(Vec::len).max().unwrap_or(0);
+        let height = lines.len();
+
+        if width == 0 || height == 0 {
             return Vec::new();
         }
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
-        }
+        let final_colors = Gradient::new(
+            [
+                Color::new(0x8a, 0x00, 0x8a),
+                Color::new(0x00, 0xd1, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+            ],
+            8,
+        )
+        .colors();
 
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let mut columns = vec![Vec::<CharacterId>::new(); width];
+        let sweep_color = Color::new(0xff, 0xff, 0xff);
+        let sweep_symbols = ["█", "▓", "▒", "░"];
+        let mut terminal = Terminal::new(width, height);
+        let mut column_groups = vec![Vec::new(); width];
+        let mut character_index = 0usize;
 
-        for character in terminal.characters() {
-            if character.position.x >= 0 {
-                let column = character.position.x as usize;
-                if column < width {
-                    columns[column].push(character.id);
-                }
-            }
-        }
-
-        let mut frames = Vec::with_capacity(width.saturating_mul(2));
-
-        // The first sweep reveals the text in a bright, uniform color.
-        for column in 0..width {
-            for id in columns[column].iter().copied() {
-                if let Some(character) = terminal.character_mut(id) {
-                    character.visible = true;
-                    character.set_appearance(
-                        character.input_symbol,
-                        Style::default().with_foreground(Color::rgb(255, 255, 255)),
-                    );
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        // The return sweep applies the final vertical gradient.
-        for column in (0..width).rev() {
-            for id in columns[column].iter().copied() {
-                let Some(position) = terminal.character(id).map(|character| character.position)
-                else {
-                    continue;
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.iter().enumerate() {
+                let final_color_index = if height <= 1 || final_colors.len() <= 1 {
+                    0
+                } else {
+                    let inverted_row = height - 1 - row;
+                    inverted_row * (final_colors.len() - 1) / (height - 1)
                 };
+                let final_color = final_colors[final_color_index];
 
-                let color = final_gradient_color(position.y, height);
+                let sweep_colors =
+                    Gradient::new([sweep_color, final_color], sweep_symbols.len())
+                        .colors();
 
-                if let Some(character) = terminal.character_mut(id) {
-                    character.set_appearance(
-                        character.input_symbol,
-                        Style::default().with_foreground(color),
-                    );
+                let mut scene = Scene::new("sweep", false);
+
+                for (sweep_symbol, color) in
+                    sweep_symbols.iter().zip(sweep_colors.iter())
+                {
+                    scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            *sweep_symbol,
+                            Style {
+                                foreground: Some(*color),
+                                ..Style::default()
+                            },
+                        ),
+                        5,
+                    ));
                 }
+
+                scene.add_frame(Frame::new(
+                    CharacterVisual::new(
+                        symbol.to_string(),
+                        Style {
+                            foreground: Some(final_color),
+                            ..Style::default()
+                        },
+                    ),
+                    1,
+                ));
+
+                let mut character = EffectCharacter::new(
+                    CharacterId(character_index as u32),
+                    symbol.to_string(),
+                    crate::utils::Coord::new(column as i32, row as i32),
+                );
+                character.visible = false;
+                character.animation.add_scene(scene);
+
+                terminal.add_character(character);
+                column_groups[column].push(character_index);
+                character_index += 1;
+            }
+        }
+
+        let mut frames = Vec::new();
+        let mut next_group = 0usize;
+
+        while next_group < column_groups.len()
+            || terminal.has_active_characters()
+        {
+            if let Some(group) = column_groups.get(next_group) {
+                let characters = terminal.characters_mut();
+
+                for &index in group {
+                    let character = &mut characters[index];
+                    character.visible = true;
+                    character.animation.activate("sweep");
+                }
+
+                next_group += 1;
             }
 
-            frames.push(terminal.render_frame());
+            frames.push(terminal.step_frame());
         }
 
         frames
     }
-}
-
-fn final_gradient_color(row: i32, height: usize) -> Color {
-    const PURPLE: (u8, u8, u8) = (138, 0, 138);
-    const CYAN: (u8, u8, u8) = (0, 209, 255);
-    const WHITE: (u8, u8, u8) = (255, 255, 255);
-
-    if height <= 1 {
-        return Color::rgb(CYAN.0, CYAN.1, CYAN.2);
-    }
-
-    // Canvas rows increase downward. Reversing the ratio places white at the
-    // top and purple at the bottom, matching the vertical final gradient.
-    let ratio = 1.0 - (row.max(0) as f64 / (height - 1) as f64).clamp(0.0, 1.0);
-
-    let (start, end, progress) = if ratio < 0.5 {
-        (PURPLE, CYAN, ratio * 2.0)
-    } else {
-        (CYAN, WHITE, (ratio - 0.5) * 2.0)
-    };
-
-    Color::rgb(
-        interpolate_channel(start.0, end.0, progress),
-        interpolate_channel(start.1, end.1, progress),
-        interpolate_channel(start.2, end.2, progress),
-    )
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

@@ -1,23 +1,80 @@
 
+use std::collections::VecDeque;
+
 use super::Effect;
-use crate::engine::Terminal;
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
-const OVERFLOW_CYCLES: usize = 2;
-const OVERFLOW_SPEED: usize = 3;
-const GRADIENT_STOPS: [(u8, u8, u8); 3] = [
-    (0xf2, 0xeb, 0xc0),
-    (0x8d, 0xbf, 0xb3),
-    (0xf2, 0xeb, 0xc0),
-];
-
-#[derive(Debug, Clone)]
 pub struct Overflow;
 
 impl Overflow {
     pub fn new() -> Self {
         Self
+    }
+
+    fn render_rows(
+        rows: &VecDeque<Vec<String>>,
+        width: usize,
+        height: usize,
+        colors: &[Color],
+    ) -> String {
+        let mut canvas = Canvas::new(width, height);
+        let empty_row = vec![" ".to_owned(); width];
+
+        for screen_row in 0..height {
+            let row = rows.get(screen_row).unwrap_or(&empty_row);
+            let color = colors
+                .get(screen_row)
+                .copied()
+                .or_else(|| colors.last().copied())
+                .unwrap_or(Color::new(255, 255, 255));
+
+            let style = Style {
+                foreground: Some(color),
+                ..Style::default()
+            };
+
+            for column in 0..width {
+                let symbol = row.get(column).map(String::as_str).unwrap_or(" ");
+                canvas.set(
+                    Coord::new(column as i32, screen_row as i32),
+                    symbol,
+                    style,
+                );
+            }
+        }
+
+        canvas.render()
+    }
+
+    fn parse_rows(input: &str) -> (Vec<Vec<String>>, usize) {
+        let mut lines: Vec<&str> = input.lines().collect();
+
+        if lines.is_empty() {
+            lines.push("");
+        }
+
+        let width = lines
+            .iter()
+            .map(|line| line.trim_end_matches('\r').chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+
+        let rows = lines
+            .into_iter()
+            .map(|line| {
+                let mut row = line
+                    .trim_end_matches('\r')
+                    .chars()
+                    .map(|character| character.to_string())
+                    .collect::<Vec<_>>();
+                row.resize(width, " ".to_owned());
+                row
+            })
+            .collect();
+
+        (rows, width)
     }
 }
 
@@ -33,151 +90,83 @@ impl Effect for Overflow {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let rows = input_rows(input);
-        let width = rows
-            .iter()
-            .map(|row| row.len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let height = rows.len().max(1);
+        let (source_rows, width) = Self::parse_rows(input);
+        let height = source_rows.len().max(1);
 
-        let mut pending_rows = Vec::with_capacity(height * (OVERFLOW_CYCLES + 1));
-        let mut random_state = seed_from_input(input);
+        let overflow_colors = Gradient::new(
+            [
+                Color::new(242, 235, 192),
+                Color::new(141, 191, 179),
+                Color::new(82, 148, 168),
+                Color::new(242, 235, 192),
+            ],
+            height,
+        )
+        .colors();
 
-        for _ in 0..OVERFLOW_CYCLES {
-            let mut shuffled = rows.clone();
-            shuffle(&mut shuffled, &mut random_state);
-            pending_rows.extend(shuffled);
-        }
+        let final_colors = Gradient::new(
+            [
+                Color::new(138, 0, 138),
+                Color::new(0, 209, 255),
+                Color::new(255, 255, 255),
+            ],
+            height,
+        )
+        .colors();
 
-        // The final pass is not shuffled, allowing the original text to settle
-        // into its proper row order.
-        pending_rows.extend(rows);
-
-        let mut active_rows: Vec<ActiveRow> = Vec::with_capacity(height);
+        let blank_row = vec![" ".to_owned(); width];
+        let mut visible_rows =
+            VecDeque::from(vec![blank_row; height]);
         let mut frames = Vec::new();
 
-        for row in pending_rows {
-            for active_row in &mut active_rows {
-                active_row.y -= 1;
-            }
-            active_rows.retain(|active_row| active_row.y >= 0);
+        // Feed several copies upward through the canvas. The final copy is kept
+        // in its original order so the animation settles on the source text.
+        for cycle in 0..3 {
+            for offset in 0..height {
+                let source_index = if cycle < 2 {
+                    (offset + cycle) % height
+                } else {
+                    offset
+                };
 
-            active_rows.push(ActiveRow {
-                symbols: row,
-                y: height as i32 - 1,
-            });
+                visible_rows.pop_front();
+                visible_rows.push_back(source_rows[source_index].clone());
 
-            let frame = render_rows(width, height, &active_rows);
+                let shifted_colors = (0..height)
+                    .map(|row| {
+                        let index = (row + cycle + offset) % height;
+                        overflow_colors[index]
+                    })
+                    .collect::<Vec<_>>();
 
-            // Overflow speed controls the time between row advances.
-            for _ in 0..OVERFLOW_SPEED {
-                frames.push(frame.clone());
+                frames.push(Self::render_rows(
+                    &visible_rows,
+                    width,
+                    height,
+                    &shifted_colors,
+                ));
             }
         }
 
-        if frames.is_empty() {
-            frames.push(Terminal::new(width, height).render_frame());
+        // Fade the moving overflow palette into the final vertical gradient.
+        let transition_steps = 8;
+        for step in 1..=transition_steps {
+            let progress = step as f64 / transition_steps as f64;
+            let colors = (0..height)
+                .map(|row| {
+                    overflow_colors[row]
+                        .lerp(final_colors[row], progress)
+                })
+                .collect::<Vec<_>>();
+
+            frames.push(Self::render_rows(
+                &visible_rows,
+                width,
+                height,
+                &colors,
+            ));
         }
 
         frames
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ActiveRow {
-    symbols: Vec<char>,
-    y: i32,
-}
-
-fn input_rows(input: &str) -> Vec<Vec<char>> {
-    if input.is_empty() {
-        vec![Vec::new()]
-    } else {
-        input.lines().map(|line| line.chars().collect()).collect()
-    }
-}
-
-fn render_rows(width: usize, height: usize, rows: &[ActiveRow]) -> String {
-    let mut terminal = Terminal::new(width, height);
-
-    for row in rows {
-        if row.y < 0 || row.y >= height as i32 {
-            continue;
-        }
-
-        let color = gradient_color(row.y as usize, height);
-        let style = Style::default().with_foreground(color);
-
-        for (x, symbol) in row.symbols.iter().copied().enumerate() {
-            if x >= width {
-                break;
-            }
-
-            let id = terminal.add_character(symbol, Coord::new(x as i32, row.y));
-            if let Some(character) = terminal.character_mut(id) {
-                character.set_style(style.clone());
-            }
-        }
-    }
-
-    terminal.render_frame()
-}
-
-fn gradient_color(row: usize, height: usize) -> Color {
-    if height <= 1 {
-        let (r, g, b) = GRADIENT_STOPS[0];
-        return Color::rgb(r, g, b);
-    }
-
-    let progress = row as f64 / (height - 1) as f64;
-    let scaled = progress * (GRADIENT_STOPS.len() - 1) as f64;
-    let start_index = (scaled.floor() as usize).min(GRADIENT_STOPS.len() - 2);
-    let local_progress = scaled - start_index as f64;
-
-    let start = GRADIENT_STOPS[start_index];
-    let end = GRADIENT_STOPS[start_index + 1];
-
-    Color::rgb(
-        interpolate(start.0, end.0, local_progress),
-        interpolate(start.1, end.1, local_progress),
-        interpolate(start.2, end.2, local_progress),
-    )
-}
-
-fn interpolate(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress;
-    value.round().clamp(0.0, 255.0) as u8
-}
-
-fn seed_from_input(input: &str) -> u64 {
-    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
-
-    for byte in input.bytes() {
-        seed ^= u64::from(byte);
-        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    if seed == 0 {
-        0x9e37_79b9_7f4a_7c15
-    } else {
-        seed
-    }
-}
-
-fn next_random(state: &mut u64) -> u64 {
-    let mut value = *state;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    *state = value;
-    value
-}
-
-fn shuffle<T>(values: &mut [T], state: &mut u64) {
-    for upper in (1..values.len()).rev() {
-        let index = (next_random(state) % (upper as u64 + 1)) as usize;
-        values.swap(upper, index);
     }
 }

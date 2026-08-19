@@ -1,8 +1,10 @@
 
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{
+    Canvas, CharacterId, CharacterVisual, EffectCharacter, Frame, Path, Scene,
+    Waypoint,
+};
+use crate::utils::{Color, Coord, Gradient, Style};
 
 pub struct Binarypath;
 
@@ -24,288 +26,304 @@ impl Effect for Binarypath {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-
-        let source_characters = terminal
-            .characters()
+        let lines: Vec<Vec<char>> = input.lines().map(|line| line.chars().collect()).collect();
+        let width = lines
             .iter()
-            .map(|character| {
-                (
-                    character.id,
-                    character.input_symbol,
-                    character.position,
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
 
-        if source_characters.is_empty() {
-            return vec![terminal.render_frame()];
-        }
+        let final_colors = Gradient::new(
+            [
+                Color::new(0x00, 0xd5, 0x00),
+                Color::new(0x00, 0xff, 0x88),
+                Color::new(0x00, 0xbb, 0xff),
+            ],
+            width.saturating_add(height).saturating_sub(1).max(1),
+        )
+        .colors();
 
-        let mut seed = seed_from_input(input);
-        let mut groups = Vec::with_capacity(source_characters.len());
+        let mut particles = Vec::new();
 
-        for (source_id, source_symbol, destination) in source_characters {
-            let final_style = final_style(destination, width, height);
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.iter().copied().enumerate() {
+                let target = Coord::new(column as i32, row as i32);
+                let id = particles.len() as u32;
+                let seed = mix_seed(
+                    id as u64
+                        ^ ((column as u64) << 21)
+                        ^ ((row as u64) << 42)
+                        ^ symbol as u64,
+                );
+                let start = starting_coord(seed, target, width, height);
+                let final_color = final_colors[(column + row) % final_colors.len()];
 
-            if let Some(source) = terminal.character_mut(source_id) {
-                source.visible = false;
-                source.set_appearance(source_symbol, final_style);
-            }
+                let mut character =
+                    EffectCharacter::new(CharacterId(id), binary_digit(symbol, id), start);
+                character.visible = false;
+                character.style = binary_style(Color::new(0x00, 0xff, 0x55));
 
-            let route = make_route(destination, width, height, &mut seed);
-            let binary_string = format!("{:08b}", source_symbol as u32);
-            let mut bit_ids = Vec::with_capacity(binary_string.len());
+                let mut path = Path::new("binary_path", 1.0);
+                add_binary_waypoints(&mut path, seed, start, target, width, height);
+                character.motion.add_path(path);
 
-            for bit in binary_string.chars() {
-                let bit_id = terminal.add_character(bit, route[0]);
+                let mut transition = Scene::new("resolve", false);
+                let active_color = Color::new(0xe0, 0xff, 0xe0);
 
-                if let Some(character) = terminal.character_mut(bit_id) {
-                    character.visible = false;
-                    character.set_appearance(bit, binary_style(bit));
+                for step in 0..8 {
+                    let progress = step as f64 / 7.0;
+                    let color = active_color.lerp(final_color, progress);
+                    let bit = binary_digit(symbol, id.wrapping_add(step as u32));
+
+                    transition.add_frame(Frame::new(
+                        CharacterVisual::new(bit, binary_style(color)),
+                        1,
+                    ));
                 }
 
-                bit_ids.push(bit_id);
-            }
+                transition.add_frame(Frame::new(
+                    CharacterVisual::new(
+                        symbol.to_string(),
+                        binary_style(final_color),
+                    ),
+                    5,
+                ));
+                character.animation.add_scene(transition);
 
-            groups.push(BinaryGroup {
-                source_id,
-                bit_ids,
-                route,
-                next_bit: 0,
-                started: false,
-                complete: false,
-            });
-        }
-
-        shuffle(&mut groups, &mut seed);
-
-        let active_limit = ((groups.len() as f64 * 0.05).ceil() as usize).max(1);
-        let mut frames = Vec::new();
-
-        while groups.iter().any(|group| !group.complete) {
-            let mut active_count = groups
-                .iter()
-                .filter(|group| group.started && !group.complete)
-                .count();
-
-            if active_count < active_limit {
-                for group in &mut groups {
-                    if active_count >= active_limit {
-                        break;
-                    }
-
-                    if !group.started && !group.complete {
-                        group.started = true;
-                        active_count += 1;
-                    }
-                }
-            }
-
-            for group in &mut groups {
-                if !group.started || group.complete {
-                    continue;
-                }
-
-                if let Some(&bit_id) = group.bit_ids.get(group.next_bit) {
-                    if let Some(bit) = terminal.character_mut(bit_id) {
-                        bit.visible = true;
-                        bit.set_position(group.route[0]);
-
-                        let waypoints = group
-                            .route
-                            .iter()
-                            .copied()
-                            .map(Waypoint::new)
-                            .collect::<Vec<_>>();
-                        let path = Path::with_waypoints(waypoints, 1.0);
-                        bit.motion.activate_path(path);
-                    }
-
-                    group.next_bit += 1;
-                }
-            }
-
-            terminal.step();
-
-            for group in &mut groups {
-                if !group.started || group.complete || group.next_bit < group.bit_ids.len() {
-                    continue;
-                }
-
-                let travel_complete = group.bit_ids.iter().all(|&bit_id| {
-                    terminal
-                        .character(bit_id)
-                        .and_then(|character| character.motion.active_path())
-                        .map(|path| !path.is_active())
-                        .unwrap_or(true)
+                particles.push(BinaryParticle {
+                    character,
+                    target,
+                    original: symbol,
+                    delay: particle_delay(id, particles.len()),
+                    started: false,
+                    arrived: false,
                 });
+            }
+        }
 
-                if travel_complete {
-                    for &bit_id in &group.bit_ids {
-                        if let Some(bit) = terminal.character_mut(bit_id) {
-                            bit.visible = false;
-                            bit.motion.deactivate();
+        if particles.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                binary_style(Color::new(0x00, 0xd5, 0x00)),
+            );
+            return vec![canvas.render()];
+        }
+
+        let mut output = Vec::new();
+        let maximum_frames = width
+            .saturating_add(height)
+            .saturating_mul(4)
+            .saturating_add(128);
+
+        for frame_index in 0..maximum_frames {
+            let mut canvas = Canvas::new(width, height);
+
+            for particle in &mut particles {
+                if !particle.started && frame_index >= particle.delay {
+                    particle.started = true;
+                    particle.character.visible = true;
+                    particle.character.motion.activate(
+                        "binary_path",
+                        particle.character.position,
+                    );
+                }
+
+                if !particle.started {
+                    continue;
+                }
+
+                if !particle.arrived {
+                    let bit_index = frame_index
+                        .wrapping_add(particle.character.id.0 as usize);
+                    particle.character.symbol =
+                        binary_digit(particle.original, bit_index as u32);
+                    particle.character.style =
+                        binary_style(binary_palette(bit_index));
+
+                    particle.character.step();
+
+                    if !particle.character.motion.is_active() {
+                        particle.character.position = particle.target;
+                        particle.arrived = true;
+                        particle.character.animation.activate("resolve");
+
+                        if let Some(visual) =
+                            particle.character.animation.current_visual().cloned()
+                        {
+                            particle.character.set_appearance(visual);
                         }
                     }
-
-                    if let Some(source) = terminal.character_mut(group.source_id) {
-                        source.visible = true;
-                    }
-
-                    group.complete = true;
+                } else if particle.character.animation.is_active() {
+                    particle.character.step();
                 }
+
+                canvas.draw_character(&particle.character);
             }
 
-            frames.push(terminal.render_frame());
+            output.push(canvas.render());
+
+            if particles.iter().all(|particle| {
+                particle.started
+                    && particle.arrived
+                    && !particle.character.animation.is_active()
+                    && !particle.character.motion.is_active()
+            }) {
+                break;
+            }
         }
 
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
-        }
-
-        frames
+        output
     }
 }
 
-struct BinaryGroup {
-    source_id: CharacterId,
-    bit_ids: Vec<CharacterId>,
-    route: Vec<Coord>,
-    next_bit: usize,
+struct BinaryParticle {
+    character: EffectCharacter,
+    target: Coord,
+    original: char,
+    delay: usize,
     started: bool,
-    complete: bool,
+    arrived: bool,
 }
 
-fn binary_style(bit: char) -> Style {
-    let color = if bit == '1' {
-        Color::rgb(0, 209, 255)
+fn binary_style(color: Color) -> Style {
+    Style {
+        foreground: Some(color),
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn binary_palette(index: usize) -> Color {
+    const COLORS: [Color; 5] = [
+        Color::new(0x04, 0x4e, 0x29),
+        Color::new(0x15, 0x7e, 0x38),
+        Color::new(0x45, 0xbf, 0x55),
+        Color::new(0x95, 0xed, 0x87),
+        Color::new(0xe0, 0xff, 0xe0),
+    ];
+
+    COLORS[index % COLORS.len()]
+}
+
+fn binary_digit(symbol: char, bit_index: u32) -> String {
+    let value = symbol as u32;
+    let shift = 7 - (bit_index % 8);
+    if (value >> shift) & 1 == 0 {
+        "0".to_owned()
     } else {
-        Color::rgb(138, 0, 138)
-    };
-
-    Style::default().with_foreground(color)
+        "1".to_owned()
+    }
 }
 
-fn final_style(coord: Coord, width: usize, height: usize) -> Style {
-    let maximum = width.saturating_sub(1) + height.saturating_sub(1);
-    let progress = if maximum == 0 {
-        1.0
-    } else {
-        let x = coord.x.max(0) as usize;
-        let y = coord.y.max(0) as usize;
-        (x + y) as f64 / maximum as f64
-    };
-
-    let color = if progress < 0.5 {
-        interpolate_color(
-            Color::rgb(138, 0, 138),
-            Color::rgb(0, 209, 255),
-            progress * 2.0,
-        )
-    } else {
-        interpolate_color(
-            Color::rgb(0, 209, 255),
-            Color::rgb(255, 255, 255),
-            (progress - 0.5) * 2.0,
-        )
-    };
-
-    Style::default().with_foreground(color)
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return end;
-    };
-
-    let progress = progress.clamp(0.0, 1.0);
-    let channel = |start: u8, end: u8| {
-        (start as f64 + (end as f64 - start as f64) * progress).round() as u8
-    };
-
-    Color::rgb(
-        channel(start_r, end_r),
-        channel(start_g, end_g),
-        channel(start_b, end_b),
-    )
-}
-
-fn make_route(
-    destination: Coord,
-    width: usize,
-    height: usize,
-    seed: &mut u64,
-) -> Vec<Coord> {
-    let right = width.saturating_sub(1) as i32;
-    let bottom = height.saturating_sub(1) as i32;
-    let edge = next_random(seed) % 4;
-
-    let start = match edge {
-        0 => Coord::new(0, random_coordinate(seed, height)),
-        1 => Coord::new(right, random_coordinate(seed, height)),
-        2 => Coord::new(random_coordinate(seed, width), 0),
-        _ => Coord::new(random_coordinate(seed, width), bottom),
-    };
-
-    let corner = if edge < 2 {
-        Coord::new(destination.x, start.y)
-    } else {
-        Coord::new(start.x, destination.y)
-    };
-
-    vec![start, corner, destination]
-}
-
-fn random_coordinate(seed: &mut u64, extent: usize) -> i32 {
-    if extent <= 1 {
+fn particle_delay(id: u32, index: usize) -> usize {
+    if index == 0 {
         0
     } else {
-        (next_random(seed) % extent as u64) as i32
+        ((id as usize).wrapping_mul(17).wrapping_add(index * 7)) % 36
     }
 }
 
-fn seed_from_input(input: &str) -> u64 {
-    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+fn starting_coord(
+    seed: u64,
+    target: Coord,
+    width: usize,
+    height: usize,
+) -> Coord {
+    let right = width.saturating_sub(1) as i32;
+    let bottom = height.saturating_sub(1) as i32;
+    let random_column = ((seed >> 8) as usize % width) as i32;
+    let random_row = ((seed >> 24) as usize % height) as i32;
 
-    for byte in input.bytes() {
-        seed ^= u64::from(byte);
-        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+    match seed & 3 {
+        0 => Coord::new(0, random_row),
+        1 => Coord::new(right, random_row),
+        2 => Coord::new(random_column, 0),
+        _ => Coord::new(random_column, bottom),
     }
+    .or_target_if_equal(target, right, bottom)
+}
 
-    if seed == 0 {
-        0x9e37_79b9_7f4a_7c15
+trait DistinctStart {
+    fn or_target_if_equal(
+        self,
+        target: Coord,
+        right: i32,
+        bottom: i32,
+    ) -> Coord;
+}
+
+impl DistinctStart for Coord {
+    fn or_target_if_equal(
+        self,
+        target: Coord,
+        right: i32,
+        bottom: i32,
+    ) -> Coord {
+        if self != target {
+            return self;
+        }
+
+        if target.column != right {
+            Coord::new(right, target.row)
+        } else if target.column != 0 {
+            Coord::new(0, target.row)
+        } else if target.row != bottom {
+            Coord::new(target.column, bottom)
+        } else {
+            Coord::new(target.column, 0)
+        }
+    }
+}
+
+fn add_binary_waypoints(
+    path: &mut Path,
+    seed: u64,
+    start: Coord,
+    target: Coord,
+    width: usize,
+    height: usize,
+) {
+    let bend_column = ((seed >> 16) as usize % width) as i32;
+    let bend_row = ((seed >> 32) as usize % height) as i32;
+
+    if seed & 4 == 0 {
+        path.add_waypoint(Waypoint::new(
+            "horizontal_entry",
+            Coord::new(bend_column, start.row),
+        ));
+        path.add_waypoint(Waypoint::new(
+            "vertical_channel",
+            Coord::new(bend_column, bend_row),
+        ));
+        path.add_waypoint(Waypoint::new(
+            "target_row",
+            Coord::new(target.column, bend_row),
+        ));
     } else {
-        seed
+        path.add_waypoint(Waypoint::new(
+            "vertical_entry",
+            Coord::new(start.column, bend_row),
+        ));
+        path.add_waypoint(Waypoint::new(
+            "horizontal_channel",
+            Coord::new(bend_column, bend_row),
+        ));
+        path.add_waypoint(Waypoint::new(
+            "target_column",
+            Coord::new(bend_column, target.row),
+        ));
     }
+
+    path.add_waypoint(Waypoint::new("target", target));
 }
 
-fn next_random(seed: &mut u64) -> u64 {
-    let mut value = *seed;
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    *seed = value;
-    value
-}
-
-fn shuffle<T>(values: &mut [T], seed: &mut u64) {
-    for index in (1..values.len()).rev() {
-        let swap_index = (next_random(seed) % (index as u64 + 1)) as usize;
-        values.swap(index, swap_index);
-    }
+fn mix_seed(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }

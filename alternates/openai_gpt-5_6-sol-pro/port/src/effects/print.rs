@@ -1,24 +1,99 @@
 
-use std::collections::BTreeMap;
-
 use super::Effect;
-use crate::engine::{CharacterId, Terminal};
-use crate::utils::easing::in_out_quad;
-use crate::utils::{Color, Coord, Style};
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, Gradient, Style};
 
-const PRINT_HEAD_SYMBOL: char = '█';
-const PRINT_HEAD_RETURN_SPEED: f64 = 1.25;
-const PRINT_SPEED: usize = 1;
-
-const GRADIENT_BOTTOM: Color = Color::rgb(0x02, 0xb8, 0xbd);
-const GRADIENT_TOP: Color = Color::rgb(0xc1, 0xf0, 0xe3);
-
-#[derive(Debug, Clone, Copy, Default)]
 pub struct Print;
 
 impl Print {
     pub fn new() -> Self {
         Self
+    }
+
+    fn render_frame(
+        lines: &[Vec<char>],
+        width: usize,
+        height: usize,
+        completed_rows: usize,
+        active_row: Option<(usize, usize)>,
+        print_head: Option<Coord>,
+        palette: &[Color],
+    ) -> String {
+        let mut canvas = Canvas::new(width, height);
+        let maximum_diagonal = width
+            .saturating_sub(1)
+            .saturating_add(height.saturating_sub(1))
+            .max(1);
+
+        let color_at = |column: usize, row: usize| {
+            let diagonal = column.saturating_add(row);
+            let index = diagonal
+                .saturating_mul(palette.len().saturating_sub(1))
+                / maximum_diagonal;
+            palette[index.min(palette.len().saturating_sub(1))]
+        };
+
+        let mut styled_character_drawn = false;
+
+        for (row, line) in lines.iter().enumerate() {
+            let visible_count = if row < completed_rows {
+                line.len()
+            } else if let Some((active_row_index, count)) = active_row {
+                if row == active_row_index {
+                    count.min(line.len())
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            for (column, symbol) in line.iter().take(visible_count).enumerate() {
+                let style = Style {
+                    foreground: Some(color_at(column, row)),
+                    ..Style::default()
+                };
+
+                canvas.set(
+                    Coord::new(column as i32, row as i32),
+                    symbol.to_string(),
+                    style,
+                );
+                styled_character_drawn = true;
+            }
+        }
+
+        if let Some(coord) = print_head {
+            let head_style = Style {
+                foreground: Some(Color::new(255, 255, 255)),
+                bold: true,
+                ..Style::default()
+            };
+            canvas.set(coord, "█", head_style);
+            styled_character_drawn = true;
+        }
+
+        // Keep empty and blank-only inputs ANSI-styled as well.
+        if !styled_character_drawn {
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style {
+                    foreground: Some(palette[0]),
+                    ..Style::default()
+                },
+            );
+        }
+
+        canvas.render()
+    }
+}
+
+impl Default for Print {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -28,141 +103,99 @@ impl Effect for Print {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let height = terminal.canvas().height();
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalized.trim_end_matches('\n');
 
-        let mut rows: BTreeMap<i32, Vec<CharacterId>> = BTreeMap::new();
-        for character in terminal.characters() {
-            rows.entry(character.position.y)
-                .or_default()
-                .push(character.id);
-        }
+        let lines: Vec<Vec<char>> = if normalized.is_empty() {
+            vec![Vec::new()]
+        } else {
+            normalized
+                .split('\n')
+                .map(|line| line.chars().collect())
+                .collect()
+        };
 
-        for row in rows.values_mut() {
-            row.sort_by_key(|id| {
-                terminal
-                    .character(*id)
-                    .map(|character| (character.position.x, character.id))
-                    .unwrap_or((i32::MAX, *id))
-            });
-        }
+        let width = lines
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
-            let color = gradient_color(character.position.y, height);
-            character.set_style(Style::default().with_foreground(color));
-        }
-
-        let rows: Vec<(i32, Vec<CharacterId>)> = rows.into_iter().collect();
-        if rows.is_empty() {
-            return vec![terminal.render_frame()];
-        }
-
-        let first_row = rows[0].0;
-        let print_head_id = terminal.add_character(
-            PRINT_HEAD_SYMBOL,
-            Coord::new(0, first_row),
-        );
-
-        if let Some(print_head) = terminal.character_mut(print_head_id) {
-            print_head.set_style(
-                Style::default().with_foreground(Color::rgb(0xff, 0xff, 0xff)),
-            );
-        }
+        let palette = Gradient::new(
+            [
+                Color::new(0x02, 0xb8, 0xbd),
+                Color::new(0xc1, 0xf0, 0xe3),
+                Color::new(0x00, 0xff, 0xa0),
+            ],
+            12,
+        )
+        .colors();
 
         let mut frames = Vec::new();
+        let mut completed_rows = 0;
 
-        for (row_index, (row_y, character_ids)) in rows.iter().enumerate() {
-            for batch in character_ids.chunks(PRINT_SPEED) {
-                let mut print_head_x = 0;
-
-                for id in batch {
-                    if let Some(character) = terminal.character_mut(*id) {
-                        character.visible = true;
-                        print_head_x = character.position.x.saturating_add(1);
-                    }
+        for (row, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                frames.push(Self::render_frame(
+                    &lines,
+                    width,
+                    height,
+                    completed_rows,
+                    Some((row, 0)),
+                    Some(Coord::new(0, row as i32)),
+                    &palette,
+                ));
+            } else {
+                for column in 0..line.len() {
+                    frames.push(Self::render_frame(
+                        &lines,
+                        width,
+                        height,
+                        completed_rows,
+                        Some((row, column)),
+                        Some(Coord::new(column as i32, row as i32)),
+                        &palette,
+                    ));
                 }
-
-                if let Some(print_head) = terminal.character_mut(print_head_id) {
-                    print_head.set_position(Coord::new(print_head_x, *row_y));
-                }
-
-                frames.push(terminal.render_frame());
             }
 
-            let Some((next_row_y, _)) = rows.get(row_index + 1) else {
-                continue;
-            };
+            completed_rows = row + 1;
 
-            let start = terminal
-                .character(print_head_id)
-                .map(|character| character.position)
-                .unwrap_or(Coord::new(0, *row_y));
-            let destination = Coord::new(0, *next_row_y);
-            let distance = start.distance(destination);
-            let return_steps = (distance / PRINT_HEAD_RETURN_SPEED)
-                .ceil()
-                .max(1.0) as usize;
+            // Simulate the printer's carriage return. The head accelerates
+            // toward the left edge and decelerates before beginning the next row.
+            let return_distance = line.len().saturating_sub(1);
+            let return_frames = return_distance.div_ceil(3);
 
-            for step in 1..=return_steps {
-                let raw_progress = step as f64 / return_steps as f64;
-                let position = start.lerp(destination, in_out_quad(raw_progress));
+            for step in 1..=return_frames {
+                let progress = step as f64 / return_frames as f64;
+                let eased = easing::in_out_quad(progress);
+                let column =
+                    (return_distance as f64 * (1.0 - eased)).round() as i32;
 
-                if let Some(print_head) = terminal.character_mut(print_head_id) {
-                    print_head.set_position(position);
-                }
-
-                frames.push(terminal.render_frame());
+                frames.push(Self::render_frame(
+                    &lines,
+                    width,
+                    height,
+                    completed_rows,
+                    None,
+                    Some(Coord::new(column, row as i32)),
+                    &palette,
+                ));
             }
         }
 
-        if let Some(print_head) = terminal.character_mut(print_head_id) {
-            print_head.visible = false;
-        }
-        frames.push(terminal.render_frame());
+        frames.push(Self::render_frame(
+            &lines,
+            width,
+            height,
+            lines.len(),
+            None,
+            None,
+            &palette,
+        ));
 
         frames
     }
-}
-
-fn gradient_color(row: i32, height: usize) -> Color {
-    if height <= 1 {
-        return GRADIENT_BOTTOM;
-    }
-
-    let row = row.clamp(0, height.saturating_sub(1) as i32) as f64;
-    let progress = 1.0 - row / (height - 1) as f64;
-
-    interpolate_color(GRADIENT_BOTTOM, GRADIENT_TOP, progress)
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return start;
-    };
-
-    let progress = progress.clamp(0.0, 1.0);
-    let interpolate = |start: u8, end: u8| {
-        (start as f64 + (end as f64 - start as f64) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
-    )
 }

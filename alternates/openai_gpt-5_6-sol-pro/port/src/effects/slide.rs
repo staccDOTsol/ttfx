@@ -1,23 +1,30 @@
-
-use std::collections::{BTreeMap, VecDeque};
-
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::easing::in_out_quad;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{Canvas, CharacterId, EffectCharacter};
+use crate::utils::easing;
+use crate::utils::graphics::{Color, ColorPair, Gradient, Style};
 use crate::utils::Coord;
 
-#[derive(Debug, Clone)]
 pub struct Slide {
     movement_speed: f64,
-    group_gap: usize,
+    gap: usize,
+    reverse_direction: bool,
+    merge: bool,
+    final_gradient_stops: Vec<Color>,
+    final_gradient_steps: usize,
 }
 
 impl Slide {
     pub fn new() -> Self {
         Self {
             movement_speed: 0.5,
-            group_gap: 0,
+            gap: 3,
+            reverse_direction: false,
+            merge: false,
+            final_gradient_stops: vec![
+                Color::new(0x12, 0xa0, 0xc0),
+                Color::new(0x80, 0x00, 0x80),
+            ],
+            final_gradient_steps: 12,
         }
     }
 }
@@ -28,136 +35,150 @@ impl Default for Slide {
     }
 }
 
+#[derive(Clone)]
+struct SlidingCharacter {
+    character: EffectCharacter,
+    start: Coord,
+    target: Coord,
+    delay: usize,
+}
+
 impl Effect for Slide {
     fn name(&self) -> &str {
         "slide"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let input = input.trim_end_matches(&['\r', '\n'][..]);
+        let lines: Vec<Vec<char>> = if input.is_empty() {
+            vec![Vec::new()]
+        } else {
+            input
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r').chars().collect())
+                .collect()
+        };
 
-        if terminal.characters().is_empty() {
-            return Vec::new();
-        }
+        let width = lines.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let height = lines.len().max(1);
+        let palette = Gradient::new(
+            self.final_gradient_stops.iter().copied(),
+            self.final_gradient_steps,
+        )
+        .colors();
 
-        let width = terminal.canvas().width() as i32;
-        let height = terminal.canvas().height();
+        let mut characters = Vec::new();
+        let mut next_id = 0_u32;
 
-        let mut rows: BTreeMap<i32, Vec<CharacterId>> = BTreeMap::new();
-        let mut destinations = BTreeMap::new();
+        for (row, line) in lines.iter().enumerate() {
+            let from_right = if self.merge {
+                row % 2 == 0
+            } else {
+                self.reverse_direction
+            };
 
-        for character in terminal.characters() {
-            rows.entry(character.position.y)
-                .or_default()
-                .push(character.id);
-            destinations.insert(character.id, character.position);
-        }
-
-        let mut groups: VecDeque<Vec<CharacterId>> = rows.into_values().collect();
-
-        for (row_index, group) in groups.iter().enumerate() {
-            let enter_from_left = row_index % 2 == 0;
-
-            for id in group {
-                let Some(destination) = destinations.get(id).copied() else {
-                    continue;
-                };
-
-                let start = if enter_from_left {
-                    destination.offset(-width, 0)
+            for (column, symbol) in line.iter().copied().enumerate() {
+                let target = Coord::new(column as i32, row as i32);
+                let start = if from_right {
+                    Coord::new(column as i32 + width as i32, row as i32)
                 } else {
-                    destination.offset(width, 0)
+                    Coord::new(column as i32 - width as i32, row as i32)
                 };
 
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.set_position(start);
-                    character.visible = true;
+                let color_index = if palette.len() <= 1 || height <= 1 {
+                    0
+                } else {
+                    row * (palette.len() - 1) / (height - 1)
+                };
+                let color = palette
+                    .get(color_index)
+                    .copied()
+                    .unwrap_or(Color::new(0x12, 0xa0, 0xc0));
 
-                    let color = slide_color(destination.y, height);
-                    character.set_style(Style::default().with_foreground(color));
-                }
+                let display_symbol = if symbol == '\t' {
+                    " ".to_owned()
+                } else {
+                    symbol.to_string()
+                };
+
+                let mut character =
+                    EffectCharacter::new(CharacterId(next_id), display_symbol, start);
+                character.style =
+                    Style::with_colors(ColorPair::new(Some(color), None));
+                next_id += 1;
+
+                characters.push(SlidingCharacter {
+                    character,
+                    start,
+                    target,
+                    delay: row * self.gap,
+                });
             }
         }
 
-        let mut active = Vec::<CharacterId>::new();
-        let mut gap_remaining = 0usize;
+        if characters.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            let color = palette
+                .first()
+                .copied()
+                .unwrap_or(Color::new(0x12, 0xa0, 0xc0));
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style::with_colors(ColorPair::new(Some(color), None)),
+            );
+            return vec![canvas.render()];
+        }
+
+        let movement_frames =
+            ((width as f64 / self.movement_speed.max(0.01)).ceil() as usize)
+                .max(1);
+        let final_frame = characters
+            .iter()
+            .map(|character| character.delay + movement_frames)
+            .max()
+            .unwrap_or(movement_frames);
+
         let mut frames = Vec::new();
 
-        while !groups.is_empty() || !active.is_empty() {
-            if gap_remaining == 0 {
-                if let Some(group) = groups.pop_front() {
-                    for id in group {
-                        let Some(destination) = destinations.get(&id).copied() else {
-                            continue;
-                        };
+        for frame_index in 0..=final_frame {
+            let mut canvas = Canvas::new(width, height);
+            let mut drew_character = false;
 
-                        if let Some(character) = terminal.character_mut(id) {
-                            let start = character.position;
-                            let mut path = Path::with_waypoints(
-                                vec![Waypoint::new(start), Waypoint::new(destination)],
-                                self.movement_speed,
-                            );
-                            path.set_easing(in_out_quad);
-
-                            if character.motion.activate_path(path) {
-                                active.push(id);
-                            } else {
-                                character.set_position(destination);
-                            }
-                        }
-                    }
-
-                    gap_remaining = self.group_gap;
+            for sliding in &mut characters {
+                if frame_index < sliding.delay {
+                    continue;
                 }
-            } else {
-                gap_remaining -= 1;
+
+                let elapsed = frame_index - sliding.delay;
+                let progress =
+                    (elapsed as f64 / movement_frames as f64).clamp(0.0, 1.0);
+                let eased_progress = easing::in_out_quart(progress);
+                sliding.character.position =
+                    sliding.start.lerp(sliding.target, eased_progress);
+
+                if canvas.draw_character(&sliding.character) {
+                    drew_character = true;
+                }
             }
 
-            terminal.step();
+            // Initial positions may be entirely outside the canvas. Omitting those
+            // blank frames also guarantees that every returned frame contains SGR.
+            if drew_character {
+                frames.push(canvas.render());
+            }
+        }
 
-            active.retain(|id| {
-                terminal
-                    .character(*id)
-                    .and_then(|character| character.motion.active_path())
-                    .is_some_and(|path| path.is_active())
-            });
-
-            frames.push(terminal.render_frame());
+        if frames.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            for sliding in &characters {
+                let mut character = sliding.character.clone();
+                character.position = sliding.target;
+                canvas.draw_character(&character);
+            }
+            frames.push(canvas.render());
         }
 
         frames
     }
-}
-
-fn slide_color(row: i32, height: usize) -> Color {
-    const STOPS: [(u8, u8, u8); 3] = [
-        (0x12, 0xc2, 0xe9),
-        (0xc4, 0x71, 0xed),
-        (0xf6, 0x4f, 0x59),
-    ];
-
-    let progress = if height <= 1 {
-        0.0
-    } else {
-        (row.max(0) as f64 / (height - 1) as f64).clamp(0.0, 1.0)
-    };
-
-    let scaled = progress * (STOPS.len() - 1) as f64;
-    let lower = (scaled.floor() as usize).min(STOPS.len() - 1);
-    let upper = (lower + 1).min(STOPS.len() - 1);
-    let local_progress = scaled - lower as f64;
-
-    let (r1, g1, b1) = STOPS[lower];
-    let (r2, g2, b2) = STOPS[upper];
-
-    Color::rgb(
-        interpolate_channel(r1, r2, local_progress),
-        interpolate_channel(g1, g2, local_progress),
-        interpolate_channel(b1, b2, local_progress),
-    )
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

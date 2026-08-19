@@ -1,8 +1,9 @@
-
 use super::Effect;
-use crate::engine::{CharacterId, CharacterVisual, Frame, Path, Scene, Terminal, Waypoint};
-use crate::utils::easing::{in_quad, out_expo};
-use crate::utils::{Color, Coord, Style};
+
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::graphics::{Color, ColorPair, Gradient, Style};
+use crate::utils::Coord;
 
 pub struct Crumble;
 
@@ -18,397 +19,313 @@ impl Default for Crumble {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CharacterPhase {
-    Waiting,
-    Crumbling,
-    Falling,
-    Hidden,
-    Returning,
-    Reforming,
-    Done,
-}
-
-struct CrumbleCharacter {
-    id: CharacterId,
-    original_position: Coord,
-    phase: CharacterPhase,
-    fall_speed: f64,
-    return_speed: f64,
-}
-
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn from_input(input: &str) -> Self {
-        let mut state = 0xcbf2_9ce4_8422_2325_u64;
-
-        for byte in input.bytes() {
-            state ^= u64::from(byte);
-            state = state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-
-        if state == 0 {
-            state = 0x9e37_79b9_7f4a_7c15;
-        }
-
-        Self { state }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        value
-    }
-
-    fn range_f64(&mut self, minimum: f64, maximum: f64) -> f64 {
-        let ratio = self.next_u64() as f64 / u64::MAX as f64;
-        minimum + (maximum - minimum) * ratio
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        for index in (1..values.len()).rev() {
-            let target = (self.next_u64() % (index as u64 + 1)) as usize;
-            values.swap(index, target);
-        }
-    }
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * progress;
-    value.round().clamp(0.0, 255.0) as u8
-}
-
-fn final_style(position: Coord, canvas_height: usize) -> Style {
-    let progress = if canvas_height <= 1 {
-        0.0
-    } else {
-        (position.y.max(0) as f64 / (canvas_height - 1) as f64).clamp(0.0, 1.0)
-    };
-
-    let start = (0x5c, 0xe1, 0xe6);
-    let end = (0xff, 0x8c, 0x00);
-
-    Style::default().with_foreground(Color::rgb(
-        interpolate_channel(start.0, end.0, progress),
-        interpolate_channel(start.1, end.1, progress),
-        interpolate_channel(start.2, end.2, progress),
-    ))
-}
-
-fn crumble_scene(symbol: char, style: &Style) -> Scene {
-    let mut scene = Scene::new(false);
-
-    scene.add_frame(Frame::new(
-        CharacterVisual::new(symbol, style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▉', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▓', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▒', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('░', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new(' ', style.clone()),
-        1,
-    ));
-
-    scene
-}
-
-fn dust_scene() -> Scene {
-    let dust_style = Style::default().with_foreground(Color::rgb(0xb2, 0xa1, 0x8f));
-    let mut scene = Scene::new(true);
-
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('░', dust_style.clone()),
-        2,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▒', dust_style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('░', dust_style),
-        2,
-    ));
-
-    scene
-}
-
-fn reform_scene(symbol: char, style: &Style) -> Scene {
-    let mut scene = Scene::new(false);
-
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('░', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▒', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new('▓', style.clone()),
-        1,
-    ));
-    scene.add_frame(Frame::new(
-        CharacterVisual::new(symbol, style.clone()),
-        1,
-    ));
-
-    scene
-}
-
-fn scene_finished(terminal: &Terminal, id: CharacterId) -> bool {
-    terminal
-        .character(id)
-        .and_then(|character| character.animation.active_scene())
-        .map(|scene| scene.is_finished())
-        .unwrap_or(true)
-}
-
-fn motion_finished(terminal: &Terminal, id: CharacterId) -> bool {
-    terminal
-        .character(id)
-        .and_then(|character| character.motion.active_path())
-        .map(|path| !path.is_active())
-        .unwrap_or(true)
-}
-
-fn restore_final_frame(
-    terminal: &mut Terminal,
-    characters: &mut [CrumbleCharacter],
-    canvas_height: usize,
-) {
-    for record in characters {
-        if let Some(character) = terminal.character_mut(record.id) {
-            let style = final_style(record.original_position, canvas_height);
-            character.motion.deactivate();
-            character.animation.deactivate();
-            character.set_position(record.original_position);
-            character.set_appearance(character.input_symbol, style);
-            character.visible = true;
-        }
-
-        record.phase = CharacterPhase::Done;
-    }
-}
-
 impl Effect for Crumble {
     fn name(&self) -> &str {
         "crumble"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let canvas_height = terminal.canvas().height();
+        let parsed = ParsedText::new(input);
+        let mut order = (0..parsed.characters.len()).collect::<Vec<_>>();
+        deterministic_shuffle(&mut order, input);
 
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
+        let mut rank = vec![0usize; parsed.characters.len()];
+        for (position, character_index) in order.into_iter().enumerate() {
+            rank[character_index] = position;
         }
 
-        let mut rng = SimpleRng::from_input(input);
-        let mut characters = terminal
-            .characters()
-            .iter()
-            .map(|character| CrumbleCharacter {
-                id: character.id,
-                original_position: character.position,
-                phase: CharacterPhase::Waiting,
-                fall_speed: rng.range_f64(0.35, 0.75),
-                return_speed: rng.range_f64(0.55, 1.0),
-            })
-            .collect::<Vec<_>>();
+        let character_count = parsed.characters.len().max(1);
+        let batch_size = character_count.div_ceil(30).max(1);
+        let stagger_count = character_count.saturating_sub(1) / batch_size;
+        let bottom = parsed.height.saturating_sub(1) as i32;
+        let top = 0;
+        let center_column = parsed.width.saturating_sub(1) as f64 / 2.0;
 
-        let mut crumble_order = (0..characters.len()).collect::<Vec<_>>();
-        rng.shuffle(&mut crumble_order);
+        const WEAKEN_DURATION: usize = 8;
+        let fall_duration = (parsed.height * 2 + 10).clamp(12, 42);
+        let fall_phase_duration =
+            stagger_count * 2 + WEAKEN_DURATION + fall_duration + 3;
 
-        let mut return_order = crumble_order.clone();
-        return_order.reverse();
+        let vacuum_duration = (parsed.height * 2 + 12).clamp(16, 46);
+        let vacuum_stagger = character_count.saturating_sub(1) / batch_size;
+        let vacuum_phase_duration = vacuum_stagger + vacuum_duration + 3;
 
-        let mut crumble_cursor = 0;
-        let mut return_cursor = 0;
-        let mut stage = 0_u8;
-        let mut pause_frames = 4_u8;
-        let mut tick = 0_usize;
-        let mut frames = Vec::new();
+        let reform_duration = (parsed.height * 2 + 12).clamp(16, 46);
+        let reform_phase_duration = vacuum_stagger + reform_duration + 3;
 
-        let maximum_frames = characters
-            .len()
-            .saturating_mul(12)
-            .saturating_add(canvas_height.saturating_mul(8))
-            .saturating_add(128);
+        let mut frames = Vec::with_capacity(
+            fall_phase_duration
+                + vacuum_phase_duration
+                + reform_phase_duration
+                + 1,
+        );
 
-        while frames.len() < maximum_frames {
-            if stage == 0 {
-                for record in &mut characters {
-                    match record.phase {
-                        CharacterPhase::Crumbling if scene_finished(&terminal, record.id) => {
-                            if let Some(character) = terminal.character_mut(record.id) {
-                                character.animation.deactivate();
-                                character.set_appearance(
-                                    '░',
-                                    Style::default()
-                                        .with_foreground(Color::rgb(0xb2, 0xa1, 0x8f)),
-                                );
+        for tick in 0..fall_phase_duration {
+            frames.push(parsed.render(|index, character| {
+                let start = (rank[index] / batch_size) * 2;
 
-                                let destination =
-                                    Coord::new(record.original_position.x, canvas_height as i32 - 1);
-                                let mut path = Path::with_waypoints(
-                                    vec![
-                                        Waypoint::new(character.position),
-                                        Waypoint::new(destination),
-                                    ],
-                                    record.fall_speed,
-                                );
-                                path.set_easing(in_quad);
-                                character.motion.activate_path(path);
-                            }
+                if tick < start {
+                    RenderedCharacter::original(character)
+                } else if tick < start + WEAKEN_DURATION {
+                    let progress =
+                        (tick - start) as f64 / WEAKEN_DURATION as f64;
+                    let symbols = [
+                        character.symbol.as_str(),
+                        character.symbol.as_str(),
+                        "▓",
+                        "▒",
+                        "░",
+                    ];
+                    let symbol_index = ((progress * symbols.len() as f64)
+                        .floor() as usize)
+                        .min(symbols.len() - 1);
 
-                            record.phase = CharacterPhase::Falling;
-                        }
-                        CharacterPhase::Falling if motion_finished(&terminal, record.id) => {
-                            if let Some(character) = terminal.character_mut(record.id) {
-                                character.motion.deactivate();
-                                character.animation.deactivate();
-                                character.visible = false;
-                            }
-
-                            record.phase = CharacterPhase::Hidden;
-                        }
-                        _ => {}
+                    RenderedCharacter {
+                        coord: character.coord,
+                        symbol: symbols[symbol_index].to_owned(),
+                        color: character
+                            .final_color
+                            .lerp(Color::new(115, 105, 98), progress),
                     }
-                }
-
-                if crumble_cursor < crumble_order.len() && tick % 2 == 0 {
-                    let record_index = crumble_order[crumble_cursor];
-                    crumble_cursor += 1;
-
-                    let record = &mut characters[record_index];
-                    if let Some(character) = terminal.character_mut(record.id) {
-                        let style = final_style(record.original_position, canvas_height);
-                        character
-                            .animation
-                            .activate_scene(crumble_scene(character.input_symbol, &style));
-                    }
-                    record.phase = CharacterPhase::Crumbling;
-                }
-
-                if crumble_cursor == crumble_order.len()
-                    && characters
-                        .iter()
-                        .all(|record| record.phase == CharacterPhase::Hidden)
-                {
-                    stage = 1;
-                }
-            } else if stage == 1 {
-                if pause_frames > 0 {
-                    pause_frames -= 1;
                 } else {
-                    stage = 2;
-                }
-            } else {
-                for record in &mut characters {
-                    match record.phase {
-                        CharacterPhase::Returning if motion_finished(&terminal, record.id) => {
-                            if let Some(character) = terminal.character_mut(record.id) {
-                                let style = final_style(record.original_position, canvas_height);
-                                character.motion.deactivate();
-                                character.set_position(record.original_position);
-                                character.animation.activate_scene(reform_scene(
-                                    character.input_symbol,
-                                    &style,
-                                ));
-                            }
+                    let elapsed = tick - start - WEAKEN_DURATION;
+                    let progress =
+                        (elapsed as f64 / fall_duration as f64).clamp(0.0, 1.0);
+                    let eased = easing::out_bounce(progress);
+                    let row = interpolate(
+                        character.coord.row as f64,
+                        bottom as f64,
+                        eased,
+                    );
 
-                            record.phase = CharacterPhase::Reforming;
-                        }
-                        CharacterPhase::Reforming if scene_finished(&terminal, record.id) => {
-                            if let Some(character) = terminal.character_mut(record.id) {
-                                let style = final_style(record.original_position, canvas_height);
-                                character.animation.deactivate();
-                                character.set_position(record.original_position);
-                                character.set_appearance(character.input_symbol, style);
-                                character.visible = true;
-                            }
-
-                            record.phase = CharacterPhase::Done;
-                        }
-                        _ => {}
+                    RenderedCharacter {
+                        coord: Coord::new(character.coord.column, row),
+                        symbol: if progress < 0.4 {
+                            "▓".to_owned()
+                        } else if progress < 0.75 {
+                            "▒".to_owned()
+                        } else {
+                            "░".to_owned()
+                        },
+                        color: character
+                            .final_color
+                            .lerp(Color::new(105, 93, 85), progress * 0.8),
                     }
                 }
-
-                if return_cursor < return_order.len() {
-                    let record_index = return_order[return_cursor];
-                    return_cursor += 1;
-
-                    let record = &mut characters[record_index];
-                    if record.phase == CharacterPhase::Hidden {
-                        if let Some(character) = terminal.character_mut(record.id) {
-                            let bottom = Coord::new(
-                                record.original_position.x,
-                                canvas_height as i32 - 1,
-                            );
-
-                            character.set_position(bottom);
-                            character.visible = true;
-                            character.animation.activate_scene(dust_scene());
-
-                            let mut path = Path::with_waypoints(
-                                vec![
-                                    Waypoint::new(bottom),
-                                    Waypoint::new(record.original_position),
-                                ],
-                                record.return_speed,
-                            );
-                            path.set_easing(out_expo);
-                            character.motion.activate_path(path);
-                        }
-
-                        record.phase = CharacterPhase::Returning;
-                    }
-                }
-
-                if return_cursor == return_order.len()
-                    && characters
-                        .iter()
-                        .all(|record| record.phase == CharacterPhase::Done)
-                {
-                    restore_final_frame(&mut terminal, &mut characters, canvas_height);
-                    frames.push(terminal.render_frame());
-                    break;
-                }
-            }
-
-            terminal.step();
-            frames.push(terminal.render_frame());
-            tick = tick.saturating_add(1);
+            }));
         }
 
-        if characters
-            .iter()
-            .any(|record| record.phase != CharacterPhase::Done)
-        {
-            restore_final_frame(&mut terminal, &mut characters, canvas_height);
-            frames.push(terminal.render_frame());
+        for tick in 0..vacuum_phase_duration {
+            frames.push(parsed.render(|index, character| {
+                let start = rank[index] / batch_size;
+                let elapsed = tick.saturating_sub(start);
+                let progress = if tick < start {
+                    0.0
+                } else {
+                    (elapsed as f64 / vacuum_duration as f64).clamp(0.0, 1.0)
+                };
+                let eased = easing::out_quint(progress);
+                let row = interpolate(bottom as f64, top as f64, eased);
+
+                // Pull the debris toward the center as it is vacuumed upward,
+                // approximating the curved top path used by the original.
+                let arc = (std::f64::consts::PI * progress).sin() * 0.42;
+                let column = interpolate(
+                    character.coord.column as f64,
+                    center_column,
+                    arc,
+                );
+
+                RenderedCharacter {
+                    coord: Coord::new(column, row),
+                    symbol: if progress < 0.55 {
+                        "░".to_owned()
+                    } else if progress < 0.85 {
+                        "▒".to_owned()
+                    } else {
+                        "▓".to_owned()
+                    },
+                    color: Color::new(105, 93, 85)
+                        .lerp(character.final_color, progress * 0.45),
+                }
+            }));
         }
 
+        for tick in 0..reform_phase_duration {
+            frames.push(parsed.render(|index, character| {
+                let reverse_rank = character_count - 1 - rank[index];
+                let start = reverse_rank / batch_size;
+                let elapsed = tick.saturating_sub(start);
+                let progress = if tick < start {
+                    0.0
+                } else {
+                    (elapsed as f64 / reform_duration as f64).clamp(0.0, 1.0)
+                };
+                let eased = easing::out_bounce(progress);
+                let row =
+                    interpolate(top as f64, character.coord.row as f64, eased);
+
+                RenderedCharacter {
+                    coord: Coord::new(character.coord.column, row),
+                    symbol: if progress < 0.2 {
+                        "░".to_owned()
+                    } else if progress < 0.4 {
+                        "▒".to_owned()
+                    } else if progress < 0.6 {
+                        "▓".to_owned()
+                    } else {
+                        character.symbol.clone()
+                    },
+                    color: Color::new(125, 113, 104)
+                        .lerp(character.final_color, progress),
+                }
+            }));
+        }
+
+        frames.push(parsed.render(|_, character| {
+            RenderedCharacter::original(character)
+        }));
         frames
+    }
+}
+
+#[derive(Clone)]
+struct InputCharacter {
+    symbol: String,
+    coord: Coord,
+    final_color: Color,
+}
+
+struct RenderedCharacter {
+    coord: Coord,
+    symbol: String,
+    color: Color,
+}
+
+impl RenderedCharacter {
+    fn original(character: &InputCharacter) -> Self {
+        Self {
+            coord: character.coord,
+            symbol: character.symbol.clone(),
+            color: character.final_color,
+        }
+    }
+}
+
+struct ParsedText {
+    width: usize,
+    height: usize,
+    characters: Vec<InputCharacter>,
+    fallback_color: Color,
+}
+
+impl ParsedText {
+    fn new(input: &str) -> Self {
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines = normalized.split('\n').collect::<Vec<_>>();
+
+        while lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty())
+        {
+            lines.pop();
+        }
+
+        if lines.is_empty() {
+            lines.push("");
+        }
+
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
+
+        let colors = Gradient::new(
+            [
+                Color::new(92, 225, 255),
+                Color::new(125, 94, 255),
+                Color::new(255, 140, 0),
+            ],
+            height,
+        )
+        .colors();
+        let fallback_color = colors
+            .first()
+            .copied()
+            .unwrap_or(Color::new(92, 225, 255));
+
+        let mut characters = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            let color = colors.get(row).copied().unwrap_or(fallback_color);
+            for (column, symbol) in line.chars().enumerate() {
+                characters.push(InputCharacter {
+                    symbol: symbol.to_string(),
+                    coord: Coord::new(column as i32, row as i32),
+                    final_color: color,
+                });
+            }
+        }
+
+        Self {
+            width,
+            height,
+            characters,
+            fallback_color,
+        }
+    }
+
+    fn render(
+        &self,
+        mut transform: impl FnMut(usize, &InputCharacter) -> RenderedCharacter,
+    ) -> String {
+        let mut canvas = Canvas::new(self.width, self.height);
+
+        if self.characters.is_empty() {
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style::with_colors(ColorPair::new(
+                    Some(self.fallback_color),
+                    None,
+                )),
+            );
+        } else {
+            for (index, character) in self.characters.iter().enumerate() {
+                let rendered = transform(index, character);
+                canvas.set(
+                    rendered.coord,
+                    rendered.symbol,
+                    Style::with_colors(ColorPair::new(
+                        Some(rendered.color),
+                        None,
+                    )),
+                );
+            }
+        }
+
+        canvas.render()
+    }
+}
+
+fn interpolate(start: f64, end: f64, progress: f64) -> i32 {
+    (start + (end - start) * progress.clamp(0.0, 1.0)).round() as i32
+}
+
+fn deterministic_shuffle(values: &mut [usize], input: &str) {
+    let mut state = 0xcbf2_9ce4_8422_2325_u64;
+
+    for byte in input.bytes() {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    for index in (1..values.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+
+        let swap_index = (state as usize) % (index + 1);
+        values.swap(index, swap_index);
     }
 }

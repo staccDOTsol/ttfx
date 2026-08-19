@@ -1,15 +1,73 @@
 
 use super::Effect;
-use crate::engine::{CharacterId, Terminal};
-use crate::utils::{Color, Coord, Style};
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::{Color, Gradient, Style};
 
-/// A retro synthwave grid that expands from the center before revealing the text.
-#[derive(Debug, Clone, Copy, Default)]
 pub struct Synthgrid;
 
 impl Synthgrid {
     pub fn new() -> Self {
         Self
+    }
+
+    fn input_cells(input: &str) -> Vec<Vec<char>> {
+        let input = input.trim_end_matches(|character| {
+            character == '\n' || character == '\r'
+        });
+
+        if input.is_empty() {
+            return vec![Vec::new()];
+        }
+
+        input
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').chars().collect())
+            .collect()
+    }
+
+    fn grid_symbol(column: usize, row: usize, height: usize) -> &'static str {
+        let vertical = column % 4 == 0;
+        let horizontal = (height.saturating_sub(1).saturating_sub(row)) % 2 == 0;
+
+        match (vertical, horizontal) {
+            (true, true) => "┼",
+            (true, false) => "│",
+            (false, true) => "─",
+            (false, false) => "·",
+        }
+    }
+
+    fn gradient_color(
+        colors: &[Color],
+        column: usize,
+        row: usize,
+        width: usize,
+        height: usize,
+    ) -> Color {
+        let maximum = width.saturating_sub(1) + height.saturating_sub(1);
+        let offset = column + height.saturating_sub(1).saturating_sub(row);
+        let index = if maximum == 0 {
+            0
+        } else {
+            offset * colors.len().saturating_sub(1) / maximum
+        };
+
+        colors[index.min(colors.len().saturating_sub(1))]
+    }
+
+    fn style(color: Color, bold: bool) -> Style {
+        Style {
+            foreground: Some(color),
+            bold,
+            ..Style::default()
+        }
+    }
+}
+
+impl Default for Synthgrid {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -19,237 +77,197 @@ impl Effect for Synthgrid {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-
-        let input_characters: Vec<(CharacterId, char, Coord)> = terminal
-            .characters()
+        let cells = Self::input_cells(input);
+        let height = cells.len().max(1);
+        let width = cells
             .iter()
-            .map(|character| (character.id, character.input_symbol, character.position))
-            .collect();
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
-        for (id, _, _) in &input_characters {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = false;
-            }
-        }
+        let grid_gradient = Gradient::new(
+            [
+                Color::new(0x35, 0x05, 0x73),
+                Color::new(0x8a, 0x16, 0xd1),
+                Color::new(0xff, 0x2b, 0xd6),
+                Color::new(0x00, 0xd9, 0xff),
+            ],
+            width + height - 1,
+        )
+        .colors();
 
-        let center = Coord::new(
-            (width.saturating_sub(1) / 2) as i32,
-            (height.saturating_sub(1) / 2) as i32,
-        );
+        let text_gradient = Gradient::new(
+            [
+                Color::new(0x00, 0xff, 0xff),
+                Color::new(0x84, 0xff, 0xf5),
+                Color::new(0xff, 0x66, 0xe8),
+                Color::new(0xff, 0x2b, 0x8a),
+            ],
+            width + height - 1,
+        )
+        .colors();
 
-        let mut grid_characters = Vec::new();
-
-        for y in 0..height {
-            for x in 0..width {
-                let coord = Coord::new(x as i32, y as i32);
-                let vertical = (coord.x - center.x).rem_euclid(4) == 0;
-                let horizontal = (coord.y - center.y).rem_euclid(2) == 0;
-
-                if !vertical && !horizontal {
-                    continue;
-                }
-
-                let symbol = match (vertical, horizontal) {
-                    (true, true) => '┼',
-                    (true, false) => '│',
-                    (false, true) => '─',
-                    (false, false) => unreachable!(),
-                };
-
-                let id = terminal.add_character(symbol, coord);
-                let distance = normalized_distance(coord, center, width, height);
-                let style = Style::default()
-                    .with_foreground(two_stop_gradient(
-                        (0xcc, 0x00, 0xcc),
-                        (0xff, 0xff, 0xff),
-                        distance,
-                    ));
-
-                if let Some(character) = terminal.character_mut(id) {
-                    character.visible = false;
-                    character.set_appearance(symbol, style);
-                }
-
-                grid_characters.push((id, coord));
-            }
-        }
-
+        let dark = Color::new(0x18, 0x04, 0x31);
+        let white = Color::new(0xff, 0xff, 0xff);
         let mut frames = Vec::new();
-        frames.push(terminal.render_frame());
 
-        const EXPANSION_STEPS: usize = 10;
+        let grid_frames = (width + height).clamp(8, 24);
+        for frame_index in 0..grid_frames {
+            let denominator = grid_frames.saturating_sub(1).max(1) as f64;
+            let progress = easing::out_expo(frame_index as f64 / denominator);
+            let mut canvas = Canvas::new(width, height);
 
-        for step in 0..EXPANSION_STEPS {
-            let progress = (step + 1) as f64 / EXPANSION_STEPS as f64;
+            for row in 0..height {
+                for column in 0..width {
+                    let vertical_distance = if height <= 1 {
+                        0.0
+                    } else {
+                        (height - 1 - row) as f64 / (height - 1) as f64
+                    };
+                    let center = (width.saturating_sub(1)) as f64 / 2.0;
+                    let horizontal_distance = if center <= f64::EPSILON {
+                        0.0
+                    } else {
+                        (column as f64 - center).abs() / center
+                    };
 
-            for (id, coord) in &grid_characters {
-                let distance = normalized_distance(*coord, center, width, height);
+                    let activation =
+                        vertical_distance * 0.62 + horizontal_distance * 0.38;
+                    let base_color = Self::gradient_color(
+                        &grid_gradient,
+                        column,
+                        row,
+                        width,
+                        height,
+                    );
+                    let visible = activation <= progress;
+                    let color = if visible {
+                        dark.lerp(base_color, 0.45 + progress * 0.55)
+                    } else {
+                        dark
+                    };
+                    let symbol = if visible {
+                        Self::grid_symbol(column, row, height)
+                    } else {
+                        " "
+                    };
 
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.visible = distance <= progress;
+                    canvas.set(
+                        crate::utils::Coord::new(column as i32, row as i32),
+                        symbol,
+                        Self::style(color, visible),
+                    );
                 }
             }
 
-            frames.push(terminal.render_frame());
+            frames.push(canvas.render());
         }
 
-        // Briefly hold the completed grid.
-        frames.push(terminal.render_frame());
-        frames.push(terminal.render_frame());
+        let reveal_frames = (width + height).clamp(10, 30);
+        for frame_index in 0..reveal_frames {
+            let denominator = reveal_frames.saturating_sub(1).max(1) as f64;
+            let progress =
+                easing::in_out_cubic(frame_index as f64 / denominator);
+            let mut canvas = Canvas::new(width, height);
 
-        let reveal_steps = (width + height).clamp(8, 24);
-        let reveal_duration = reveal_steps + 4;
-
-        for frame_index in 0..reveal_duration {
-            for (id, coord) in &grid_characters {
-                let disappearance_step =
-                    deterministic_noise(coord.x, coord.y) % reveal_steps.max(1);
-
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.visible = frame_index < disappearance_step;
-                }
-            }
-
-            for (id, symbol, coord) in &input_characters {
-                let delay = reveal_delay(*coord, width, height, reveal_steps);
-
-                if frame_index < delay {
-                    continue;
-                }
-
-                let stage = frame_index - delay;
-                let final_style = Style::default()
-                    .with_foreground(text_gradient(*coord, width, height));
-
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.visible = true;
-
-                    if symbol.is_whitespace() {
-                        character.set_appearance(*symbol, final_style);
+            for row in 0..height {
+                for column in 0..width {
+                    let vertical = if height <= 1 {
+                        0.0
                     } else {
-                        match stage {
-                            0 => character.set_appearance(
-                                '░',
-                                Style::default()
-                                    .with_foreground(Color::rgb(0x8a, 0x00, 0x8a)),
+                        (height - 1 - row) as f64 / (height - 1) as f64
+                    };
+                    let center = (width.saturating_sub(1)) as f64 / 2.0;
+                    let horizontal = if center <= f64::EPSILON {
+                        0.0
+                    } else {
+                        (column as f64 - center).abs() / center
+                    };
+                    let reveal_at = vertical * 0.72 + horizontal * 0.28;
+
+                    let grid_color = Self::gradient_color(
+                        &grid_gradient,
+                        column,
+                        row,
+                        width,
+                        height,
+                    );
+                    let text_color = Self::gradient_color(
+                        &text_gradient,
+                        column,
+                        row,
+                        width,
+                        height,
+                    );
+
+                    let input_symbol = cells
+                        .get(row)
+                        .and_then(|line| line.get(column))
+                        .copied()
+                        .unwrap_or(' ');
+
+                    if reveal_at <= progress {
+                        canvas.set(
+                            crate::utils::Coord::new(
+                                column as i32,
+                                row as i32,
                             ),
-                            1 => character.set_appearance(
-                                '▒',
-                                Style::default()
-                                    .with_foreground(Color::rgb(0xcc, 0x00, 0xcc)),
+                            input_symbol.to_string(),
+                            Self::style(
+                                grid_color.lerp(text_color, progress),
+                                true,
                             ),
-                            2 => character.set_appearance(
-                                '▓',
-                                Style::default()
-                                    .with_foreground(Color::rgb(0x00, 0xd1, 0xff)),
+                        );
+                    } else {
+                        canvas.set(
+                            crate::utils::Coord::new(
+                                column as i32,
+                                row as i32,
                             ),
-                            _ => character.set_appearance(*symbol, final_style),
-                        }
+                            Self::grid_symbol(column, row, height),
+                            Self::style(dark.lerp(grid_color, 0.55), false),
+                        );
                     }
                 }
             }
 
-            frames.push(terminal.render_frame());
+            frames.push(canvas.render());
         }
 
-        for (id, _) in &grid_characters {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = false;
+        for frame_index in 0..6 {
+            let progress = frame_index as f64 / 5.0;
+            let glow = (std::f64::consts::PI * progress).sin() * 0.35;
+            let mut canvas = Canvas::new(width, height);
+
+            for row in 0..height {
+                for column in 0..width {
+                    let symbol = cells
+                        .get(row)
+                        .and_then(|line| line.get(column))
+                        .copied()
+                        .unwrap_or(' ');
+
+                    let color = Self::gradient_color(
+                        &text_gradient,
+                        column,
+                        row,
+                        width,
+                        height,
+                    )
+                    .lerp(white, glow);
+
+                    canvas.set(
+                        crate::utils::Coord::new(column as i32, row as i32),
+                        symbol.to_string(),
+                        Self::style(color, true),
+                    );
+                }
             }
+
+            frames.push(canvas.render());
         }
 
-        for (id, symbol, coord) in &input_characters {
-            let style =
-                Style::default().with_foreground(text_gradient(*coord, width, height));
-
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = true;
-                character.set_appearance(*symbol, style);
-            }
-        }
-
-        frames.push(terminal.render_frame());
         frames
     }
-}
-
-fn normalized_distance(coord: Coord, center: Coord, width: usize, height: usize) -> f64 {
-    let dx = (coord.x - center.x).unsigned_abs() as f64;
-    let dy = (coord.y - center.y).unsigned_abs() as f64;
-    let max_dx = center.x.max(width as i32 - 1 - center.x).max(1) as f64;
-    let max_dy = center.y.max(height as i32 - 1 - center.y).max(1) as f64;
-
-    (dx / max_dx).max(dy / max_dy).clamp(0.0, 1.0)
-}
-
-fn reveal_delay(coord: Coord, width: usize, height: usize, steps: usize) -> usize {
-    let denominator = width.saturating_sub(1) + height.saturating_sub(1);
-
-    if denominator == 0 {
-        return 0;
-    }
-
-    let diagonal = coord.x.max(0) as usize + coord.y.max(0) as usize;
-    diagonal.saturating_mul(steps.saturating_sub(1)) / denominator
-}
-
-fn deterministic_noise(x: i32, y: i32) -> usize {
-    let x = x as i64;
-    let y = y as i64;
-    let mixed = x
-        .wrapping_mul(73_856_093)
-        .wrapping_add(y.wrapping_mul(19_349_663))
-        .wrapping_add((x ^ y).wrapping_mul(83_492_791));
-
-    mixed.unsigned_abs() as usize
-}
-
-fn text_gradient(coord: Coord, width: usize, height: usize) -> Color {
-    let denominator = width.saturating_sub(1) + height.saturating_sub(1);
-    let progress = if denominator == 0 {
-        1.0
-    } else {
-        let diagonal = coord.x.max(0) as usize + coord.y.max(0) as usize;
-        diagonal as f64 / denominator as f64
-    };
-
-    three_stop_gradient(
-        (0x8a, 0x00, 0x8a),
-        (0x00, 0xd1, 0xff),
-        (0xff, 0xff, 0xff),
-        progress,
-    )
-}
-
-fn two_stop_gradient(start: (u8, u8, u8), end: (u8, u8, u8), progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-
-    Color::rgb(
-        interpolate_channel(start.0, end.0, progress),
-        interpolate_channel(start.1, end.1, progress),
-        interpolate_channel(start.2, end.2, progress),
-    )
-}
-
-fn three_stop_gradient(
-    start: (u8, u8, u8),
-    middle: (u8, u8, u8),
-    end: (u8, u8, u8),
-    progress: f64,
-) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-
-    if progress <= 0.5 {
-        two_stop_gradient(start, middle, progress * 2.0)
-    } else {
-        two_stop_gradient(middle, end, (progress - 0.5) * 2.0)
-    }
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

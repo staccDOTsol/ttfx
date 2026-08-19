@@ -1,18 +1,23 @@
+use std::collections::BTreeMap;
+
 use crate::utils::graphics::Style;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CharacterVisual {
-    pub symbol: char,
+    pub symbol: String,
     pub style: Style,
 }
 
 impl CharacterVisual {
-    pub fn new(symbol: char, style: Style) -> Self {
-        Self { symbol, style }
+    pub fn new(symbol: impl Into<String>, style: Style) -> Self {
+        Self {
+            symbol: symbol.into(),
+            style,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub visual: CharacterVisual,
     pub duration: u32,
@@ -27,36 +32,27 @@ impl Frame {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Scene {
+    pub id: String,
     frames: Vec<Frame>,
-    frame_index: usize,
-    frame_tick: u32,
     looping: bool,
+    frame_index: usize,
+    elapsed: u32,
     active: bool,
-    finished: bool,
+    complete: bool,
 }
 
 impl Scene {
-    pub fn new(looping: bool) -> Self {
+    pub fn new(id: impl Into<String>, looping: bool) -> Self {
         Self {
+            id: id.into(),
             frames: Vec::new(),
-            frame_index: 0,
-            frame_tick: 0,
             looping,
-            active: false,
-            finished: false,
-        }
-    }
-
-    pub fn with_frames(frames: Vec<Frame>, looping: bool) -> Self {
-        Self {
-            frames,
             frame_index: 0,
-            frame_tick: 0,
-            looping,
+            elapsed: 0,
             active: false,
-            finished: false,
+            complete: false,
         }
     }
 
@@ -74,9 +70,9 @@ impl Scene {
         }
 
         self.frame_index = 0;
-        self.frame_tick = 0;
+        self.elapsed = 0;
         self.active = true;
-        self.finished = false;
+        self.complete = false;
         true
     }
 
@@ -88,8 +84,8 @@ impl Scene {
         self.active
     }
 
-    pub fn is_finished(&self) -> bool {
-        self.finished
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     pub fn current_visual(&self) -> Option<&CharacterVisual> {
@@ -103,82 +99,109 @@ impl Scene {
             return None;
         }
 
-        let frame = self.frames[self.frame_index].clone();
-        self.frame_tick += 1;
+        let visual = self.frames[self.frame_index].visual.clone();
+        self.elapsed += 1;
 
-        if self.frame_tick >= frame.duration {
-            self.frame_tick = 0;
-            self.frame_index += 1;
+        if self.elapsed >= self.frames[self.frame_index].duration {
+            self.elapsed = 0;
 
-            if self.frame_index >= self.frames.len() {
-                if self.looping {
-                    self.frame_index = 0;
-                } else {
-                    self.frame_index = self.frames.len() - 1;
-                    self.active = false;
-                    self.finished = true;
-                }
+            if self.frame_index + 1 < self.frames.len() {
+                self.frame_index += 1;
+            } else if self.looping {
+                self.frame_index = 0;
+            } else {
+                self.active = false;
+                self.complete = true;
             }
         }
 
-        Some(frame.visual)
+        Some(visual)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default)]
 pub struct Animation {
-    current: CharacterVisual,
-    active_scene: Option<Scene>,
+    scenes: BTreeMap<String, Scene>,
+    active_scene: Option<String>,
+    current_visual: Option<CharacterVisual>,
 }
 
 impl Animation {
-    pub fn new(symbol: char, style: Style) -> Self {
-        Self {
-            current: CharacterVisual::new(symbol, style),
-            active_scene: None,
+    pub fn add_scene(&mut self, scene: Scene) -> Option<Scene> {
+        self.scenes.insert(scene.id.clone(), scene)
+    }
+
+    pub fn create_scene(
+        &mut self,
+        id: impl Into<String>,
+        looping: bool,
+    ) -> &mut Scene {
+        let id = id.into();
+        self.scenes
+            .entry(id.clone())
+            .or_insert_with(|| Scene::new(id, looping))
+    }
+
+    pub fn scene(&self, id: &str) -> Option<&Scene> {
+        self.scenes.get(id)
+    }
+
+    pub fn scene_mut(&mut self, id: &str) -> Option<&mut Scene> {
+        self.scenes.get_mut(id)
+    }
+
+    pub fn activate(&mut self, id: &str) -> bool {
+        if let Some(previous_id) = self.active_scene.take() {
+            if let Some(previous) = self.scenes.get_mut(&previous_id) {
+                previous.deactivate();
+            }
         }
-    }
 
-    pub fn current_visual(&self) -> &CharacterVisual {
-        &self.current
-    }
+        let Some(scene) = self.scenes.get_mut(id) else {
+            return false;
+        };
 
-    pub fn set_appearance(&mut self, symbol: char, style: Style) {
-        self.current = CharacterVisual::new(symbol, style);
-    }
-
-    pub fn activate_scene(&mut self, mut scene: Scene) -> bool {
         if !scene.activate() {
             return false;
         }
 
-        if let Some(visual) = scene.current_visual() {
-            self.current = visual.clone();
-        }
-
-        self.active_scene = Some(scene);
+        self.current_visual = scene.current_visual().cloned();
+        self.active_scene = Some(id.to_owned());
         true
     }
 
-    pub fn active_scene(&self) -> Option<&Scene> {
-        self.active_scene.as_ref()
-    }
-
-    pub fn active_scene_mut(&mut self) -> Option<&mut Scene> {
-        self.active_scene.as_mut()
-    }
-
     pub fn deactivate(&mut self) {
-        if let Some(scene) = &mut self.active_scene {
-            scene.deactivate();
+        if let Some(id) = self.active_scene.take() {
+            if let Some(scene) = self.scenes.get_mut(&id) {
+                scene.deactivate();
+            }
         }
-        self.active_scene = None;
+    }
+
+    pub fn current_visual(&self) -> Option<&CharacterVisual> {
+        self.current_visual.as_ref()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active_scene
+            .as_ref()
+            .and_then(|id| self.scenes.get(id))
+            .is_some_and(Scene::is_active)
     }
 
     pub fn step(&mut self) -> Option<CharacterVisual> {
-        let scene = self.active_scene.as_mut()?;
-        let visual = scene.step()?;
-        self.current = visual.clone();
-        Some(visual)
+        let id = self.active_scene.clone()?;
+        let scene = self.scenes.get_mut(&id)?;
+        let visual = scene.step();
+
+        if let Some(visual) = &visual {
+            self.current_visual = Some(visual.clone());
+        }
+
+        if !scene.is_active() {
+            self.active_scene = None;
+        }
+
+        visual
     }
 }

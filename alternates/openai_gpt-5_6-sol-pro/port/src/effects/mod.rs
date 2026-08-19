@@ -1,3 +1,4 @@
+pub mod beams;
 pub mod binarypath;
 pub mod blackhole;
 pub mod bouncyballs;
@@ -5,6 +6,7 @@ pub mod bubbles;
 pub mod burn;
 pub mod colorshift;
 pub mod crumble;
+pub mod decrypt;
 pub mod errorcorrect;
 pub mod expand;
 pub mod fireworks;
@@ -12,10 +14,6 @@ pub mod highlight;
 pub mod laseretch;
 pub mod matrix;
 pub mod middleout;
-pub mod overflow;
-pub mod pour;
-pub mod beams;
-pub mod decrypt;
 pub mod orbittingvolley;
 pub mod print;
 pub mod rain;
@@ -33,8 +31,10 @@ pub mod thunderstorm;
 pub mod unstable;
 pub mod vhstape;
 pub mod waves;
-pub mod wipe;
+pub mod overflow;
+pub mod pour;
 pub mod random_sequence;
+pub mod wipe;
 
 pub trait Effect {
     fn name(&self) -> &str;
@@ -43,6 +43,7 @@ pub trait Effect {
 
 pub fn registry() -> Vec<Box<dyn Effect>> {
     vec![
+        Box::new(beams::Beams::new()),
         Box::new(binarypath::Binarypath::new()),
         Box::new(blackhole::Blackhole::new()),
         Box::new(bouncyballs::Bouncyballs::new()),
@@ -50,6 +51,7 @@ pub fn registry() -> Vec<Box<dyn Effect>> {
         Box::new(burn::Burn::new()),
         Box::new(colorshift::Colorshift::new()),
         Box::new(crumble::Crumble::new()),
+        Box::new(decrypt::Decrypt::new()),
         Box::new(errorcorrect::Errorcorrect::new()),
         Box::new(expand::Expand::new()),
         Box::new(fireworks::Fireworks::new()),
@@ -57,10 +59,6 @@ pub fn registry() -> Vec<Box<dyn Effect>> {
         Box::new(laseretch::Laseretch::new()),
         Box::new(matrix::Matrix::new()),
         Box::new(middleout::Middleout::new()),
-        Box::new(overflow::Overflow::new()),
-        Box::new(pour::Pour::new()),
-        Box::new(beams::Beams::new()),
-        Box::new(decrypt::Decrypt::new()),
         Box::new(orbittingvolley::Orbittingvolley::new()),
         Box::new(print::Print::new()),
         Box::new(rain::Rain::new()),
@@ -78,7 +76,9 @@ pub fn registry() -> Vec<Box<dyn Effect>> {
         Box::new(unstable::Unstable::new()),
         Box::new(vhstape::Vhstape::new()),
         Box::new(waves::Waves::new()),
-        Box::new(wipe::Wipe::new()),
-        Box::new(random_sequence::RandomSequence::new())
+        Box::new(overflow::Overflow::new()),
+        Box::new(pour::Pour::new()),
+        Box::new(random_sequence::RandomSequence::new()),
+        Box::new(wipe::Wipe::new())
     ]
 }

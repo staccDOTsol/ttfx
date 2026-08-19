@@ -1,11 +1,9 @@
-use std::collections::HashSet;
+use std::f64::consts::PI;
 
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::easing::{in_expo, in_out_sine, out_expo, out_quad};
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
-use crate::utils::EasingFn;
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::{Color, ColorPair, Coord, Gradient, Style};
 
 pub struct Blackhole;
 
@@ -27,452 +25,416 @@ impl Effect for Blackhole {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let mut frames = Vec::new();
-
-        let ids: Vec<CharacterId> = terminal
-            .characters()
+        let lines: Vec<&str> = input.lines().collect();
+        let width = lines
             .iter()
-            .map(|character| character.id)
-            .collect();
+            .map(|line| line.trim_end_matches('\r').chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
 
-        if ids.is_empty() {
-            frames.push(terminal.render_frame());
-            return frames;
+        let final_gradient = Gradient::new(
+            [
+                Color::new(0x5f, 0x1f, 0x99),
+                Color::new(0x00, 0xd4, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+                Color::new(0xff, 0xb0, 0x00),
+            ],
+            96,
+        )
+        .colors();
+        let blackhole_gradient = Gradient::new(
+            [
+                Color::new(0x20, 0x00, 0x38),
+                Color::new(0x76, 0x18, 0xb8),
+                Color::new(0xff, 0x36, 0xd8),
+                Color::new(0xff, 0xf0, 0x91),
+            ],
+            48,
+        )
+        .colors();
+        let fade_gradient = Gradient::new(
+            [
+                Color::new(0x08, 0x05, 0x12),
+                Color::new(0x24, 0x10, 0x40),
+                Color::new(0x78, 0x2e, 0xa8),
+            ],
+            32,
+        )
+        .colors();
+
+        let mut characters = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.trim_end_matches('\r').chars().enumerate() {
+                if symbol.is_whitespace() {
+                    continue;
+                }
+
+                let hash = mix(
+                    column as u64
+                        ^ ((row as u64) << 21)
+                        ^ symbol as u32 as u64,
+                );
+                let color_index = ((row * width + column) * final_gradient.len())
+                    / (width * height).max(1);
+
+                characters.push(BlackholeCharacter {
+                    symbol: symbol.to_string(),
+                    input_coord: Coord::new(column as i32, row as i32),
+                    final_color: final_gradient
+                        [color_index.min(final_gradient.len() - 1)],
+                    hash,
+                });
+            }
         }
 
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
+        if characters.is_empty() {
+            return vec![render_frame(
+                width,
+                height,
+                vec![Draw {
+                    coord: Coord::new(0, 0),
+                    symbol: " ".to_owned(),
+                    color: Color::new(0x76, 0x18, 0xb8),
+                    bold: false,
+                }],
+            )];
+        }
+
         let center = Coord::new(
             (width.saturating_sub(1) / 2) as i32,
             (height.saturating_sub(1) / 2) as i32,
         );
+        let visual_width = width as f64;
+        let visual_height = height as f64 * 2.0;
+        let radius = (visual_width.min(visual_height) * 0.22)
+            .max(1.5)
+            .min((visual_width.max(2.0) - 1.0) / 2.0);
 
-        let original_positions: Vec<(CharacterId, Coord)> = terminal
-            .characters()
-            .iter()
-            .map(|character| (character.id, character.position))
-            .collect();
+        let ring_count = ((characters.len() + 7) / 8)
+            .max(3)
+            .min(characters.len());
+        let mut ranked: Vec<usize> = (0..characters.len()).collect();
+        ranked.sort_by_key(|&index| characters[index].hash);
+        let ring_indices = ranked[..ring_count].to_vec();
 
-        let seed = input
-            .bytes()
-            .fold(0x9e37_79b9_7f4a_7c15_u64, |state, byte| {
-                state
-                    .wrapping_mul(0x100_0000_01b3)
-                    .wrapping_add(u64::from(byte) + 1)
-            });
-        let mut rng = SmallRng::new(seed);
+        let mut is_ring = vec![false; characters.len()];
+        for &index in &ring_indices {
+            is_ring[index] = true;
+        }
 
-        let radius_limit = width.min(height).saturating_sub(1) / 2;
-        let radius = radius_limit.max(1) as i32;
-        let desired_ring_size =
-            ((2.0 * std::f64::consts::PI * f64::from(radius)).round() as usize).max(1);
-        let ring_size = desired_ring_size.min(ids.len());
-        let ring_ids = ids[ids.len() - ring_size..].to_vec();
-        let ring_set: HashSet<CharacterId> = ring_ids.iter().copied().collect();
-        let ring_positions = circle_positions(center, radius, ring_size, width, height);
+        let remaining_indices: Vec<usize> = ranked[ring_count..].to_vec();
+        let mut frames = Vec::new();
 
-        let star_symbols = ['.', '`', '\'', ',', '*'];
-        let star_colors = [
-            Color::rgb(255, 204, 0),
-            Color::rgb(255, 153, 0),
-            Color::rgb(255, 102, 0),
-            Color::rgb(255, 255, 255),
-        ];
+        // The input first appears as dim matter suspended around the future singularity.
+        for frame in 0..12 {
+            let progress = (frame + 1) as f64 / 12.0;
+            let eased = easing::out_sine(progress);
+            let mut draws = Vec::with_capacity(characters.len());
 
-        for id in &ids {
-            let position = random_coord(&mut rng, width, height);
-            let symbol = star_symbols[rng.index(star_symbols.len())];
-            let color = star_colors[rng.index(star_colors.len())];
-
-            if let Some(character) = terminal.character_mut(*id) {
-                character.set_position(position);
-                character.visible = true;
-                character.set_appearance(symbol, colored_style(color));
+            for character in &characters {
+                let shimmer = ((character.hash >> (frame % 16)) & 7) as usize;
+                let color_index = ((eased * 20.0) as usize + shimmer)
+                    .min(fade_gradient.len() - 1);
+                draws.push(Draw {
+                    coord: character.input_coord,
+                    symbol: character.symbol.clone(),
+                    color: fade_gradient[color_index],
+                    bold: false,
+                });
             }
+
+            frames.push(render_frame(width, height, draws));
         }
 
-        frames.push(terminal.render_frame());
+        // A subset of the text forms the rotating event horizon.
+        for frame in 0..30 {
+            let progress = easing::in_out_sine((frame + 1) as f64 / 30.0);
+            let mut draws = Vec::with_capacity(characters.len());
 
-        for (index, id) in ring_ids.iter().enumerate() {
-            let speed = 0.55 + rng.unit() * 0.25;
-            activate_move(
-                &mut terminal,
-                *id,
-                ring_positions[index],
-                speed,
-                in_out_sine,
-            );
-        }
-
-        run_until_still(
-            &mut terminal,
-            &ring_ids,
-            phase_limit(width, height, 4.0, 40),
-            &mut frames,
-        );
-
-        let blackhole_color = Color::rgb(255, 255, 255);
-        for (index, id) in ring_ids.iter().enumerate() {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = true;
-                character.set_appearance('*', colored_style(blackhole_color));
-
-                let mut path = Path::new(0.45);
-                path.set_looping(true);
-                path.set_easing(in_out_sine);
-
-                for offset in 0..=ring_positions.len() {
-                    let position_index = (index + offset) % ring_positions.len();
-                    path.add_waypoint(Waypoint::new(ring_positions[position_index]));
+            for (index, character) in characters.iter().enumerate() {
+                if !is_ring[index] {
+                    draws.push(Draw {
+                        coord: character.input_coord,
+                        symbol: character.symbol.clone(),
+                        color: character
+                            .final_color
+                            .lerp(Color::new(0x18, 0x08, 0x28), progress * 0.8),
+                        bold: false,
+                    });
                 }
-
-                character.motion.activate_path(path);
             }
+
+            for (ring_position, &index) in ring_indices.iter().enumerate() {
+                let angle = ring_position as f64 / ring_count as f64 * PI * 2.0
+                    + progress * PI / 3.0;
+                let destination = ring_coord(center, radius, angle);
+                let coord = characters[index]
+                    .input_coord
+                    .lerp(destination, progress);
+                let color_index =
+                    (ring_position * 7 + frame) % blackhole_gradient.len();
+
+                draws.push(Draw {
+                    coord,
+                    symbol: if progress > 0.35 {
+                        "*".to_owned()
+                    } else {
+                        characters[index].symbol.clone()
+                    },
+                    color: blackhole_gradient[color_index],
+                    bold: true,
+                });
+            }
+
+            frames.push(render_frame(width, height, draws));
         }
 
-        let mut pending: Vec<CharacterId> = ids
-            .iter()
-            .copied()
-            .filter(|id| !ring_set.contains(id))
-            .collect();
-        shuffle(&mut pending, &mut rng);
+        // Matter spirals into the black hole while the event horizon rotates.
+        let consumption_frames =
+            (38 + remaining_indices.len().saturating_mul(2)).min(110);
+        for frame in 0..consumption_frames {
+            let global = (frame + 1) as f64 / consumption_frames as f64;
+            let mut draws = Vec::with_capacity(characters.len());
 
-        let mut consuming = HashSet::new();
-        let launch_count = (pending.len() / 40).max(1);
-        let consume_limit = phase_limit(width, height, 8.0, pending.len() + 100);
-
-        for _ in 0..consume_limit {
-            for _ in 0..launch_count {
-                let Some(id) = pending.pop() else {
-                    break;
+            for (order, &index) in remaining_indices.iter().enumerate() {
+                let start = if remaining_indices.is_empty() {
+                    0.0
+                } else {
+                    order as f64 / remaining_indices.len() as f64 * 0.72
                 };
+                let local = ((global - start) / 0.28).clamp(0.0, 1.0);
 
-                let speed = 0.17 + rng.unit() * 0.13;
-                activate_move(&mut terminal, id, center, speed, in_expo);
-                consuming.insert(id);
-            }
-
-            terminal.step();
-
-            let completed: Vec<CharacterId> = consuming
-                .iter()
-                .copied()
-                .filter(|id| !character_is_moving(&terminal, *id))
-                .collect();
-
-            for id in completed {
-                consuming.remove(&id);
-                if let Some(character) = terminal.character_mut(id) {
-                    character.visible = false;
-                    character.set_position(center);
+                if local >= 1.0 {
+                    continue;
                 }
+
+                let character = &characters[index];
+                let pull = easing::in_expo(local);
+                let dx = character.input_coord.column as f64 - center.column as f64;
+                let dy =
+                    (character.input_coord.row as f64 - center.row as f64) * 2.0;
+                let initial_radius = dx.hypot(dy);
+                let initial_angle = dy.atan2(dx);
+                let angle = initial_angle + pull * PI * 2.25;
+                let current_radius = initial_radius * (1.0 - pull);
+                let coord = Coord::new(
+                    (center.column as f64 + current_radius * angle.cos()).round()
+                        as i32,
+                    (center.row as f64
+                        + current_radius * angle.sin() / 2.0)
+                        .round() as i32,
+                );
+                let color = character.final_color.lerp(
+                    Color::new(0x72, 0x16, 0xa0),
+                    (pull * 1.2).min(1.0),
+                );
+
+                draws.push(Draw {
+                    coord,
+                    symbol: character.symbol.clone(),
+                    color,
+                    bold: pull > 0.65,
+                });
             }
 
-            frames.push(terminal.render_frame());
+            for (ring_position, _) in ring_indices.iter().enumerate() {
+                let angle = ring_position as f64 / ring_count as f64 * PI * 2.0
+                    + global * PI * 5.0;
+                let pulse = 1.0 + (global * PI * 12.0).sin() * 0.08;
+                let color_index =
+                    (ring_position * 5 + frame * 2) % blackhole_gradient.len();
 
-            if pending.is_empty() && consuming.is_empty() {
-                break;
+                draws.push(Draw {
+                    coord: ring_coord(center, radius * pulse, angle),
+                    symbol: "*".to_owned(),
+                    color: blackhole_gradient[color_index],
+                    bold: true,
+                });
             }
+
+            draws.push(Draw {
+                coord: center,
+                symbol: "●".to_owned(),
+                color: Color::new(0x08, 0x00, 0x10),
+                bold: true,
+            });
+
+            frames.push(render_frame(width, height, draws));
         }
 
-        for id in &ring_ids {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.motion.deactivate();
+        // The event horizon collapses into a single point.
+        for frame in 0..20 {
+            let progress = easing::in_quint((frame + 1) as f64 / 20.0);
+            let current_radius = radius * (1.0 - progress);
+            let mut draws = Vec::with_capacity(ring_count + 1);
+
+            for (ring_position, _) in ring_indices.iter().enumerate() {
+                let angle = ring_position as f64 / ring_count as f64 * PI * 2.0
+                    + progress * PI * 4.0;
+                let color_index =
+                    (ring_position * 3 + frame * 2) % blackhole_gradient.len();
+
+                draws.push(Draw {
+                    coord: ring_coord(center, current_radius, angle),
+                    symbol: "*".to_owned(),
+                    color: blackhole_gradient[color_index],
+                    bold: true,
+                });
             }
-            activate_move(&mut terminal, *id, center, 0.3, in_expo);
+
+            draws.push(Draw {
+                coord: center,
+                symbol: if frame > 15 { "◆" } else { "●" }.to_owned(),
+                color: blackhole_gradient
+                    [(frame * 2).min(blackhole_gradient.len() - 1)],
+                bold: true,
+            });
+
+            frames.push(render_frame(width, height, draws));
         }
 
-        run_until_still(
-            &mut terminal,
-            &ring_ids,
-            phase_limit(width, height, 6.0, 40),
-            &mut frames,
-        );
+        // The singularity bursts outward.
+        let particle_count = 24;
+        for frame in 0..18 {
+            let progress = easing::out_expo((frame + 1) as f64 / 18.0);
+            let maximum_radius = width.max(height * 2) as f64 * 0.65;
+            let mut draws = Vec::with_capacity(particle_count + 1);
 
-        for id in &ring_ids {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.set_position(center);
-                character.set_appearance('*', colored_style(blackhole_color));
+            for particle in 0..particle_count {
+                let jitter = mix(particle as u64 * 7919);
+                let angle = particle as f64 / particle_count as f64 * PI * 2.0
+                    + ((jitter & 255) as f64 / 255.0 - 0.5) * 0.25;
+                let distance = maximum_radius
+                    * progress
+                    * (0.55 + ((jitter >> 8) & 255) as f64 / 512.0);
+                let coord = ring_coord(center, distance, angle);
+                let color_index = ((1.0 - progress)
+                    * (blackhole_gradient.len() - 1) as f64)
+                    as usize;
+
+                draws.push(Draw {
+                    coord,
+                    symbol: if particle % 3 == 0 { "✦" } else { "*" }.to_owned(),
+                    color: blackhole_gradient[color_index],
+                    bold: true,
+                });
             }
+
+            draws.push(Draw {
+                coord: center,
+                symbol: "✹".to_owned(),
+                color: Color::new(0xff, 0xff, 0xe8),
+                bold: true,
+            });
+
+            frames.push(render_frame(width, height, draws));
         }
 
-        for pulse in 0..8 {
-            let color = if pulse % 2 == 0 {
-                Color::rgb(255, 255, 255)
-            } else {
-                Color::rgb(255, 153, 0)
-            };
+        // Every consumed character is restored to its original coordinate.
+        for frame in 0..48 {
+            let global = (frame + 1) as f64 / 48.0;
+            let mut draws = Vec::with_capacity(characters.len());
 
-            for id in &ring_ids {
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.set_appearance('*', colored_style(color));
+            for character in &characters {
+                let delay = (character.hash & 15) as f64 / 100.0;
+                let local = ((global - delay) / (1.0 - delay)).clamp(0.0, 1.0);
+                if local <= 0.0 {
+                    continue;
                 }
+
+                let progress = easing::out_expo(local);
+                let coord = center.lerp(character.input_coord, progress);
+                let hot = Color::new(0xff, 0xf3, 0xc0);
+                let color = hot.lerp(character.final_color, progress);
+
+                draws.push(Draw {
+                    coord,
+                    symbol: character.symbol.clone(),
+                    color,
+                    bold: local < 0.72,
+                });
             }
 
-            frames.push(terminal.render_frame());
+            frames.push(render_frame(width, height, draws));
         }
 
-        let explosion_colors = [
-            Color::rgb(255, 255, 255),
-            Color::rgb(255, 204, 0),
-            Color::rgb(255, 102, 0),
-            Color::rgb(255, 51, 0),
-        ];
+        // Hold the fully restored, colored text briefly.
+        for frame in 0..8 {
+            let mut draws = Vec::with_capacity(characters.len());
 
-        for id in &ids {
-            let destination = random_coord(&mut rng, width, height);
-            let color = explosion_colors[rng.index(explosion_colors.len())];
-            let symbol = star_symbols[rng.index(star_symbols.len())];
-
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = true;
-                character.set_position(center);
-                character.set_appearance(symbol, colored_style(color));
+            for character in &characters {
+                let pulse = ((character.hash as usize + frame) % 7) as f64 / 35.0;
+                draws.push(Draw {
+                    coord: character.input_coord,
+                    symbol: character.symbol.clone(),
+                    color: character
+                        .final_color
+                        .lerp(Color::new(0xff, 0xff, 0xff), pulse),
+                    bold: frame < 3,
+                });
             }
 
-            activate_move(
-                &mut terminal,
-                *id,
-                destination,
-                0.55 + rng.unit() * 0.35,
-                out_expo,
-            );
+            frames.push(render_frame(width, height, draws));
         }
 
-        run_until_still(
-            &mut terminal,
-            &ids,
-            phase_limit(width, height, 5.0, 80),
-            &mut frames,
-        );
-
-        for (id, original_position) in &original_positions {
-            activate_move(&mut terminal, *id, *original_position, 0.8, out_quad);
-        }
-
-        let home_limit = phase_limit(width, height, 4.0, 80);
-        for _ in 0..home_limit {
-            terminal.step();
-
-            for (id, original_position) in &original_positions {
-                if !character_is_moving(&terminal, *id) {
-                    let color = final_color(*original_position, center, width, height);
-                    if let Some(character) = terminal.character_mut(*id) {
-                        character.set_position(*original_position);
-                        character.set_appearance(
-                            character.input_symbol,
-                            colored_style(color),
-                        );
-                    }
-                }
-            }
-
-            frames.push(terminal.render_frame());
-
-            if !ids
-                .iter()
-                .any(|id| character_is_moving(&terminal, *id))
-            {
-                break;
-            }
-        }
-
-        for (id, original_position) in original_positions {
-            let color = final_color(original_position, center, width, height);
-            if let Some(character) = terminal.character_mut(id) {
-                character.motion.deactivate();
-                character.visible = true;
-                character.set_position(original_position);
-                character.set_appearance(character.input_symbol, colored_style(color));
-            }
-        }
-
-        frames.push(terminal.render_frame());
         frames
     }
 }
 
-fn activate_move(
-    terminal: &mut Terminal,
-    id: CharacterId,
-    destination: Coord,
-    speed: f64,
-    easing: EasingFn,
-) {
-    let Some(start) = terminal.character(id).map(|character| character.position) else {
-        return;
-    };
-
-    let mut path = Path::new(speed);
-    path.set_easing(easing);
-    path.add_waypoint(Waypoint::new(start));
-    path.add_waypoint(Waypoint::new(destination));
-
-    if let Some(character) = terminal.character_mut(id) {
-        character.motion.activate_path(path);
-    }
+#[derive(Clone)]
+struct BlackholeCharacter {
+    symbol: String,
+    input_coord: Coord,
+    final_color: Color,
+    hash: u64,
 }
 
-fn character_is_moving(terminal: &Terminal, id: CharacterId) -> bool {
-    terminal
-        .character(id)
-        .and_then(|character| character.motion.active_path())
-        .is_some_and(|path| path.is_active())
+struct Draw {
+    coord: Coord,
+    symbol: String,
+    color: Color,
+    bold: bool,
 }
 
-fn run_until_still(
-    terminal: &mut Terminal,
-    ids: &[CharacterId],
-    limit: usize,
-    frames: &mut Vec<String>,
-) {
-    for _ in 0..limit {
-        terminal.step();
-        frames.push(terminal.render_frame());
-
-        if !ids
-            .iter()
-            .any(|id| character_is_moving(terminal, *id))
-        {
-            break;
-        }
-    }
-}
-
-fn circle_positions(
-    center: Coord,
-    radius: i32,
-    count: usize,
-    width: usize,
-    height: usize,
-) -> Vec<Coord> {
-    let max_x = width.saturating_sub(1) as i32;
-    let max_y = height.saturating_sub(1) as i32;
-
-    (0..count.max(1))
-        .map(|index| {
-            let angle =
-                std::f64::consts::TAU * index as f64 / count.max(1) as f64;
-            let x = center.x + (angle.cos() * f64::from(radius)).round() as i32;
-            let y = center.y + (angle.sin() * f64::from(radius)).round() as i32;
-            Coord::new(x.clamp(0, max_x), y.clamp(0, max_y))
-        })
-        .collect()
-}
-
-fn random_coord(rng: &mut SmallRng, width: usize, height: usize) -> Coord {
-    Coord::new(rng.index(width.max(1)) as i32, rng.index(height.max(1)) as i32)
-}
-
-fn colored_style(color: Color) -> Style {
-    Style::default().with_foreground(color)
-}
-
-fn final_color(
-    position: Coord,
-    center: Coord,
-    width: usize,
-    height: usize,
-) -> Color {
-    let max_distance = ((width.max(1) as f64).powi(2)
-        + (height.max(1) as f64).powi(2))
-    .sqrt()
-    .max(1.0);
-    let progress = (position.distance(center) / max_distance).clamp(0.0, 1.0);
-
-    if progress < 0.5 {
-        interpolate_color(
-            Color::rgb(138, 0, 138),
-            Color::rgb(0, 209, 255),
-            progress * 2.0,
-        )
-    } else {
-        interpolate_color(
-            Color::rgb(0, 209, 255),
-            Color::rgb(255, 255, 255),
-            (progress - 0.5) * 2.0,
-        )
-    }
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return start;
-    };
-
-    let progress = progress.clamp(0.0, 1.0);
-    let interpolate = |from: u8, to: u8| {
-        (f64::from(from) + (f64::from(to) - f64::from(from)) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
+fn ring_coord(center: Coord, radius: f64, angle: f64) -> Coord {
+    Coord::new(
+        (center.column as f64 + radius * angle.cos()).round() as i32,
+        (center.row as f64 + radius * angle.sin() / 2.0).round() as i32,
     )
 }
 
-fn phase_limit(width: usize, height: usize, multiplier: f64, minimum: usize) -> usize {
-    let diagonal =
-        ((width.max(1) as f64).powi(2) + (height.max(1) as f64).powi(2)).sqrt();
-    ((diagonal * multiplier).ceil() as usize).max(minimum)
-}
+fn render_frame(width: usize, height: usize, draws: Vec<Draw>) -> String {
+    let mut canvas = Canvas::new(width, height);
+    let fallback_color = Color::new(0x76, 0x18, 0xb8);
+    let mut drew_visible_cell = false;
 
-fn shuffle<T>(values: &mut [T], rng: &mut SmallRng) {
-    for index in (1..values.len()).rev() {
-        let swap_index = rng.index(index + 1);
-        values.swap(index, swap_index);
-    }
-}
+    for draw in draws {
+        let style = Style {
+            bold: draw.bold,
+            ..Style::with_colors(ColorPair::new(Some(draw.color), None))
+        };
 
-struct SmallRng {
-    state: u64,
-}
-
-impl SmallRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0xa5a5_5a5a_d3c1_b2e7
-            } else {
-                seed
-            },
+        if canvas.set(draw.coord, draw.symbol, style) {
+            drew_visible_cell = true;
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        value
+    if !drew_visible_cell {
+        canvas.set(
+            Coord::new(0, 0),
+            " ",
+            Style::with_colors(ColorPair::new(Some(fallback_color), None)),
+        );
     }
 
-    fn unit(&mut self) -> f64 {
-        self.next_u64() as f64 / u64::MAX as f64
-    }
+    canvas.render()
+}
 
-    fn index(&mut self, upper_bound: usize) -> usize {
-        if upper_bound <= 1 {
-            0
-        } else {
-            (self.next_u64() % upper_bound as u64) as usize
-        }
-    }
+fn mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }

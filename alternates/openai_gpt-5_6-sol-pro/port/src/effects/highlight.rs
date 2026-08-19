@@ -1,24 +1,24 @@
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::Effect;
-use crate::engine::{CharacterId, CharacterVisual, Frame, Scene, Terminal};
-use crate::utils::{Color, Style};
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
-const HIGHLIGHT_DURATION: u32 = 3;
-const FINAL_GRADIENT_STEPS: f64 = 24.0;
+const HIGHLIGHT_COLOR: Color = Color::new(255, 255, 255);
+const HIGHLIGHT_DURATION: usize = 2;
+const HIGHLIGHT_STEPS: usize = 5;
+const FINAL_GRADIENT_STEPS: usize = 12;
 
-const GRADIENT_START: Color = Color::rgb(0x8a, 0x00, 0x8a);
-const GRADIENT_MIDDLE: Color = Color::rgb(0x00, 0xd1, 0xff);
-const GRADIENT_END: Color = Color::rgb(0xff, 0xff, 0xff);
-const HIGHLIGHT_COLOR: Color = Color::rgb(0xff, 0xff, 0xff);
-
-#[derive(Debug, Clone, Copy, Default)]
 pub struct Highlight;
 
 impl Highlight {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for Highlight {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -28,173 +28,111 @@ impl Effect for Highlight {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let input = input.trim_end_matches(&['\r', '\n'][..]);
+        let lines: Vec<Vec<char>> = if input.is_empty() {
+            vec![Vec::new()]
+        } else {
+            input
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r').chars().collect())
+                .collect()
+        };
 
-        if terminal.characters().is_empty() {
-            return Vec::new();
-        }
+        let width = lines.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let height = lines.len().max(1);
+        let has_characters = lines.iter().any(|line| !line.is_empty());
 
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
+        let final_palette = Gradient::new(
+            [
+                Color::new(0x8a, 0x00, 0x8a),
+                Color::new(0x00, 0xd1, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+            ],
+            FINAL_GRADIENT_STEPS,
+        )
+        .colors();
 
-        let mut groups: BTreeMap<i32, Vec<CharacterId>> = BTreeMap::new();
+        let base_colors: Vec<Color> = (0..height)
+            .map(|row| {
+                let palette_index = if height == 1 {
+                    0
+                } else {
+                    row * (final_palette.len() - 1) / (height - 1)
+                };
+                final_palette[palette_index]
+            })
+            .collect();
 
-        for character in terminal.characters_mut() {
-            let x_progress = axis_progress(character.position.x, width);
-            let y_progress = if height <= 1 {
-                0.0
-            } else {
-                1.0 - axis_progress(character.position.y, height)
-            };
-
-            let diagonal_progress = if width <= 1 {
-                y_progress
-            } else if height <= 1 {
-                x_progress
-            } else {
-                (x_progress + y_progress) / 2.0
-            };
-
-            let final_color = final_gradient(diagonal_progress);
-            let final_style = Style::default().with_foreground(final_color);
-            let highlight_style = Style::default().with_foreground(HIGHLIGHT_COLOR);
-
-            character.set_style(final_style.clone());
-
-            let scene = Scene::with_frames(
-                vec![
-                    Frame::new(
-                        CharacterVisual::new(character.input_symbol, highlight_style),
-                        HIGHLIGHT_DURATION,
-                    ),
-                    Frame::new(
-                        CharacterVisual::new(character.input_symbol, final_style),
-                        1,
-                    ),
-                ],
-                false,
+        if !has_characters {
+            let mut canvas = Canvas::new(1, 1);
+            canvas.fill(
+                " ",
+                Style {
+                    foreground: Some(base_colors[0]),
+                    ..Style::default()
+                },
             );
-
-            character.animation.activate_scene(scene);
-            character.animation.deactivate();
-
-            groups
-                .entry(character.position.x)
-                .or_default()
-                .push(character.id);
+            return vec![canvas.render()];
         }
 
-        let groups: Vec<Vec<CharacterId>> = groups.into_values().collect();
-        let mut next_group = 0;
-        let mut active = BTreeSet::new();
-        let mut frames = Vec::new();
+        let transition_palettes: Vec<Vec<Color>> = base_colors
+            .iter()
+            .map(|base| {
+                Gradient::new(
+                    [*base, HIGHLIGHT_COLOR, *base],
+                    HIGHLIGHT_STEPS,
+                )
+                .colors()
+            })
+            .collect();
 
-        while next_group < groups.len() || !active.is_empty() {
-            if let Some(group) = groups.get(next_group) {
-                for &id in group {
-                    if let Some(character) = terminal.character_mut(id) {
-                        let final_style = character.style.clone();
-                        let highlight_style =
-                            Style::default().with_foreground(HIGHLIGHT_COLOR);
+        let final_diagonal = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.iter()
+                    .enumerate()
+                    .map(move |(column, _)| row + column)
+            })
+            .max()
+            .unwrap_or(0);
 
-                        let scene = Scene::with_frames(
-                            vec![
-                                Frame::new(
-                                    CharacterVisual::new(
-                                        character.input_symbol,
-                                        highlight_style,
-                                    ),
-                                    HIGHLIGHT_DURATION,
-                                ),
-                                Frame::new(
-                                    CharacterVisual::new(
-                                        character.input_symbol,
-                                        final_style,
-                                    ),
-                                    1,
-                                ),
-                            ],
-                            false,
-                        );
+        let animation_length = HIGHLIGHT_STEPS * HIGHLIGHT_DURATION;
+        let frame_count = final_diagonal + animation_length;
+        let mut frames = Vec::with_capacity(frame_count);
 
-                        if character.animation.activate_scene(scene) {
-                            active.insert(id);
-                        }
-                    }
+        for tick in 0..frame_count {
+            let mut canvas = Canvas::new(width, height);
+
+            for (row, line) in lines.iter().enumerate() {
+                for (column, symbol) in line.iter().enumerate() {
+                    let activation_tick = row + column;
+                    let color = if tick >= activation_tick {
+                        let local_tick = tick - activation_tick;
+                        let color_index = local_tick / HIGHLIGHT_DURATION;
+
+                        transition_palettes[row]
+                            .get(color_index)
+                            .copied()
+                            .unwrap_or(base_colors[row])
+                    } else {
+                        base_colors[row]
+                    };
+
+                    canvas.set(
+                        Coord::new(column as i32, row as i32),
+                        symbol.to_string(),
+                        Style {
+                            foreground: Some(color),
+                            ..Style::default()
+                        },
+                    );
                 }
-
-                next_group += 1;
             }
 
-            terminal.step();
-
-            active.retain(|id| {
-                terminal
-                    .character(*id)
-                    .and_then(|character| character.animation.active_scene())
-                    .is_some_and(|scene| !scene.is_finished())
-            });
-
-            frames.push(terminal.render_frame());
+            frames.push(canvas.render());
         }
 
         frames
     }
-}
-
-fn axis_progress(position: i32, size: usize) -> f64 {
-    if size <= 1 {
-        0.0
-    } else {
-        (position.max(0) as f64 / (size - 1) as f64).clamp(0.0, 1.0)
-    }
-}
-
-fn final_gradient(progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-    let quantized = (progress * FINAL_GRADIENT_STEPS).round() / FINAL_GRADIENT_STEPS;
-
-    if quantized <= 0.5 {
-        interpolate_color(GRADIENT_START, GRADIENT_MIDDLE, quantized * 2.0)
-    } else {
-        interpolate_color(
-            GRADIENT_MIDDLE,
-            GRADIENT_END,
-            (quantized - 0.5) * 2.0,
-        )
-    }
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
-            },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => Color::rgb(
-            interpolate_channel(start_r, end_r, progress),
-            interpolate_channel(start_g, end_g, progress),
-            interpolate_channel(start_b, end_b, progress),
-        ),
-        (Color::Ansi(start), Color::Ansi(end)) => {
-            Color::ansi(interpolate_channel(start, end, progress))
-        }
-        _ if progress < 0.5 => start,
-        _ => end,
-    }
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    (f64::from(start) + (f64::from(end) - f64::from(start)) * progress)
-        .round()
-        .clamp(0.0, 255.0) as u8
 }

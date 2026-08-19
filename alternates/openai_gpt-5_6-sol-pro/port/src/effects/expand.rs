@@ -1,24 +1,30 @@
+
 use super::Effect;
-use crate::engine::{Path, Terminal, Waypoint};
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{Canvas, CharacterId, EffectCharacter};
+use crate::utils::easing;
+use crate::utils::{Color, ColorPair, Coord, Gradient, Style};
 
 const MOVEMENT_SPEED: f64 = 0.35;
-const FINAL_GRADIENT_STEPS: usize = 12;
-const EXPAND_GRADIENT_STEPS: usize = 10;
+const GRADIENT_STEPS: usize = 12;
 
-const FINAL_GRADIENT: [Color; 3] = [
-    Color::rgb(0x8a, 0x00, 0x8a),
-    Color::rgb(0x00, 0xd1, 0xff),
-    Color::rgb(0xff, 0xff, 0xff),
-];
+#[derive(Clone, Debug)]
+struct ExpandingCharacter {
+    character: EffectCharacter,
+    target: Coord,
+    total_steps: usize,
+}
 
-#[derive(Debug, Clone, Copy, Default)]
 pub struct Expand;
 
 impl Expand {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for Expand {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -28,194 +34,147 @@ impl Effect for Expand {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-
-        if terminal.characters().is_empty() {
+        let normalized = input.trim_end_matches(['\r', '\n']);
+        if normalized.is_empty() {
             return Vec::new();
         }
 
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
+        let lines = normalized
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').chars().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        let width = lines.iter().map(Vec::len).max().unwrap_or(0);
+        let height = lines.len();
+
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+
         let center = Coord::new(
-            (width.saturating_sub(1) / 2) as i32,
-            (height.saturating_sub(1) / 2) as i32,
+            ((width - 1) / 2) as i32,
+            (height / 2) as i32,
         );
 
-        let targets: Vec<Coord> = terminal
-            .characters()
-            .iter()
-            .map(|character| character.position)
-            .collect();
+        let palette = Gradient::new(
+            [
+                Color::new(0x8a, 0x00, 0x8a),
+                Color::new(0x00, 0xd1, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+            ],
+            GRADIENT_STEPS,
+        )
+        .colors();
 
-        let distances: Vec<f64> = targets
-            .iter()
-            .map(|target| center.distance(*target))
-            .collect();
+        let mut characters = Vec::new();
+        let mut next_id = 0_u32;
+        let mut maximum_steps = 0_usize;
 
-        let final_colors: Vec<Color> = targets
-            .iter()
-            .map(|target| final_color_for_row(target.y, height))
-            .collect();
+        for (row, line) in lines.iter().enumerate() {
+            let color_progress = if height <= 1 {
+                0.0
+            } else {
+                (height - 1 - row) as f64 / (height - 1) as f64
+            };
+            let color_index = round_half_even(
+                color_progress * (palette.len().saturating_sub(1)) as f64,
+            )
+            .clamp(0, palette.len().saturating_sub(1) as i64)
+                as usize;
 
-        for character in terminal.characters_mut() {
-            character.set_position(center);
-            character.set_style(Style::default().with_foreground(Color::rgb(
-                0xff, 0xff, 0xff,
-            )));
-        }
+            let style = Style::with_colors(ColorPair::new(
+                Some(palette[color_index]),
+                None,
+            ));
 
-        for (character, target) in terminal
-            .characters_mut()
-            .iter_mut()
-            .zip(targets.iter().copied())
-        {
-            let mut path = Path::with_waypoints(
-                vec![Waypoint::new(center), Waypoint::new(target)],
-                MOVEMENT_SPEED,
-            );
-            path.set_easing(in_out_quart);
-            character.motion.activate_path(path);
-        }
+            for (column, symbol) in line.iter().enumerate() {
+                let target = Coord::new(column as i32, row as i32);
+                let dx = (target.column - center.column) as f64;
+                let dy = (target.row - center.row) as f64 * 2.0;
+                let distance = dx.hypot(dy);
 
-        let mut frames = Vec::new();
-        let mut elapsed_steps = 0usize;
-
-        loop {
-            let has_active_character = terminal.characters().iter().any(|character| {
-                character
-                    .motion
-                    .active_path()
-                    .map(|path| path.is_active())
-                    .unwrap_or(false)
-            });
-
-            if !has_active_character {
-                break;
-            }
-
-            terminal.step();
-            elapsed_steps += 1;
-
-            for (index, character) in terminal.characters_mut().iter_mut().enumerate() {
-                let distance = distances[index];
-                let progress = if distance <= f64::EPSILON {
-                    1.0
+                let total_steps = if distance <= f64::EPSILON {
+                    1
                 } else {
-                    let raw =
-                        (elapsed_steps as f64 * MOVEMENT_SPEED / distance).clamp(0.0, 1.0);
-                    in_out_quart(raw)
+                    round_half_even(distance / MOVEMENT_SPEED).max(1) as usize
                 };
 
-                let color = stepped_color(
-                    Color::rgb(0xff, 0xff, 0xff),
-                    final_colors[index],
-                    progress,
-                    EXPAND_GRADIENT_STEPS,
-                );
+                maximum_steps = maximum_steps.max(total_steps);
 
-                character.set_style(Style::default().with_foreground(color));
+                let mut character =
+                    EffectCharacter::new(CharacterId(next_id), symbol.to_string(), center);
+                character.style = style;
+                next_id = next_id.saturating_add(1);
+
+                characters.push(ExpandingCharacter {
+                    character,
+                    target,
+                    total_steps,
+                });
+            }
+        }
+
+        if characters.is_empty() {
+            return Vec::new();
+        }
+
+        let mut canvas = Canvas::new(width, height);
+        let mut frames = Vec::with_capacity(maximum_steps);
+
+        for step in 1..=maximum_steps {
+            canvas.clear();
+
+            for expanding in &mut characters {
+                let progress =
+                    (step.min(expanding.total_steps) as f64 / expanding.total_steps as f64)
+                        .clamp(0.0, 1.0);
+                let eased_progress = easing::in_out_quart(progress);
+
+                expanding.character.position = interpolate_coord(
+                    center,
+                    expanding.target,
+                    eased_progress,
+                );
+                canvas.draw_character(&expanding.character);
             }
 
-            frames.push(terminal.render_frame());
+            frames.push(canvas.render());
         }
 
         frames
     }
 }
 
-fn in_out_quart(progress: f64) -> f64 {
+fn interpolate_coord(start: Coord, end: Coord, progress: f64) -> Coord {
     let progress = progress.clamp(0.0, 1.0);
+    let column =
+        start.column as f64 + (end.column - start.column) as f64 * progress;
+    let row = start.row as f64 + (end.row - start.row) as f64 * progress;
 
-    if progress < 0.5 {
-        8.0 * progress.powi(4)
-    } else {
-        1.0 - (-2.0 * progress + 2.0).powi(4) / 2.0
-    }
-}
-
-fn final_color_for_row(row: i32, height: usize) -> Color {
-    if height <= 1 {
-        return FINAL_GRADIENT[0];
-    }
-
-    // The original effect's vertical gradient runs from the first stop at
-    // the bottom of the canvas to the last stop at the top.
-    let vertical_progress =
-        1.0 - (row.max(0) as f64 / height.saturating_sub(1) as f64);
-
-    multi_stop_color(
-        &FINAL_GRADIENT,
-        vertical_progress,
-        FINAL_GRADIENT_STEPS,
+    Coord::new(
+        round_half_even(column) as i32,
+        round_half_even(row) as i32,
     )
 }
 
-fn multi_stop_color(stops: &[Color], progress: f64, steps_per_segment: usize) -> Color {
-    if stops.is_empty() {
-        return Color::rgb(0xff, 0xff, 0xff);
+fn round_half_even(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
     }
 
-    if stops.len() == 1 {
-        return stops[0];
-    }
-
-    let steps_per_segment = steps_per_segment.max(2);
-    let segment_count = stops.len() - 1;
-    let spectrum_len = segment_count * steps_per_segment;
-    let index = rounded_index(progress, spectrum_len.saturating_sub(1));
-
-    let segment = (index / steps_per_segment).min(segment_count - 1);
-    let segment_index = index.saturating_sub(segment * steps_per_segment);
-    let segment_progress = segment_index as f64 / (steps_per_segment - 1) as f64;
-
-    interpolate_color(stops[segment], stops[segment + 1], segment_progress)
-}
-
-fn stepped_color(start: Color, end: Color, progress: f64, steps: usize) -> Color {
-    let steps = steps.max(2);
-    let index = rounded_index(progress, steps - 1);
-    let quantized_progress = index as f64 / (steps - 1) as f64;
-    interpolate_color(start, end, quantized_progress)
-}
-
-fn rounded_index(progress: f64, final_index: usize) -> usize {
-    let value = progress.clamp(0.0, 1.0) * final_index as f64;
     let lower = value.floor();
     let fraction = value - lower;
 
-    let rounded = if fraction < 0.5 {
-        lower
+    if fraction < 0.5 {
+        lower as i64
     } else if fraction > 0.5 {
-        lower + 1.0
-    } else if lower as usize % 2 == 0 {
-        lower
+        lower as i64 + 1
     } else {
-        lower + 1.0
-    };
-
-    (rounded as usize).min(final_index)
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (start_r, start_g, start_b) = rgb_components(start);
-    let (end_r, end_g, end_b) = rgb_components(end);
-    let progress = progress.clamp(0.0, 1.0);
-
-    Color::rgb(
-        interpolate_channel(start_r, end_r, progress),
-        interpolate_channel(start_g, end_g, progress),
-        interpolate_channel(start_b, end_b, progress),
-    )
-}
-
-fn rgb_components(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb { r, g, b } => (r, g, b),
-        Color::Ansi(value) => (value, value, value),
+        let lower_integer = lower as i64;
+        if lower_integer % 2 == 0 {
+            lower_integer
+        } else {
+            lower_integer + 1
+        }
     }
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::io::{self, Read};
-use std::time::Duration;
 
 use clap::Parser;
 use ttfx::effects;
@@ -10,67 +9,50 @@ use ttfx::engine::terminal::Terminal;
 #[command(
     name = "ttfx",
     version,
-    about = "Terminal text effects implemented in Rust"
+    about = "Terminal text effects, implemented in Rust"
 )]
 struct Cli {
-    /// Effect to run.
-    effect: Option<String>,
+    /// Name of the effect to run.
+    effect: String,
 
-    /// Delay between frames in milliseconds.
-    #[arg(long, default_value_t = 50)]
-    frame_delay: u64,
+    /// Frames rendered per second. Use 0 to disable pacing.
+    #[arg(long, default_value_t = 30.0)]
+    frame_rate: f64,
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("ttfx: {error}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
 
-    let frames = if let Some(effect_name) = cli.effect.as_deref() {
-        let effect = effects::registry()
-            .into_iter()
-            .find(|effect| effect.name() == effect_name)
-            .ok_or_else(|| {
-                let available = effects::registry()
-                    .into_iter()
-                    .map(|effect| effect.name().to_owned())
-                    .collect::<Vec<_>>();
+    let effect = effects::registry()
+        .into_iter()
+        .find(|effect| effect.name() == cli.effect)
+        .ok_or_else(|| {
+            let available = effects::registry()
+                .into_iter()
+                .map(|effect| effect.name().to_owned())
+                .collect::<Vec<_>>();
 
-                if available.is_empty() {
-                    format!(
-                        "unknown effect '{effect_name}'; no effects are currently registered"
-                    )
-                } else {
-                    format!(
-                        "unknown effect '{effect_name}'; available effects: {}",
-                        available.join(", ")
-                    )
-                }
-            })?;
+            let message = if available.is_empty() {
+                format!(
+                    "unknown effect {:?}; no effects are registered yet",
+                    cli.effect
+                )
+            } else {
+                format!(
+                    "unknown effect {:?}; available effects: {}",
+                    cli.effect,
+                    available.join(", ")
+                )
+            };
 
-        effect.frames(&input)
-    } else {
-        let mut terminal = Terminal::from_text(&input);
-        terminal.run_steps(1, |_terminal, _step| true)
-    };
+            io::Error::new(io::ErrorKind::InvalidInput, message)
+        })?;
 
-    let terminal = Terminal::new(1, 1);
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-
-    terminal.play_frames(
-        &mut output,
-        frames.iter().map(String::as_str),
-        Duration::from_millis(cli.frame_delay),
-    )?;
+    let frames = effect.frames(&input);
+    Terminal::play_frames(&frames, cli.frame_rate)?;
 
     Ok(())
 }

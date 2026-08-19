@@ -1,16 +1,7 @@
 use super::Effect;
-use crate::engine::{CharacterId, Terminal};
-use crate::utils::{Color, Coord, Style};
 
-const FORMATION_FRAMES: usize = 10;
-const STORM_FRAMES: usize = 56;
-const DISSIPATION_FRAMES: usize = 10;
-const FADE_FRAMES: usize = 12;
-
-const DARK_TEXT: Color = Color::rgb(42, 45, 64);
-const CLOUD_COLOR: Color = Color::rgb(70, 75, 96);
-const RAIN_COLOR: Color = Color::rgb(80, 130, 190);
-const LIGHTNING_COLOR: Color = Color::rgb(245, 248, 255);
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
 pub struct Thunderstorm;
 
@@ -32,384 +23,351 @@ impl Effect for Thunderstorm {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let width_i32 = width.min(i32::MAX as usize) as i32;
-        let height_i32 = height.min(i32::MAX as usize) as i32;
+        let text = TextLayout::new(input);
+        let mut frames = Vec::new();
+        let mut rng = StormRng::new(hash_input(input));
+        let mut rain = Vec::<RainDrop>::new();
 
-        let input_ids: Vec<CharacterId> = terminal
-            .characters()
-            .iter()
-            .map(|character| character.id)
-            .collect();
-        let mut glow = vec![0_u8; input_ids.len()];
-        let mut rng = StormRng::new(seed_from_input(input));
+        let storm_gradient = Gradient::new(
+            [
+                Color::new(8, 12, 24),
+                Color::new(18, 29, 52),
+                Color::new(31, 48, 76),
+            ],
+            12,
+        )
+        .colors();
 
-        for id in &input_ids {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.set_appearance(
-                    character.input_symbol,
-                    Style::default().with_foreground(DARK_TEXT),
-                );
-            }
+        for step in 0..12 {
+            let color = storm_gradient[step];
+            frames.push(render_frame(
+                &text,
+                color,
+                &rain,
+                &[],
+                None,
+                step as u64,
+            ));
         }
 
-        let cloud_count = (width / 2 + width % 2).min(512).max(1);
-        let mut clouds = Vec::with_capacity(cloud_count);
+        const STRIKES: [usize; 3] = [14, 39, 65];
 
-        for index in 0..cloud_count {
-            let target_x = if cloud_count == 1 {
-                0
-            } else {
-                ((index * width.saturating_sub(1)) / (cloud_count - 1)) as i32
-            };
-            let starts_left = index % 2 == 0;
-            let start_x = if starts_left {
-                target_x - FORMATION_FRAMES as i32
-            } else {
-                target_x + FORMATION_FRAMES as i32
-            };
-            let symbol = match index % 4 {
-                0 => '~',
-                1 => '-',
-                2 => '=',
-                _ => '~',
-            };
-            let id = terminal.add_character(symbol, Coord::new(start_x, 0));
+        for storm_frame in 0..84 {
+            update_rain(
+                &mut rain,
+                &mut rng,
+                text.width,
+                text.height,
+                storm_frame,
+            );
 
-            if let Some(character) = terminal.character_mut(id) {
-                character.visible = true;
-                character.set_appearance(
-                    symbol,
-                    Style::default().with_foreground(CLOUD_COLOR),
-                );
-            }
+            let mut bolt = Vec::new();
+            let mut flash = None;
 
-            clouds.push(Cloud {
-                id,
-                target_x,
-                starts_left,
-                symbol,
-            });
-        }
-
-        let area = width.saturating_mul(height);
-        let rain_count = (area / 3)
-            .max(width / 2)
-            .max(1)
-            .min(512);
-        let mut rain = Vec::with_capacity(rain_count);
-
-        for index in 0..rain_count {
-            let x = rng.range(width) as i32;
-            let y = rng.range(height) as i32;
-            let speed = 1 + (rng.range(2) as i32);
-            let symbol = match index % 3 {
-                0 => '|',
-                1 => '/',
-                _ => '\\',
-            };
-            let id = terminal.add_character(symbol, Coord::new(x, y));
-
-            if let Some(character) = terminal.character_mut(id) {
-                character.visible = false;
-                character.set_appearance(
-                    symbol,
-                    Style::default().with_foreground(RAIN_COLOR),
-                );
-            }
-
-            rain.push(RainDrop {
-                id,
-                x,
-                y,
-                speed,
-                symbol,
-            });
-        }
-
-        let mut frames = Vec::with_capacity(
-            FORMATION_FRAMES + STORM_FRAMES + DISSIPATION_FRAMES + FADE_FRAMES + 1,
-        );
-
-        for frame in 0..FORMATION_FRAMES {
-            let remaining = (FORMATION_FRAMES - frame - 1) as i32;
-
-            for cloud in &clouds {
-                let x = if cloud.starts_left {
-                    cloud.target_x - remaining
-                } else {
-                    cloud.target_x + remaining
-                };
-
-                if let Some(character) = terminal.character_mut(cloud.id) {
-                    character.set_position(Coord::new(x, 0));
-                    character.visible = true;
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        let strike_frames = [7_usize, 25, 41, 50];
-        let mut lightning_ids = Vec::new();
-        let mut flash_remaining = 0_u8;
-
-        for storm_frame in 0..STORM_FRAMES {
-            if flash_remaining == 0 && !lightning_ids.is_empty() {
-                hide_characters(&mut terminal, &lightning_ids);
-                lightning_ids.clear();
-            }
-
-            if strike_frames.contains(&storm_frame) {
-                hide_characters(&mut terminal, &lightning_ids);
-                lightning_ids.clear();
-
-                let mut x = rng.range(width) as i32;
-
-                for y in 0..height_i32.max(1) {
-                    let previous_x = x;
-
-                    if y > 0 && y % 2 == 0 {
-                        x += match rng.range(3) {
-                            0 => -1,
-                            1 => 0,
-                            _ => 1,
-                        };
-                        x = x.clamp(0, width_i32.saturating_sub(1));
-                    }
-
-                    let symbol = if x < previous_x {
-                        '/'
-                    } else if x > previous_x {
-                        '\\'
-                    } else {
-                        '|'
-                    };
-
-                    let coord = Coord::new(x, y);
-                    let id = terminal.add_character(symbol, coord);
-
-                    if let Some(character) = terminal.character_mut(id) {
-                        let mut style = Style::default().with_foreground(LIGHTNING_COLOR);
-                        style.bold = true;
-                        character.set_appearance(symbol, style);
-                        character.visible = true;
-                    }
-
-                    lightning_ids.push(id);
-
-                    for (index, input_id) in input_ids.iter().enumerate() {
-                        let is_hit = terminal
-                            .character(*input_id)
-                            .map(|character| character.position == coord)
-                            .unwrap_or(false);
-
-                        if is_hit {
-                            glow[index] = 8;
-                        }
-                    }
-                }
-
-                flash_remaining = 2;
-            }
-
-            for cloud in &clouds {
-                if let Some(character) = terminal.character_mut(cloud.id) {
-                    let color = if flash_remaining > 0 {
-                        Color::rgb(180, 190, 215)
-                    } else {
-                        CLOUD_COLOR
-                    };
-                    character.set_appearance(
-                        cloud.symbol,
-                        Style::default().with_foreground(color),
+            for (strike_index, strike_start) in STRIKES.iter().enumerate() {
+                if storm_frame >= *strike_start && storm_frame < strike_start + 6 {
+                    let age = storm_frame - strike_start;
+                    bolt = lightning_bolt(
+                        text.width,
+                        text.height,
+                        hash_input(input)
+                            ^ ((*strike_start as u64 + 1) * 0x9e37_79b9)
+                            ^ strike_index as u64,
                     );
+
+                    flash = Some(match age {
+                        0 => Flash::Faint,
+                        1 | 2 => Flash::Bright,
+                        3 => Flash::Cool,
+                        _ => Flash::Afterglow,
+                    });
+                    break;
                 }
             }
 
-            for drop in &mut rain {
-                drop.y = drop.y.saturating_add(drop.speed);
+            let rumble = ((storm_frame as f64 * 0.31).sin() * 3.0).round() as i16;
+            let base = Color::new(
+                (20_i16 + rumble).clamp(8, 30) as u8,
+                (31_i16 + rumble).clamp(14, 42) as u8,
+                (51_i16 + rumble * 2).clamp(24, 68) as u8,
+            );
 
-                if drop.y >= height_i32 {
-                    drop.y = 0;
-                    drop.x = rng.range(width) as i32;
-                } else if storm_frame % 4 == 0 && rng.range(4) == 0 {
-                    drop.x = (drop.x + 1).rem_euclid(width_i32.max(1));
-                }
-
-                if let Some(character) = terminal.character_mut(drop.id) {
-                    character.visible = true;
-                    character.set_position(Coord::new(drop.x, drop.y));
-                    character.set_appearance(
-                        drop.symbol,
-                        Style::default().with_foreground(RAIN_COLOR),
-                    );
-                }
-            }
-
-            for (index, id) in input_ids.iter().enumerate() {
-                if let Some(character) = terminal.character_mut(*id) {
-                    let style = storm_text_style(glow[index], flash_remaining);
-                    character.set_appearance(character.input_symbol, style);
-                }
-            }
-
-            frames.push(terminal.render_frame());
-
-            for value in &mut glow {
-                *value = value.saturating_sub(1);
-            }
-            flash_remaining = flash_remaining.saturating_sub(1);
+            frames.push(render_frame(
+                &text,
+                base,
+                &rain,
+                &bolt,
+                flash,
+                storm_frame as u64 + 12,
+            ));
         }
 
-        hide_characters(&mut terminal, &lightning_ids);
+        let final_gradient = Gradient::new(
+            [
+                Color::new(34, 52, 79),
+                Color::new(89, 132, 174),
+                Color::new(194, 222, 238),
+                Color::new(235, 246, 250),
+            ],
+            18,
+        )
+        .colors();
 
-        for frame in 0..DISSIPATION_FRAMES {
-            let hidden_rain = rain.len().saturating_mul(frame + 1) / DISSIPATION_FRAMES;
-
-            for (index, drop) in rain.iter_mut().enumerate() {
-                drop.y = drop.y.saturating_add(drop.speed);
-
-                if drop.y >= height_i32 {
-                    drop.y = 0;
-                    drop.x = rng.range(width) as i32;
-                }
-
-                if let Some(character) = terminal.character_mut(drop.id) {
-                    character.visible = index >= hidden_rain;
-                    character.set_position(Coord::new(drop.x, drop.y));
-                }
-            }
-
-            for cloud in &clouds {
-                let distance = (frame + 1) as i32;
-                let x = if cloud.starts_left {
-                    cloud.target_x - distance
-                } else {
-                    cloud.target_x + distance
-                };
-
-                if let Some(character) = terminal.character_mut(cloud.id) {
-                    character.set_position(Coord::new(x, 0));
-                }
-            }
-
-            for (index, id) in input_ids.iter().enumerate() {
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.set_appearance(
-                        character.input_symbol,
-                        storm_text_style(glow[index], 0),
-                    );
-                }
-                glow[index] = glow[index].saturating_sub(1);
-            }
-
-            frames.push(terminal.render_frame());
+        rain.clear();
+        for (step, color) in final_gradient.into_iter().enumerate() {
+            frames.push(render_frame(
+                &text,
+                color,
+                &rain,
+                &[],
+                None,
+                96 + step as u64,
+            ));
         }
 
-        let cloud_ids: Vec<CharacterId> = clouds.iter().map(|cloud| cloud.id).collect();
-        let rain_ids: Vec<CharacterId> = rain.iter().map(|drop| drop.id).collect();
-        hide_characters(&mut terminal, &cloud_ids);
-        hide_characters(&mut terminal, &rain_ids);
-
-        for frame in 0..FADE_FRAMES {
-            let progress = (frame + 1) as f64 / FADE_FRAMES as f64;
-            let color = mix_color((42, 45, 64), (210, 218, 235), progress);
-
-            for id in &input_ids {
-                if let Some(character) = terminal.character_mut(*id) {
-                    character.visible = true;
-                    character.set_appearance(
-                        character.input_symbol,
-                        Style::default().with_foreground(color),
-                    );
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        for id in &input_ids {
-            if let Some(character) = terminal.character_mut(*id) {
-                character.visible = true;
-                character.set_appearance(character.input_symbol, Style::default());
-            }
-        }
-
-        frames.push(terminal.render_frame());
         frames
     }
 }
 
-struct Cloud {
-    id: CharacterId,
-    target_x: i32,
-    starts_left: bool,
-    symbol: char,
+#[derive(Clone)]
+struct TextCell {
+    coord: Coord,
+    symbol: String,
 }
 
-struct RainDrop {
-    id: CharacterId,
-    x: i32,
-    y: i32,
-    speed: i32,
-    symbol: char,
+struct TextLayout {
+    width: usize,
+    height: usize,
+    cells: Vec<TextCell>,
 }
 
-fn storm_text_style(glow: u8, flash: u8) -> Style {
-    if flash > 0 {
-        let mut style = Style::default()
-            .with_foreground(Color::rgb(230, 238, 255))
-            .with_background(Color::rgb(65, 75, 110));
-        style.bold = true;
-        return style;
-    }
+impl TextLayout {
+    fn new(input: &str) -> Self {
+        let normalized = input.strip_suffix('\n').unwrap_or(input);
+        let normalized = normalized.strip_suffix('\r').unwrap_or(normalized);
+        let lines = normalized.split('\n').collect::<Vec<_>>();
 
-    if glow > 0 {
-        let intensity = u16::from(glow);
-        let red = (75 + intensity * 10).min(255) as u8;
-        let green = (100 + intensity * 12).min(255) as u8;
-        let blue = (145 + intensity * 13).min(255) as u8;
-        return Style::default().with_foreground(Color::rgb(red, green, blue));
-    }
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
+        let mut cells = Vec::new();
 
-    Style::default().with_foreground(DARK_TEXT)
-}
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                cells.push(TextCell {
+                    coord: Coord::new(column as i32, row as i32),
+                    symbol: symbol.to_string(),
+                });
+            }
+        }
 
-fn hide_characters(terminal: &mut Terminal, ids: &[CharacterId]) {
-    for id in ids {
-        if let Some(character) = terminal.character_mut(*id) {
-            character.visible = false;
+        if cells.is_empty() {
+            cells.push(TextCell {
+                coord: Coord::new(0, 0),
+                symbol: " ".to_owned(),
+            });
+        }
+
+        Self {
+            width,
+            height,
+            cells,
         }
     }
 }
 
-fn mix_color(start: (u8, u8, u8), end: (u8, u8, u8), progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-    let channel = |from: u8, to: u8| {
-        (f64::from(from) + (f64::from(to) - f64::from(from)) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        channel(start.0, end.0),
-        channel(start.1, end.1),
-        channel(start.2, end.2),
-    )
+#[derive(Clone, Copy)]
+struct RainDrop {
+    column: i32,
+    row: i32,
+    speed: i32,
+    length: i32,
 }
 
-fn seed_from_input(input: &str) -> u64 {
-    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+#[derive(Clone, Copy)]
+enum Flash {
+    Faint,
+    Bright,
+    Cool,
+    Afterglow,
+}
 
-    for byte in input.bytes() {
-        seed ^= u64::from(byte);
-        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+fn update_rain(
+    rain: &mut Vec<RainDrop>,
+    rng: &mut StormRng,
+    width: usize,
+    height: usize,
+    frame: usize,
+) {
+    for drop in rain.iter_mut() {
+        drop.row += drop.speed;
     }
 
-    seed ^ 0x7468_756e_6465_7273
+    rain.retain(|drop| drop.row - drop.length < height as i32);
+
+    let density = ((width + 3) / 4).max(1);
+    let spawn_count = density + usize::from(frame % 3 == 0);
+
+    for _ in 0..spawn_count {
+        if rng.next_u32() % 100 < 72 {
+            rain.push(RainDrop {
+                column: rng.range(width as u32) as i32,
+                row: -(rng.range(4) as i32) - 1,
+                speed: 1 + rng.range(2) as i32,
+                length: 1 + rng.range(3) as i32,
+            });
+        }
+    }
+}
+
+fn lightning_bolt(width: usize, height: usize, seed: u64) -> Vec<Coord> {
+    let mut rng = StormRng::new(seed);
+    let mut bolt = Vec::new();
+    let mut column = rng.range(width as u32) as i32;
+
+    for row in 0..height as i32 {
+        bolt.push(Coord::new(column, row));
+
+        if row + 1 < height as i32 {
+            let movement = rng.range(3) as i32 - 1;
+            column = (column + movement).clamp(0, width as i32 - 1);
+        }
+
+        if row > 0 && row + 1 < height as i32 && rng.next_u32() % 100 < 28 {
+            let direction = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
+            let branch_column =
+                (column + direction).clamp(0, width as i32 - 1);
+            bolt.push(Coord::new(branch_column, row));
+        }
+    }
+
+    bolt
+}
+
+fn render_frame(
+    text: &TextLayout,
+    text_color: Color,
+    rain: &[RainDrop],
+    bolt: &[Coord],
+    flash: Option<Flash>,
+    frame: u64,
+) -> String {
+    let mut canvas = Canvas::new(text.width, text.height);
+
+    let flash_background = match flash {
+        Some(Flash::Bright) => Some(Color::new(20, 29, 48)),
+        Some(Flash::Faint) => Some(Color::new(8, 13, 25)),
+        _ => None,
+    };
+
+    for cell in &text.cells {
+        let near_bolt = bolt
+            .iter()
+            .any(|coord| coord.manhattan_distance_to(cell.coord) <= 2);
+
+        let foreground = if near_bolt {
+            match flash {
+                Some(Flash::Bright) => Color::new(218, 239, 255),
+                Some(Flash::Cool) => Color::new(121, 184, 235),
+                Some(Flash::Afterglow) => Color::new(75, 121, 166),
+                _ => text_color.lerp(Color::new(135, 179, 214), 0.45),
+            }
+        } else {
+            text_color
+        };
+
+        canvas.set(
+            cell.coord,
+            cell.symbol.clone(),
+            Style {
+                foreground: Some(foreground),
+                background: flash_background,
+                bold: near_bolt && matches!(flash, Some(Flash::Bright)),
+                ..Style::default()
+            },
+        );
+    }
+
+    for drop in rain {
+        for offset in 0..drop.length {
+            let coord = Coord::new(drop.column, drop.row - offset);
+            if !canvas.contains(coord) {
+                continue;
+            }
+
+            let leading = offset == 0;
+            let shimmer = ((frame + drop.column as u64) & 3) == 0;
+            let color = if leading {
+                Color::new(99, 145, 187)
+            } else if shimmer {
+                Color::new(56, 91, 126)
+            } else {
+                Color::new(38, 66, 98)
+            };
+
+            canvas.set(
+                coord,
+                if leading { "│" } else { "·" },
+                Style {
+                    foreground: Some(color),
+                    ..Style::default()
+                },
+            );
+        }
+    }
+
+    for (index, coord) in bolt.iter().enumerate() {
+        if !canvas.contains(*coord) {
+            continue;
+        }
+
+        let symbol = if index == 0 {
+            "╷"
+        } else if index + 1 == bolt.len() {
+            "╵"
+        } else if index % 3 == 0 {
+            "╲"
+        } else if index % 3 == 1 {
+            "│"
+        } else {
+            "╱"
+        };
+
+        let color = match flash {
+            Some(Flash::Bright) => Color::new(245, 252, 255),
+            Some(Flash::Cool) => Color::new(160, 211, 247),
+            Some(Flash::Afterglow) => Color::new(82, 137, 184),
+            _ => Color::new(132, 180, 220),
+        };
+
+        canvas.set(
+            *coord,
+            symbol,
+            Style {
+                foreground: Some(color),
+                background: flash_background,
+                bold: matches!(flash, Some(Flash::Bright)),
+                ..Style::default()
+            },
+        );
+    }
+
+    canvas.render()
+}
+
+fn hash_input(input: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    hash ^ 0xa076_1d64_78bd_642f
 }
 
 struct StormRng {
@@ -420,26 +378,27 @@ impl StormRng {
     fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
-                0x9e37_79b9_7f4a_7c15
+                0x6a09_e667_f3bc_c909
             } else {
                 seed
             },
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.state = self
-            .state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.state
+    fn next_u32(&mut self) -> u32 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        (value >> 16) as u32
     }
 
-    fn range(&mut self, upper: usize) -> usize {
-        if upper <= 1 {
+    fn range(&mut self, upper: u32) -> u32 {
+        if upper == 0 {
             0
         } else {
-            (self.next_u64() % upper as u64) as usize
+            self.next_u32() % upper
         }
     }
 }

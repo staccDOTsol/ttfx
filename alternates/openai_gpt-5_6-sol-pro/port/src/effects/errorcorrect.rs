@@ -1,68 +1,31 @@
-
-use std::collections::{BTreeMap, HashSet};
-
 use super::Effect;
-use crate::engine::character::CharacterId;
-use crate::engine::terminal::Terminal;
-use crate::utils::easing::out_quad;
+
+use crate::engine::Canvas;
+use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::utils::graphics::{Color, Gradient, Style};
 
-const ERROR_PAIR_RATIO: f64 = 0.1;
-const ERROR_HOLD_FRAMES: usize = 10;
-const SWAP_FRAMES: usize = 6;
-const CORRECT_HOLD_FRAMES: usize = 4;
+const ERROR_COLOR: Color = Color::new(255, 0, 0);
+const CORRECT_COLOR: Color = Color::new(0, 255, 0);
+const MOVEMENT_SPEED: f64 = 0.5;
+const SWAP_DELAY: usize = 10;
+const ERROR_PAIRS: usize = 3;
+const COLOR_FADE_FRAMES: usize = 8;
 
-const ERROR_COLOR: Color = Color::rgb(255, 0, 0);
-const CORRECT_COLOR: Color = Color::rgb(0, 255, 0);
+#[derive(Clone, Debug)]
+struct Glyph {
+    symbol: String,
+    input_coord: Coord,
+    final_color: Color,
+}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ErrorPair {
-    left_id: CharacterId,
-    right_id: CharacterId,
-    left_coord: Coord,
-    right_coord: Coord,
+    first: usize,
+    second: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn from_input(input: &str) -> Self {
-        let mut state = 0xcbf2_9ce4_8422_2325_u64;
-
-        for byte in input.bytes() {
-            state ^= u64::from(byte);
-            state = state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-
-        if state == 0 {
-            state = 0x9e37_79b9_7f4a_7c15;
-        }
-
-        Self { state }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        value
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        for index in (1..values.len()).rev() {
-            let other = (self.next_u64() as usize) % (index + 1);
-            values.swap(index, other);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Errorcorrect;
 
 impl Errorcorrect {
@@ -77,191 +40,301 @@ impl Effect for Errorcorrect {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let (width, height, mut glyphs) = parse_input(input);
+        assign_final_colors(&mut glyphs, height);
 
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
+        if glyphs.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style {
+                    foreground: Some(Color::new(138, 0, 138)),
+                    ..Style::default()
+                },
+            );
+            return vec![canvas.render()];
         }
 
-        let mut pairs = build_error_pairs(&terminal, input);
+        let final_positions = glyphs
+            .iter()
+            .map(|glyph| glyph.input_coord)
+            .collect::<Vec<_>>();
+        let final_colors = glyphs
+            .iter()
+            .map(|glyph| glyph.final_color)
+            .collect::<Vec<_>>();
+
+        let pairs = select_error_pairs(&glyphs, input);
+        let mut frames = vec![render_frame(
+            width,
+            height,
+            &glyphs,
+            &final_positions,
+            &final_colors,
+        )];
 
         if pairs.is_empty() {
-            return vec![terminal.render_frame()];
+            return frames;
         }
 
-        let error_style = Style::default().with_foreground(ERROR_COLOR);
-        let correct_style = Style::default().with_foreground(CORRECT_COLOR);
-
+        let mut swapped_positions = final_positions.clone();
         for pair in &pairs {
-            set_character(
-                &mut terminal,
-                pair.left_id,
-                pair.right_coord,
-                error_style.clone(),
-            );
-            set_character(
-                &mut terminal,
-                pair.right_id,
-                pair.left_coord,
-                error_style.clone(),
-            );
+            swapped_positions[pair.first] = final_positions[pair.second];
+            swapped_positions[pair.second] = final_positions[pair.first];
         }
 
-        let mut frames = Vec::new();
+        let error_colors =
+            colors_for_pairs(&final_colors, &pairs, ERROR_COLOR);
+        let correct_colors =
+            colors_for_pairs(&final_colors, &pairs, CORRECT_COLOR);
 
-        push_repeated_frame(&mut terminal, &mut frames, ERROR_HOLD_FRAMES);
+        let movement_frames =
+            movement_frame_count(&final_positions, &swapped_positions);
 
-        for pair in pairs.drain(..) {
-            for step in 1..=SWAP_FRAMES {
-                let raw_progress = step as f64 / SWAP_FRAMES as f64;
-                let progress = out_quad(raw_progress);
+        for frame_index in 1..=movement_frames {
+            let progress =
+                easing::in_out_sine(frame_index as f64 / movement_frames as f64);
+            let positions = interpolate_positions(
+                &final_positions,
+                &swapped_positions,
+                progress,
+            );
 
-                let left_position = pair.right_coord.lerp(pair.left_coord, progress);
-                let right_position = pair.left_coord.lerp(pair.right_coord, progress);
+            frames.push(render_frame(
+                width,
+                height,
+                &glyphs,
+                &positions,
+                &error_colors,
+            ));
+        }
 
-                set_character(
-                    &mut terminal,
-                    pair.left_id,
-                    left_position,
-                    error_style.clone(),
-                );
-                set_character(
-                    &mut terminal,
-                    pair.right_id,
-                    right_position,
-                    error_style.clone(),
-                );
+        for _ in 0..SWAP_DELAY {
+            frames.push(render_frame(
+                width,
+                height,
+                &glyphs,
+                &swapped_positions,
+                &error_colors,
+            ));
+        }
 
-                frames.push(terminal.render_frame());
+        for frame_index in 1..=movement_frames {
+            let progress =
+                easing::in_out_sine(frame_index as f64 / movement_frames as f64);
+            let positions = interpolate_positions(
+                &swapped_positions,
+                &final_positions,
+                progress,
+            );
+
+            frames.push(render_frame(
+                width,
+                height,
+                &glyphs,
+                &positions,
+                &correct_colors,
+            ));
+        }
+
+        for frame_index in 1..=COLOR_FADE_FRAMES {
+            let progress =
+                frame_index as f64 / COLOR_FADE_FRAMES as f64;
+            let mut colors = final_colors.clone();
+
+            for pair in &pairs {
+                colors[pair.first] =
+                    CORRECT_COLOR.lerp(final_colors[pair.first], progress);
+                colors[pair.second] =
+                    CORRECT_COLOR.lerp(final_colors[pair.second], progress);
             }
 
-            set_character(
-                &mut terminal,
-                pair.left_id,
-                pair.left_coord,
-                correct_style.clone(),
-            );
-            set_character(
-                &mut terminal,
-                pair.right_id,
-                pair.right_coord,
-                correct_style.clone(),
-            );
-
-            push_repeated_frame(&mut terminal, &mut frames, CORRECT_HOLD_FRAMES);
-
-            set_character(
-                &mut terminal,
-                pair.left_id,
-                pair.left_coord,
-                Style::default(),
-            );
-            set_character(
-                &mut terminal,
-                pair.right_id,
-                pair.right_coord,
-                Style::default(),
-            );
-
-            frames.push(terminal.render_frame());
-        }
-
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
+            frames.push(render_frame(
+                width,
+                height,
+                &glyphs,
+                &final_positions,
+                &colors,
+            ));
         }
 
         frames
     }
 }
 
-fn build_error_pairs(terminal: &Terminal, input: &str) -> Vec<ErrorPair> {
-    let mut rows: BTreeMap<i32, Vec<(CharacterId, Coord)>> = BTreeMap::new();
-    let mut eligible_count = 0_usize;
+fn parse_input(input: &str) -> (usize, usize, Vec<Glyph>) {
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
 
-    for character in terminal.characters() {
-        if character.input_symbol.is_whitespace() {
-            continue;
-        }
-
-        eligible_count += 1;
-        rows.entry(character.position.y)
-            .or_default()
-            .push((character.id, character.position));
+    if normalized.ends_with('\n') && lines.len() > 1 {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push("");
     }
 
-    let mut candidates = Vec::new();
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let height = lines.len().max(1);
 
-    for row in rows.values_mut() {
-        row.sort_by_key(|(_, coord)| coord.x);
+    let mut glyphs = Vec::new();
 
-        for adjacent in row.windows(2) {
-            let (left_id, left_coord) = adjacent[0];
-            let (right_id, right_coord) = adjacent[1];
+    for (row, line) in lines.iter().enumerate() {
+        for (column, symbol) in line.chars().enumerate() {
+            glyphs.push(Glyph {
+                symbol: symbol.to_string(),
+                input_coord: Coord::new(column as i32, row as i32),
+                final_color: Color::default(),
+            });
+        }
+    }
 
-            if right_coord.x == left_coord.x + 1 {
-                candidates.push(ErrorPair {
-                    left_id,
-                    right_id,
-                    left_coord,
-                    right_coord,
-                });
+    (width, height, glyphs)
+}
+
+fn assign_final_colors(glyphs: &mut [Glyph], height: usize) {
+    let gradient = Gradient::new(
+        [
+            Color::new(138, 0, 138),
+            Color::new(0, 209, 255),
+            Color::new(255, 255, 255),
+        ],
+        height.max(2),
+    );
+    let colors = gradient.colors();
+
+    for glyph in glyphs {
+        let row = glyph.input_coord.row.max(0) as usize;
+        glyph.final_color = colors
+            .get(row)
+            .copied()
+            .or_else(|| colors.last().copied())
+            .unwrap_or(Color::new(255, 255, 255));
+    }
+}
+
+fn select_error_pairs(glyphs: &[Glyph], input: &str) -> Vec<ErrorPair> {
+    let mut indices = glyphs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, glyph)| {
+            if glyph.symbol.chars().all(char::is_whitespace) {
+                None
+            } else {
+                Some(index)
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
-    if candidates.is_empty() {
+    if indices.len() < 2 {
         return Vec::new();
     }
 
-    let requested_pairs = ((eligible_count as f64 * ERROR_PAIR_RATIO).round() as usize)
-        .max(1)
-        .min(candidates.len());
+    let mut state = input.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    });
 
-    let mut rng = SimpleRng::from_input(input);
-    rng.shuffle(&mut candidates);
+    for index in (1..indices.len()).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let selected = (state as usize) % (index + 1);
+        indices.swap(index, selected);
+    }
 
-    let mut selected = Vec::with_capacity(requested_pairs);
-    let mut used = HashSet::new();
+    let pair_count = ERROR_PAIRS.min(indices.len() / 2);
+    let mut pairs = Vec::with_capacity(pair_count);
 
-    for pair in candidates {
-        if selected.len() >= requested_pairs {
-            break;
+    for pair_index in 0..pair_count {
+        let first_offset = pair_index * 2;
+        let mut second_offset = first_offset + 1;
+
+        if glyphs[indices[first_offset]].symbol
+            == glyphs[indices[second_offset]].symbol
+        {
+            if let Some(offset) =
+                ((second_offset + 1)..indices.len()).find(|offset| {
+                    glyphs[indices[*offset]].symbol
+                        != glyphs[indices[first_offset]].symbol
+                })
+            {
+                indices.swap(second_offset, offset);
+                second_offset = first_offset + 1;
+            }
         }
 
-        if used.contains(&pair.left_id) || used.contains(&pair.right_id) {
-            continue;
-        }
-
-        used.insert(pair.left_id);
-        used.insert(pair.right_id);
-        selected.push(pair);
+        pairs.push(ErrorPair {
+            first: indices[first_offset],
+            second: indices[second_offset],
+        });
     }
 
-    rng.shuffle(&mut selected);
-    selected
+    pairs
 }
 
-fn set_character(
-    terminal: &mut Terminal,
-    id: CharacterId,
-    position: Coord,
-    style: Style,
-) {
-    if let Some(character) = terminal.character_mut(id) {
-        character.set_position(position);
-        character.set_appearance(character.input_symbol, style);
-    }
+fn movement_frame_count(start: &[Coord], end: &[Coord]) -> usize {
+    let maximum_distance = start
+        .iter()
+        .zip(end)
+        .map(|(start, end)| start.distance_to(*end))
+        .fold(0.0_f64, f64::max);
+
+    (maximum_distance / MOVEMENT_SPEED).ceil().max(1.0) as usize
 }
 
-fn push_repeated_frame(
-    terminal: &mut Terminal,
-    frames: &mut Vec<String>,
-    count: usize,
-) {
-    if count == 0 {
-        return;
+fn interpolate_positions(
+    start: &[Coord],
+    end: &[Coord],
+    progress: f64,
+) -> Vec<Coord> {
+    start
+        .iter()
+        .zip(end)
+        .map(|(start, end)| start.lerp(*end, progress))
+        .collect()
+}
+
+fn colors_for_pairs(
+    final_colors: &[Color],
+    pairs: &[ErrorPair],
+    pair_color: Color,
+) -> Vec<Color> {
+    let mut colors = final_colors.to_vec();
+
+    for pair in pairs {
+        colors[pair.first] = pair_color;
+        colors[pair.second] = pair_color;
     }
 
-    let frame = terminal.render_frame();
-    frames.extend(std::iter::repeat(frame).take(count));
+    colors
+}
+
+fn render_frame(
+    width: usize,
+    height: usize,
+    glyphs: &[Glyph],
+    positions: &[Coord],
+    colors: &[Color],
+) -> String {
+    let mut canvas = Canvas::new(width, height);
+
+    for ((glyph, position), color) in
+        glyphs.iter().zip(positions).zip(colors)
+    {
+        canvas.set(
+            *position,
+            glyph.symbol.clone(),
+            Style {
+                foreground: Some(*color),
+                ..Style::default()
+            },
+        );
+    }
+
+    canvas.render()
 }

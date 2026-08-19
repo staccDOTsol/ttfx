@@ -1,32 +1,31 @@
 
-use std::collections::VecDeque;
-
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::easing::out_sine;
+use crate::engine::Canvas;
+use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::utils::graphics::{Color, ColorPair, Gradient, Style};
 
-#[derive(Debug, Clone)]
-pub struct Orbittingvolley {
-    launcher_symbol: char,
-    launcher_color: Color,
-    movement_speed: f64,
-    launcher_movement_speed: f64,
-    volley_size: usize,
-    launch_delay: usize,
+const LAUNCHER_COUNT: usize = 4;
+const VOLLEY_SIZE: usize = 3;
+const VOLLEY_DELAY: usize = 7;
+const SHOT_STAGGER: usize = 1;
+const FLIGHT_SPEED: f64 = 0.75;
+const FINAL_HOLD_FRAMES: usize = 4;
+
+#[derive(Clone, Debug)]
+struct VolleyCharacter {
+    symbol: String,
+    target: Coord,
+    launcher: usize,
+    launch_frame: usize,
+    duration: usize,
 }
+
+pub struct Orbittingvolley;
 
 impl Orbittingvolley {
     pub fn new() -> Self {
-        Self {
-            launcher_symbol: '█',
-            launcher_color: Color::rgb(255, 255, 255),
-            movement_speed: 1.0,
-            launcher_movement_speed: 0.5,
-            volley_size: 4,
-            launch_delay: 2,
-        }
+        Self
     }
 }
 
@@ -42,226 +41,309 @@ impl Effect for Orbittingvolley {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let max_x = terminal.canvas().width().saturating_sub(1) as i32;
-        let max_y = terminal.canvas().height().saturating_sub(1) as i32;
-
-        let corners = [
-            Coord::new(0, 0),
-            Coord::new(max_x, 0),
-            Coord::new(max_x, max_y),
-            Coord::new(0, max_y),
-        ];
-
-        let original_characters: Vec<(CharacterId, Coord)> = terminal
-            .characters()
+        let lines = input_lines(input);
+        let width = lines
             .iter()
-            .map(|character| (character.id, character.position))
-            .collect();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
+        let final_gradient = Gradient::new(
+            [
+                Color::new(255, 180, 0),
+                Color::new(255, 70, 120),
+                Color::new(120, 70, 255),
+                Color::new(0, 210, 255),
+            ],
+            256,
+        )
+        .colors();
+
+        let launcher_gradient = Gradient::new(
+            [
+                Color::new(0, 255, 210),
+                Color::new(40, 130, 255),
+                Color::new(180, 60, 255),
+                Color::new(255, 60, 120),
+                Color::new(255, 220, 40),
+                Color::new(0, 255, 210),
+            ],
+            256,
+        )
+        .colors();
+
+        let mut magazines: [Vec<(String, Coord)>; LAUNCHER_COUNT] =
+            std::array::from_fn(|_| Vec::new());
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                if symbol.is_whitespace() {
+                    continue;
+                }
+
+                let target = Coord::new(column as i32, row as i32);
+                let launcher = target_launcher(target, width, height);
+                magazines[launcher].push((symbol.to_string(), target));
+            }
         }
 
-        let launcher_ids: [CharacterId; 4] = std::array::from_fn(|index| {
-            let id = terminal.add_character(self.launcher_symbol, corners[index]);
+        for (launcher, magazine) in magazines.iter_mut().enumerate() {
+            let corner = launcher_corner(launcher, width, height);
+            magazine.sort_by_key(|(_, target)| {
+                (
+                    target.manhattan_distance_to(corner),
+                    target.row,
+                    target.column,
+                )
+            });
+        }
 
-            if let Some(launcher) = terminal.character_mut(id) {
-                launcher.set_appearance(
-                    self.launcher_symbol,
-                    Style::default().with_foreground(self.launcher_color),
+        let perimeter = perimeter_length(width, height);
+        let orbit_speed = if perimeter <= 4 {
+            1
+        } else {
+            (perimeter / 48).max(1)
+        };
+
+        let mut volley_characters = Vec::new();
+        let mut last_arrival = 0;
+
+        for (launcher, magazine) in magazines.into_iter().enumerate() {
+            for (index, (symbol, target)) in magazine.into_iter().enumerate() {
+                let launch_frame = (index / VOLLEY_SIZE) * VOLLEY_DELAY
+                    + (index % VOLLEY_SIZE) * SHOT_STAGGER;
+                let start =
+                    launcher_position(launcher, launch_frame, orbit_speed, width, height);
+                let distance = start.distance_to(target);
+                let duration = (distance / FLIGHT_SPEED).ceil().max(1.0) as usize;
+
+                last_arrival = last_arrival.max(launch_frame + duration);
+                volley_characters.push(VolleyCharacter {
+                    symbol,
+                    target,
+                    launcher,
+                    launch_frame,
+                    duration,
+                });
+            }
+        }
+
+        let animation_frames = if volley_characters.is_empty() {
+            perimeter.max(8).min(24)
+        } else {
+            last_arrival + 1
+        };
+        let total_frames = animation_frames + FINAL_HOLD_FRAMES;
+        let mut frames = Vec::with_capacity(total_frames);
+
+        for frame_index in 0..total_frames {
+            let mut canvas = Canvas::new(width, height);
+            let show_launchers = frame_index < animation_frames;
+
+            // Settled characters form the final text beneath active shots.
+            for character in &volley_characters {
+                if frame_index < character.launch_frame + character.duration {
+                    continue;
+                }
+
+                let color = coordinate_color(
+                    character.target,
+                    width,
+                    height,
+                    &final_gradient,
                 );
-                launcher.visible = true;
+                canvas.set(
+                    character.target,
+                    character.symbol.clone(),
+                    colored_style(color, false),
+                );
             }
 
-            id
-        });
-
-        let mut magazines: [VecDeque<CharacterId>; 4] =
-            std::array::from_fn(|_| VecDeque::new());
-
-        for &(id, destination) in &original_characters {
-            let launcher_index = nearest_corner(destination, &corners);
-            magazines[launcher_index].push_back(id);
-        }
-
-        for magazine in &mut magazines {
-            let slice = magazine.make_contiguous();
-            slice.sort_by_key(|id| {
-                terminal
-                    .character(*id)
-                    .map(|character| {
-                        let center_distance = distance_squared_from_center(
-                            character.position,
-                            max_x,
-                            max_y,
-                        );
-                        (center_distance, character.id)
-                    })
-                    .unwrap_or((0, *id))
-            });
-        }
-
-        let mut frames = Vec::new();
-        let mut launcher_progress = 0.0;
-        let mut launch_delay_remaining = 0usize;
-
-        loop {
-            if launch_delay_remaining == 0 {
-                for launcher_index in 0..launcher_ids.len() {
-                    let launcher_position = terminal
-                        .character(launcher_ids[launcher_index])
-                        .map(|launcher| launcher.position)
-                        .unwrap_or(corners[launcher_index]);
-
-                    for _ in 0..self.volley_size {
-                        let Some(character_id) = magazines[launcher_index].pop_front() else {
-                            break;
-                        };
-
-                        let Some(destination) = original_characters
-                            .iter()
-                            .find_map(|(id, coord)| (*id == character_id).then_some(*coord))
-                        else {
-                            continue;
-                        };
-
-                        let style = final_style(destination, max_x, max_y);
-                        let mut path = Path::with_waypoints(
-                            vec![
-                                Waypoint::new(launcher_position),
-                                Waypoint::new(destination),
-                            ],
-                            self.movement_speed,
-                        );
-                        path.set_easing(out_sine);
-
-                        if let Some(character) = terminal.character_mut(character_id) {
-                            character.set_position(launcher_position);
-                            character.set_appearance(character.input_symbol, style);
-                            character.visible = true;
-                            character.motion.activate_path(path);
-                        }
-                    }
+            // Characters inherit the perimeter gradient while in flight.
+            for character in &volley_characters {
+                if frame_index < character.launch_frame
+                    || frame_index >= character.launch_frame + character.duration
+                {
+                    continue;
                 }
 
-                launch_delay_remaining = self.launch_delay;
-            } else {
-                launch_delay_remaining -= 1;
+                let elapsed = frame_index - character.launch_frame;
+                let raw_progress = elapsed as f64 / character.duration as f64;
+                let progress = easing::out_sine(raw_progress);
+                let start = launcher_position(
+                    character.launcher,
+                    character.launch_frame,
+                    orbit_speed,
+                    width,
+                    height,
+                );
+                let position = start.lerp(character.target, progress);
+                let color =
+                    coordinate_color(position, width, height, &launcher_gradient);
+
+                canvas.set(
+                    position,
+                    character.symbol.clone(),
+                    colored_style(color, true),
+                );
             }
 
-            terminal.step();
+            if show_launchers {
+                for launcher in 0..LAUNCHER_COUNT {
+                    let position = launcher_position(
+                        launcher,
+                        frame_index,
+                        orbit_speed,
+                        width,
+                        height,
+                    );
+                    let color = coordinate_color(
+                        position,
+                        width,
+                        height,
+                        &launcher_gradient,
+                    );
 
-            let orbit_span = f64::from(max_x.max(1));
-            launcher_progress += self.launcher_movement_speed / orbit_span;
-            if launcher_progress > 1.0 {
-                launcher_progress -= 1.0;
+                    canvas.set(position, "◉", colored_style(color, true));
+                }
             }
 
-            update_launchers(
-                &mut terminal,
-                launcher_ids,
-                launcher_progress,
-                max_x,
-                max_y,
-            );
-
-            frames.push(terminal.render_frame());
-
-            let magazines_empty = magazines.iter().all(VecDeque::is_empty);
-            let characters_at_rest = original_characters.iter().all(|(id, _)| {
-                terminal
-                    .character(*id)
-                    .and_then(|character| character.motion.active_path())
-                    .is_none_or(|path| !path.is_active())
-            });
-
-            if magazines_empty && characters_at_rest {
-                for launcher_id in launcher_ids {
-                    if let Some(launcher) = terminal.character_mut(launcher_id) {
-                        launcher.visible = false;
-                    }
-                }
-
-                for &(id, destination) in &original_characters {
-                    if let Some(character) = terminal.character_mut(id) {
-                        character.set_position(destination);
-                        character.visible = true;
-                    }
-                }
-
-                let final_frame = terminal.render_frame();
-                if frames.last() != Some(&final_frame) {
-                    frames.push(final_frame);
-                }
-                break;
-            }
-        }
-
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
+            frames.push(canvas.render());
         }
 
         frames
     }
 }
 
-fn nearest_corner(coord: Coord, corners: &[Coord; 4]) -> usize {
-    corners
-        .iter()
-        .enumerate()
-        .min_by_key(|(index, corner)| (coord.manhattan_distance(**corner), *index))
-        .map(|(index, _)| index)
-        .unwrap_or(0)
+fn input_lines(input: &str) -> Vec<String> {
+    let input = input.trim_end_matches(&['\r', '\n'][..]);
+
+    if input.is_empty() {
+        vec![String::new()]
+    } else {
+        input
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').to_owned())
+            .collect()
+    }
 }
 
-fn distance_squared_from_center(coord: Coord, max_x: i32, max_y: i32) -> i64 {
-    let doubled_x = i64::from(coord.x) * 2 - i64::from(max_x);
-    let doubled_y = i64::from(coord.y) * 2 - i64::from(max_y);
-    doubled_x * doubled_x + doubled_y * doubled_y
+fn colored_style(color: Color, bold: bool) -> Style {
+    Style {
+        bold,
+        ..Style::with_colors(ColorPair::new(Some(color), None))
+    }
 }
 
-fn final_style(coord: Coord, max_x: i32, max_y: i32) -> Style {
-    const START: (u8, u8, u8) = (49, 233, 129);
-    const END: (u8, u8, u8) = (27, 231, 255);
+fn target_launcher(target: Coord, width: usize, height: usize) -> usize {
+    let right_half = target.column as usize >= width.div_ceil(2);
+    let bottom_half = target.row as usize >= height.div_ceil(2);
 
-    let denominator = (max_x + max_y).max(1) as f64;
-    let progress = f64::from(coord.x + coord.y).clamp(0.0, denominator) / denominator;
+    match (right_half, bottom_half) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, true) => 3,
+    }
+}
 
-    let interpolate = |start: u8, end: u8| {
-        (f64::from(start) + (f64::from(end) - f64::from(start)) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
+fn launcher_corner(launcher: usize, width: usize, height: usize) -> Coord {
+    let right = width.saturating_sub(1) as i32;
+    let bottom = height.saturating_sub(1) as i32;
+
+    match launcher % LAUNCHER_COUNT {
+        0 => Coord::new(0, 0),
+        1 => Coord::new(right, 0),
+        2 => Coord::new(right, bottom),
+        _ => Coord::new(0, bottom),
+    }
+}
+
+fn perimeter_length(width: usize, height: usize) -> usize {
+    match (width, height) {
+        (1, 1) => 1,
+        (1, height) => height,
+        (width, 1) => width,
+        (width, height) => 2 * width + 2 * height - 4,
+    }
+}
+
+fn launcher_position(
+    launcher: usize,
+    frame: usize,
+    orbit_speed: usize,
+    width: usize,
+    height: usize,
+) -> Coord {
+    let perimeter = perimeter_length(width, height);
+    if perimeter <= 1 {
+        return Coord::new(0, 0);
+    }
+
+    let quarter_offset = launcher * perimeter / LAUNCHER_COUNT;
+    let distance = (quarter_offset + frame * orbit_speed) % perimeter;
+
+    perimeter_coord(distance, width, height)
+}
+
+fn perimeter_coord(distance: usize, width: usize, height: usize) -> Coord {
+    if width == 1 {
+        return Coord::new(0, (distance % height) as i32);
+    }
+    if height == 1 {
+        return Coord::new((distance % width) as i32, 0);
+    }
+
+    let top_length = width - 1;
+    let right_length = height - 1;
+    let bottom_length = width - 1;
+
+    if distance <= top_length {
+        return Coord::new(distance as i32, 0);
+    }
+
+    let distance = distance - top_length;
+    if distance <= right_length {
+        return Coord::new((width - 1) as i32, distance as i32);
+    }
+
+    let distance = distance - right_length;
+    if distance <= bottom_length {
+        return Coord::new((width - 1 - distance) as i32, (height - 1) as i32);
+    }
+
+    let distance = distance - bottom_length;
+    Coord::new(0, (height - 1 - distance) as i32)
+}
+
+fn coordinate_color(
+    coord: Coord,
+    width: usize,
+    height: usize,
+    colors: &[Color],
+) -> Color {
+    if colors.is_empty() {
+        return Color::new(255, 255, 255);
+    }
+
+    let column_progress = if width <= 1 {
+        0.5
+    } else {
+        coord.column.clamp(0, width as i32 - 1) as f64
+            / (width - 1) as f64
+    };
+    let row_progress = if height <= 1 {
+        0.5
+    } else {
+        coord.row.clamp(0, height as i32 - 1) as f64
+            / (height - 1) as f64
     };
 
-    Style::default().with_foreground(Color::rgb(
-        interpolate(START.0, END.0),
-        interpolate(START.1, END.1),
-        interpolate(START.2, END.2),
-    ))
-}
+    let progress = (column_progress + row_progress) / 2.0;
+    let index =
+        (progress * (colors.len() - 1) as f64).round() as usize;
 
-fn update_launchers(
-    terminal: &mut Terminal,
-    launcher_ids: [CharacterId; 4],
-    progress: f64,
-    max_x: i32,
-    max_y: i32,
-) {
-    let progress = progress.clamp(0.0, 1.0);
-    let x_forward = (f64::from(max_x) * progress).trunc() as i32;
-    let y_forward = (f64::from(max_y) * progress).trunc() as i32;
-
-    let positions = [
-        Coord::new(x_forward, 0),
-        Coord::new(max_x, y_forward),
-        Coord::new(max_x - x_forward, max_y),
-        Coord::new(0, max_y - y_forward),
-    ];
-
-    for (launcher_id, position) in launcher_ids.into_iter().zip(positions) {
-        if let Some(launcher) = terminal.character_mut(launcher_id) {
-            launcher.set_position(position);
-        }
-    }
+    colors[index.min(colors.len() - 1)]
 }

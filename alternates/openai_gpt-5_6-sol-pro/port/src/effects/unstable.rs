@@ -1,22 +1,216 @@
 use super::Effect;
-use crate::engine::Terminal;
-use crate::utils::easing::{in_out_sine, out_expo};
-use crate::utils::{Color, Coord, Style};
 
-const UNSTABLE_COLOR: Color = Color::rgb(255, 255, 255);
-const UNSTABLE_MAGENTA: Color = Color::rgb(255, 0, 170);
-const UNSTABLE_CYAN: Color = Color::rgb(0, 209, 255);
+use crate::engine::{Canvas, CharacterId, CharacterVisual, EffectCharacter};
+use crate::utils::easing;
+use crate::utils::{Color, ColorPair, Coord, Gradient, Style};
 
-const FINAL_START: Color = Color::rgb(138, 0, 138);
-const FINAL_MIDDLE: Color = Color::rgb(0, 209, 255);
-const FINAL_END: Color = Color::rgb(255, 255, 255);
+const UNSTABLE_COLOR: Color = Color::new(255, 255, 255);
+const FINAL_GRADIENT_START: Color = Color::new(138, 0, 138);
+const FINAL_GRADIENT_MIDDLE: Color = Color::new(0, 209, 255);
+const FINAL_GRADIENT_END: Color = Color::new(255, 255, 255);
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Debug)]
+struct Glyph {
+    id: CharacterId,
+    symbol: String,
+    origin: Coord,
+    scattered: Coord,
+    final_color: Color,
+}
+
 pub struct Unstable;
 
 impl Unstable {
     pub fn new() -> Self {
         Self
+    }
+
+    fn parse_input(input: &str) -> (usize, usize, Vec<(String, Coord)>) {
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = normalized.trim_end_matches('\n');
+        let lines: Vec<&str> = if normalized.is_empty() {
+            vec![""]
+        } else {
+            normalized.split('\n').collect()
+        };
+
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
+
+        let mut parsed = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                parsed.push((
+                    symbol.to_string(),
+                    Coord::new(column as i32, row as i32),
+                ));
+            }
+        }
+
+        (width, height, parsed)
+    }
+
+    fn build_glyphs(
+        width: usize,
+        height: usize,
+        parsed: Vec<(String, Coord)>,
+    ) -> Vec<Glyph> {
+        let gradient_steps = height.max(12);
+        let gradient = Gradient::new(
+            [
+                FINAL_GRADIENT_START,
+                FINAL_GRADIENT_MIDDLE,
+                FINAL_GRADIENT_END,
+            ],
+            gradient_steps,
+        )
+        .colors();
+
+        parsed
+            .into_iter()
+            .enumerate()
+            .map(|(index, (symbol, origin))| {
+                let seed = index as u64 + 1;
+                let scattered = Coord::new(
+                    Self::random_coordinate(seed, 0, width),
+                    Self::random_coordinate(seed, 1, height),
+                );
+
+                let color_index = if height <= 1 {
+                    index % gradient.len()
+                } else {
+                    let progress = origin.row as f64 / (height - 1) as f64;
+                    (progress * (gradient.len() - 1) as f64).round() as usize
+                };
+
+                Glyph {
+                    id: CharacterId(index as u32),
+                    symbol,
+                    origin,
+                    scattered,
+                    final_color: gradient[color_index.min(gradient.len() - 1)],
+                }
+            })
+            .collect()
+    }
+
+    fn random_coordinate(
+        seed: u64,
+        axis: u64,
+        extent: usize,
+    ) -> i32 {
+        if extent <= 1 {
+            return 0;
+        }
+
+        (Self::mix(seed ^ axis.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            % extent as u64) as i32
+    }
+
+    fn mix(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30))
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27))
+            .wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn jitter(
+        id: CharacterId,
+        frame: usize,
+        amplitude: i32,
+    ) -> Coord {
+        if amplitude <= 0 {
+            return Coord::new(0, 0);
+        }
+
+        let span = (amplitude * 2 + 1) as u64;
+        let base = id.0 as u64
+            ^ (frame as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+
+        let column =
+            (Self::mix(base ^ 0xa076_1d64_78bd_642f) % span) as i32
+                - amplitude;
+        let row =
+            (Self::mix(base ^ 0xe703_7ed1_a0b4_28db) % span) as i32
+                - amplitude;
+
+        Coord::new(column, row)
+    }
+
+    fn render(
+        width: usize,
+        height: usize,
+        glyphs: &[Glyph],
+        frame_number: usize,
+        position: impl Fn(&Glyph) -> Coord,
+        color_progress: f64,
+        jitter_amplitude: i32,
+    ) -> String {
+        let mut canvas = Canvas::new(width, height);
+
+        if glyphs.is_empty() {
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style::with_colors(ColorPair::new(
+                    Some(UNSTABLE_COLOR),
+                    None,
+                )),
+            );
+            return canvas.render();
+        }
+
+        for glyph in glyphs {
+            let base_position = position(glyph);
+            let offset =
+                Self::jitter(glyph.id, frame_number, jitter_amplitude);
+            let current_position = Coord::new(
+                base_position.column + offset.column,
+                base_position.row + offset.row,
+            );
+
+            let color =
+                UNSTABLE_COLOR.lerp(glyph.final_color, color_progress);
+            let style = Style {
+                bold: color_progress < 0.8,
+                ..Style::with_colors(ColorPair::new(Some(color), None))
+            };
+
+            let mut character = EffectCharacter::new(
+                glyph.id,
+                glyph.symbol.clone(),
+                current_position,
+            );
+            character.set_appearance(CharacterVisual::new(
+                glyph.symbol.clone(),
+                style,
+            ));
+            canvas.draw_character(&character);
+        }
+
+        let rendered = canvas.render();
+        if rendered.contains('\x1b') {
+            rendered
+        } else {
+            let style = Style::with_colors(ColorPair::new(
+                Some(UNSTABLE_COLOR),
+                None,
+            ));
+            format!("{}{}\x1b[0m", style.ansi_prefix(), rendered)
+        }
+    }
+}
+
+impl Default for Unstable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -26,227 +220,112 @@ impl Effect for Unstable {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
-        }
-
-        let homes: Vec<Coord> = terminal
-            .characters()
-            .iter()
-            .map(|character| character.position)
-            .collect();
-
-        let mut rng = SmallRng::from_input(input);
+        let (width, height, parsed) = Self::parse_input(input);
+        let glyphs = Self::build_glyphs(width, height, parsed);
         let mut frames = Vec::new();
+        let mut frame_number = 0;
 
-        // The text becomes progressively less stable, with characters shaking
-        // independently and briefly flashing contrasting colors.
-        for frame_index in 0..30 {
-            let amplitude = match frame_index {
-                0..=5 => 1,
-                6..=13 => 2,
-                14..=21 => 3,
-                22..=25 => 2,
-                _ => 1,
+        const DESTABILIZE_FRAMES: usize = 14;
+        for frame in 0..DESTABILIZE_FRAMES {
+            let progress =
+                frame as f64 / (DESTABILIZE_FRAMES - 1) as f64;
+            let amplitude = if progress < 0.25 {
+                0
+            } else if progress < 0.65 {
+                1
+            } else {
+                2
             };
 
-            let width = terminal.canvas().width() as i32;
-            let height = terminal.canvas().height() as i32;
-
-            for (character, home) in terminal.characters_mut().iter_mut().zip(&homes) {
-                let dx = rng.range_i32(-amplitude, amplitude);
-                let dy = rng.range_i32(-amplitude, amplitude);
-                let position = clamp_coord(home.offset(dx, dy), width, height);
-
-                let color = match rng.next_u32() % 7 {
-                    0 => UNSTABLE_MAGENTA,
-                    1 => UNSTABLE_CYAN,
-                    _ => UNSTABLE_COLOR,
-                };
-
-                character.set_position(position);
-                character.set_appearance(
-                    character.input_symbol,
-                    Style::default().with_foreground(color),
-                );
-            }
-
-            frames.push(terminal.render_frame());
+            frames.push(Self::render(
+                width,
+                height,
+                &glyphs,
+                frame_number,
+                |glyph| glyph.origin,
+                0.0,
+                amplitude,
+            ));
+            frame_number += 1;
         }
 
-        let width = terminal.canvas().width() as i32;
-        let height = terminal.canvas().height() as i32;
-        let targets: Vec<Coord> = homes
-            .iter()
-            .map(|_| random_edge_coord(&mut rng, width, height))
-            .collect();
+        const SCATTER_FRAMES: usize = 18;
+        for frame in 0..SCATTER_FRAMES {
+            let progress = (frame + 1) as f64 / SCATTER_FRAMES as f64;
+            let eased = easing::out_expo(progress);
 
-        // Release the unstable characters toward random edges of the canvas.
-        for step in 1..=18 {
-            let progress = out_expo(step as f64 / 18.0);
-
-            for ((character, home), target) in terminal
-                .characters_mut()
-                .iter_mut()
-                .zip(&homes)
-                .zip(&targets)
-            {
-                character.set_position(home.lerp(*target, progress));
-
-                let color = if (step + character.id.0 as usize) % 4 == 0 {
-                    UNSTABLE_CYAN
-                } else {
-                    UNSTABLE_COLOR
-                };
-
-                character.set_appearance(
-                    character.input_symbol,
-                    Style::default().with_foreground(color),
-                );
-            }
-
-            frames.push(terminal.render_frame());
+            frames.push(Self::render(
+                width,
+                height,
+                &glyphs,
+                frame_number,
+                |glyph| glyph.origin.lerp(glyph.scattered, eased),
+                0.0,
+                1,
+            ));
+            frame_number += 1;
         }
 
-        // Reassemble the text at its original coordinates.
-        for step in 1..=24 {
-            let progress = in_out_sine(step as f64 / 24.0);
-
-            for ((character, target), home) in terminal
-                .characters_mut()
-                .iter_mut()
-                .zip(&targets)
-                .zip(&homes)
-            {
-                character.set_position(target.lerp(*home, progress));
-                character.set_appearance(
-                    character.input_symbol,
-                    Style::default().with_foreground(UNSTABLE_COLOR),
-                );
-            }
-
-            frames.push(terminal.render_frame());
+        const UNSTABLE_HOLD_FRAMES: usize = 7;
+        for _ in 0..UNSTABLE_HOLD_FRAMES {
+            frames.push(Self::render(
+                width,
+                height,
+                &glyphs,
+                frame_number,
+                |glyph| glyph.scattered,
+                0.0,
+                1,
+            ));
+            frame_number += 1;
         }
 
-        // Finish with the stable vertical gradient used by the effect.
-        let canvas_height = terminal.canvas().height();
+        const REASSEMBLE_FRAMES: usize = 24;
+        for frame in 0..REASSEMBLE_FRAMES {
+            let progress =
+                (frame + 1) as f64 / REASSEMBLE_FRAMES as f64;
+            let eased = easing::in_out_cubic(progress);
+            let jitter_amplitude = if progress < 0.7 { 1 } else { 0 };
 
-        for (character, home) in terminal.characters_mut().iter_mut().zip(&homes) {
-            let color = final_gradient(home.y, canvas_height);
-            character.set_position(*home);
-            character.set_appearance(
-                character.input_symbol,
-                Style::default().with_foreground(color),
-            );
+            frames.push(Self::render(
+                width,
+                height,
+                &glyphs,
+                frame_number,
+                |glyph| glyph.scattered.lerp(glyph.origin, eased),
+                easing::in_out_sine(progress),
+                jitter_amplitude,
+            ));
+            frame_number += 1;
         }
 
-        frames.push(terminal.render_frame());
+        const SETTLE_FRAMES: usize = 6;
+        for frame in 0..SETTLE_FRAMES {
+            let jitter_amplitude =
+                usize::from(frame < SETTLE_FRAMES / 2) as i32;
+
+            frames.push(Self::render(
+                width,
+                height,
+                &glyphs,
+                frame_number,
+                |glyph| glyph.origin,
+                1.0,
+                jitter_amplitude,
+            ));
+            frame_number += 1;
+        }
+
+        frames.push(Self::render(
+            width,
+            height,
+            &glyphs,
+            frame_number,
+            |glyph| glyph.origin,
+            1.0,
+            0,
+        ));
+
         frames
-    }
-}
-
-fn clamp_coord(coord: Coord, width: i32, height: i32) -> Coord {
-    Coord::new(
-        coord.x.clamp(0, width.saturating_sub(1)),
-        coord.y.clamp(0, height.saturating_sub(1)),
-    )
-}
-
-fn random_edge_coord(rng: &mut SmallRng, width: i32, height: i32) -> Coord {
-    let max_x = width.saturating_sub(1);
-    let max_y = height.saturating_sub(1);
-
-    match rng.next_u32() % 4 {
-        0 => Coord::new(0, rng.range_i32(0, max_y)),
-        1 => Coord::new(max_x, rng.range_i32(0, max_y)),
-        2 => Coord::new(rng.range_i32(0, max_x), 0),
-        _ => Coord::new(rng.range_i32(0, max_x), max_y),
-    }
-}
-
-fn final_gradient(row: i32, height: usize) -> Color {
-    let progress = if height <= 1 {
-        1.0
-    } else {
-        (row.max(0) as f64 / (height - 1) as f64).clamp(0.0, 1.0)
-    };
-
-    if progress <= 0.5 {
-        interpolate_color(FINAL_START, FINAL_MIDDLE, progress * 2.0)
-    } else {
-        interpolate_color(FINAL_MIDDLE, FINAL_END, (progress - 0.5) * 2.0)
-    }
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return end;
-    };
-
-    let progress = progress.clamp(0.0, 1.0);
-    let interpolate = |start: u8, end: u8| {
-        (start as f64 + (end as f64 - start as f64) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
-    )
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SmallRng {
-    state: u64,
-}
-
-impl SmallRng {
-    fn from_input(input: &str) -> Self {
-        let mut state = 0xcbf2_9ce4_8422_2325_u64;
-
-        for byte in input.bytes() {
-            state ^= u64::from(byte);
-            state = state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-
-        if state == 0 {
-            state = 0x9e37_79b9_7f4a_7c15;
-        }
-
-        Self { state }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        (value >> 32) as u32
-    }
-
-    fn range_i32(&mut self, minimum: i32, maximum: i32) -> i32 {
-        if maximum <= minimum {
-            return minimum;
-        }
-
-        let span = (i64::from(maximum) - i64::from(minimum) + 1) as u64;
-        minimum + (u64::from(self.next_u32()) % span) as i32
     }
 }

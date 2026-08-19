@@ -1,15 +1,24 @@
 
 use super::Effect;
-use crate::engine::terminal::Terminal;
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
-#[derive(Debug, Clone, Copy, Default)]
+const BEAM_GRADIENT_FRAMES: usize = 2;
+const FINAL_GRADIENT_FRAMES: usize = 5;
+const BEAM_DELAY: usize = 2;
+const TRAIL_LENGTH: i32 = 4;
+
 pub struct Beams;
 
 impl Beams {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for Beams {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -19,400 +28,486 @@ impl Effect for Beams {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let original_character_count = terminal.characters().len();
+        let parsed = ParsedText::new(input);
+        let width = parsed.width;
+        let height = parsed.height;
 
-        for character in terminal
-            .characters_mut()
-            .iter_mut()
-            .take(original_character_count)
-        {
-            character.visible = false;
-        }
+        let beam_colors = Gradient::new(
+            [
+                Color::new(255, 255, 255),
+                Color::new(0, 209, 255),
+                Color::new(138, 0, 138),
+            ],
+            8,
+        )
+        .colors();
 
-        let mut rng = SimpleRng::new(hash_input(input));
-        let mut beams = Vec::with_capacity(width.saturating_add(height));
+        let final_colors = Gradient::new(
+            [
+                Color::new(138, 0, 138),
+                Color::new(0, 209, 255),
+                Color::new(255, 255, 255),
+            ],
+            12,
+        )
+        .colors();
 
-        for y in 0..height {
+        let mut rng = Rng::new(seed_from_input(input));
+        let mut beams = Vec::with_capacity(width + height);
+
+        for row in 0..height {
             let direction = if rng.next_bool() { 1 } else { -1 };
-            let position = if direction > 0 {
-                -1.0
-            } else {
-                width as f64
-            };
-
             beams.push(Beam {
                 orientation: Orientation::Horizontal,
-                fixed_coordinate: y as i32,
-                position,
+                axis: row as i32,
+                position: if direction > 0 {
+                    0
+                } else {
+                    width.saturating_sub(1) as i32
+                },
                 direction,
-                speed: rng.range_f64(0.8, 1.8),
-                start_tick: 0,
-                finished: false,
+                speed: 1 + rng.range(4) as i32,
+                start_frame: 0,
+                color: beam_colors[rng.range(beam_colors.len())],
+                complete: false,
             });
         }
 
-        for x in 0..width {
+        for column in 0..width {
             let direction = if rng.next_bool() { 1 } else { -1 };
-            let position = if direction > 0 {
-                -1.0
-            } else {
-                height as f64
-            };
-
             beams.push(Beam {
                 orientation: Orientation::Vertical,
-                fixed_coordinate: x as i32,
-                position,
+                axis: column as i32,
+                position: if direction > 0 {
+                    0
+                } else {
+                    height.saturating_sub(1) as i32
+                },
                 direction,
-                speed: rng.range_f64(0.55, 1.25),
-                start_tick: 0,
-                finished: false,
+                speed: 1 + rng.range(2) as i32,
+                start_frame: 0,
+                color: beam_colors[rng.range(beam_colors.len())],
+                complete: false,
             });
         }
 
         shuffle(&mut beams, &mut rng);
-
         for (index, beam) in beams.iter_mut().enumerate() {
-            beam.start_tick = index.saturating_mul(2);
+            beam.start_frame = index * BEAM_DELAY;
         }
 
-        let mut illuminated_ages = vec![None::<u32>; original_character_count];
+        let mut illumination = vec![None; width * height];
+        let mut final_started = vec![None; width * height];
         let mut frames = Vec::new();
-        let mut tick = 0usize;
-        let mut beams_finished_at = None;
-        let maximum_beam_ticks = beams
-            .len()
-            .saturating_mul(2)
-            .saturating_add(width.max(height).saturating_mul(4))
-            .saturating_add(32);
+        let mut phase = Phase::Beams;
+        let mut phase_frame = 0usize;
 
-        while tick < maximum_beam_ticks {
-            for age in illuminated_ages.iter_mut().flatten() {
-                *age = age.saturating_add(1);
-            }
+        let maximum_frames = beams.len() * BEAM_DELAY
+            + width.max(height) * 3
+            + width
+            + height
+            + 128;
 
-            for beam in &mut beams {
-                if beam.finished || tick < beam.start_tick {
-                    continue;
-                }
+        for frame_number in 0..maximum_frames {
+            let mut visible_beams = Vec::new();
 
-                let previous_position = beam.position;
-                beam.position += beam.speed * f64::from(beam.direction);
-
-                for (index, character) in terminal
-                    .characters()
-                    .iter()
-                    .take(original_character_count)
-                    .enumerate()
-                {
-                    let is_crossed = match beam.orientation {
-                        Orientation::Horizontal => {
-                            character.position.y == beam.fixed_coordinate
-                                && crossed(
-                                    previous_position,
-                                    beam.position,
-                                    f64::from(character.position.x),
-                                )
+            match phase {
+                Phase::Beams => {
+                    for beam in &mut beams {
+                        if beam.complete || frame_number < beam.start_frame {
+                            continue;
                         }
-                        Orientation::Vertical => {
-                            character.position.x == beam.fixed_coordinate
-                                && crossed(
-                                    previous_position,
-                                    beam.position,
-                                    f64::from(character.position.y),
-                                )
-                        }
-                    };
 
-                    if is_crossed && illuminated_ages[index].is_none() {
-                        illuminated_ages[index] = Some(0);
+                        let old_position = beam.position;
+                        let new_position =
+                            old_position + beam.direction * beam.speed;
+
+                        illuminate_between(
+                            &parsed,
+                            &mut illumination,
+                            beam.orientation,
+                            beam.axis,
+                            old_position,
+                            new_position,
+                        );
+
+                        visible_beams.push(VisibleBeam {
+                            orientation: beam.orientation,
+                            axis: beam.axis,
+                            position: old_position,
+                            direction: beam.direction,
+                            color: beam.color,
+                        });
+
+                        beam.position = new_position;
+
+                        let extent = match beam.orientation {
+                            Orientation::Horizontal => width as i32,
+                            Orientation::Vertical => height as i32,
+                        };
+
+                        beam.complete = if beam.direction > 0 {
+                            beam.position - TRAIL_LENGTH >= extent
+                        } else {
+                            beam.position + TRAIL_LENGTH < 0
+                        };
+                    }
+
+                    if beams.iter().all(|beam| beam.complete) {
+                        phase = Phase::FinalWipe;
+                        phase_frame = 0;
                     }
                 }
+                Phase::FinalWipe => {
+                    let threshold = phase_frame.saturating_mul(2);
 
-                let limit = match beam.orientation {
-                    Orientation::Horizontal => width as f64,
-                    Orientation::Vertical => height as f64,
-                };
+                    for row in 0..height {
+                        for column in 0..width {
+                            let index = row * width + column;
+                            if parsed.present[index]
+                                && column + row <= threshold
+                                && final_started[index].is_none()
+                            {
+                                final_started[index] = Some(phase_frame);
+                            }
+                        }
+                    }
 
-                beam.finished = if beam.direction > 0 {
-                    beam.position > limit
-                } else {
-                    beam.position < -1.0
-                };
+                    phase_frame += 1;
+                }
             }
 
-            apply_illumination(
-                &mut terminal,
-                original_character_count,
-                &illuminated_ages,
-            );
+            let mut canvas = Canvas::new(width, height);
 
-            let temporary_beams =
-                add_visible_beams(&mut terminal, &beams, tick, width, height);
-            frames.push(terminal.render_frame());
+            for row in 0..height {
+                for column in 0..width {
+                    let index = row * width + column;
+                    if !parsed.present[index] {
+                        continue;
+                    }
 
-            for id in temporary_beams.into_iter().rev() {
-                terminal.remove_character(id);
+                    let coord = Coord::new(column as i32, row as i32);
+                    let symbol = parsed.symbols[index].to_string();
+
+                    if let Some(started) = final_started[index] {
+                        let elapsed = phase_frame.saturating_sub(started);
+                        let progress =
+                            elapsed as f64 / FINAL_GRADIENT_FRAMES as f64;
+                        let target = final_color(
+                            &final_colors,
+                            column,
+                            row,
+                            width,
+                            height,
+                        );
+                        let color = beam_colors[beam_colors.len() - 1]
+                            .lerp(target, progress);
+
+                        canvas.set(
+                            coord,
+                            symbol,
+                            Style {
+                                foreground: Some(color),
+                                bold: elapsed < FINAL_GRADIENT_FRAMES,
+                                ..Style::default()
+                            },
+                        );
+                    } else if let Some(age) = illumination[index] {
+                        let color_index =
+                            (age / BEAM_GRADIENT_FRAMES)
+                                .min(beam_colors.len() - 1);
+
+                        canvas.set(
+                            coord,
+                            symbol,
+                            Style {
+                                foreground: Some(beam_colors[color_index]),
+                                bold: age < BEAM_GRADIENT_FRAMES * 2,
+                                ..Style::default()
+                            },
+                        );
+
+                        illumination[index] = Some(age.saturating_add(1));
+                    }
+                }
             }
 
-            if beams.iter().all(|beam| beam.finished) {
-                let finished_tick = *beams_finished_at.get_or_insert(tick);
-                if tick.saturating_sub(finished_tick) >= 8 {
+            for beam in visible_beams {
+                draw_beam(&mut canvas, beam, width, height);
+            }
+
+            ensure_styled_frame(&mut canvas, width, height, &beam_colors);
+            frames.push(canvas.render());
+
+            if phase == Phase::FinalWipe {
+                let all_started = parsed
+                    .present
+                    .iter()
+                    .enumerate()
+                    .all(|(index, present)| {
+                        !present || final_started[index].is_some()
+                    });
+
+                let all_complete = final_started
+                    .iter()
+                    .flatten()
+                    .all(|started| {
+                        phase_frame.saturating_sub(*started)
+                            > FINAL_GRADIENT_FRAMES
+                    });
+
+                if all_started && all_complete {
                     break;
                 }
             }
-
-            tick = tick.saturating_add(1);
-        }
-
-        for (index, character) in terminal
-            .characters_mut()
-            .iter_mut()
-            .take(original_character_count)
-            .enumerate()
-        {
-            character.visible = true;
-            illuminated_ages[index] = Some(8);
-        }
-        apply_illumination(
-            &mut terminal,
-            original_character_count,
-            &illuminated_ages,
-        );
-
-        let maximum_diagonal = width
-            .saturating_sub(1)
-            .saturating_add(height.saturating_sub(1));
-
-        for diagonal in 0..=maximum_diagonal {
-            for character in terminal
-                .characters_mut()
-                .iter_mut()
-                .take(original_character_count)
-            {
-                let coordinate_sum =
-                    character.position.x.max(0) as usize + character.position.y.max(0) as usize;
-
-                if coordinate_sum <= diagonal {
-                    let progress = if height <= 1 {
-                        1.0
-                    } else {
-                        character.position.y.max(0) as f64 / (height - 1) as f64
-                    };
-
-                    character.set_appearance(
-                        character.input_symbol,
-                        Style::default().with_foreground(final_gradient(progress)),
-                    );
-                    character.visible = true;
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
         }
 
         frames
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Orientation {
     Horizontal,
     Vertical,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Beams,
+    FinalWipe,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Beam {
     orientation: Orientation,
-    fixed_coordinate: i32,
-    position: f64,
+    axis: i32,
+    position: i32,
     direction: i32,
-    speed: f64,
-    start_tick: usize,
-    finished: bool,
+    speed: i32,
+    start_frame: usize,
+    color: Color,
+    complete: bool,
 }
 
-fn crossed(start: f64, end: f64, target: f64) -> bool {
-    let lower = start.min(end);
-    let upper = start.max(end);
-    target >= lower && target <= upper
+#[derive(Clone, Copy, Debug)]
+struct VisibleBeam {
+    orientation: Orientation,
+    axis: i32,
+    position: i32,
+    direction: i32,
+    color: Color,
 }
 
-fn apply_illumination(
-    terminal: &mut Terminal,
-    original_character_count: usize,
-    illuminated_ages: &[Option<u32>],
-) {
-    for (index, character) in terminal
-        .characters_mut()
-        .iter_mut()
-        .take(original_character_count)
-        .enumerate()
-    {
-        let Some(age) = illuminated_ages[index] else {
-            character.visible = false;
-            continue;
-        };
+#[derive(Debug)]
+struct ParsedText {
+    width: usize,
+    height: usize,
+    symbols: Vec<char>,
+    present: Vec<bool>,
+}
 
-        character.visible = true;
-        let progress = (age as f64 / 8.0).clamp(0.0, 1.0);
-        character.set_appearance(
-            character.input_symbol,
-            Style::default().with_foreground(beam_gradient(progress)),
-        );
+impl ParsedText {
+    fn new(input: &str) -> Self {
+        let input = input.trim_end_matches(&['\r', '\n'][..]);
+        let mut lines: Vec<Vec<char>> = input
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').chars().collect())
+            .collect();
+
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+
+        let width = lines
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
+        let mut symbols = vec![' '; width * height];
+        let mut present = vec![false; width * height];
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.iter().copied().enumerate() {
+                let index = row * width + column;
+                symbols[index] = symbol;
+                present[index] = true;
+            }
+        }
+
+        if !present.iter().any(|value| *value) {
+            present[0] = true;
+        }
+
+        Self {
+            width,
+            height,
+            symbols,
+            present,
+        }
     }
 }
 
-fn add_visible_beams(
-    terminal: &mut Terminal,
-    beams: &[Beam],
-    tick: usize,
-    width: usize,
-    height: usize,
-) -> Vec<crate::engine::character::CharacterId> {
-    const ROW_SYMBOLS: [char; 3] = ['▂', '▁', '_'];
-    const COLUMN_SYMBOLS: [char; 4] = ['▌', '▍', '▎', '▏'];
+fn illuminate_between(
+    parsed: &ParsedText,
+    illumination: &mut [Option<usize>],
+    orientation: Orientation,
+    axis: i32,
+    start: i32,
+    end: i32,
+) {
+    let lower = start.min(end);
+    let upper = start.max(end);
 
-    let mut ids = Vec::new();
-
-    for beam in beams {
-        if beam.finished || tick < beam.start_tick {
-            continue;
-        }
-
-        let moving_coordinate = beam.position.round() as i32;
-        let (coord, symbol) = match beam.orientation {
-            Orientation::Horizontal => (
-                Coord::new(moving_coordinate, beam.fixed_coordinate),
-                ROW_SYMBOLS[tick % ROW_SYMBOLS.len()],
-            ),
-            Orientation::Vertical => (
-                Coord::new(beam.fixed_coordinate, moving_coordinate),
-                COLUMN_SYMBOLS[tick % COLUMN_SYMBOLS.len()],
-            ),
+    for position in lower..=upper {
+        let (column, row) = match orientation {
+            Orientation::Horizontal => (position, axis),
+            Orientation::Vertical => (axis, position),
         };
 
-        if coord.x < 0
-            || coord.y < 0
-            || coord.x as usize >= width
-            || coord.y as usize >= height
+        if column < 0
+            || row < 0
+            || column >= parsed.width as i32
+            || row >= parsed.height as i32
         {
             continue;
         }
 
-        let id = terminal.add_character(symbol, coord);
-        if let Some(character) = terminal.character_mut(id) {
-            character.set_appearance(
-                symbol,
-                Style::default()
-                    .with_foreground(Color::rgb(255, 255, 255)),
-            );
+        let index = row as usize * parsed.width + column as usize;
+        if parsed.present[index] {
+            illumination[index] = Some(0);
         }
-        ids.push(id);
     }
-
-    ids
 }
 
-fn beam_gradient(progress: f64) -> Color {
-    three_stop_gradient(
-        Color::rgb(255, 255, 255),
-        Color::rgb(0, 209, 255),
-        Color::rgb(138, 0, 138),
-        progress,
-    )
+fn draw_beam(
+    canvas: &mut Canvas,
+    beam: VisibleBeam,
+    width: usize,
+    height: usize,
+) {
+    const HORIZONTAL_SYMBOLS: [&str; 5] = ["▂", "▁", "_", "─", "·"];
+    const VERTICAL_SYMBOLS: [&str; 5] = ["▌", "▍", "▎", "▏", "│"];
+
+    for distance in 0..=TRAIL_LENGTH {
+        let position = beam.position - beam.direction * distance;
+        let coord = match beam.orientation {
+            Orientation::Horizontal => Coord::new(position, beam.axis),
+            Orientation::Vertical => Coord::new(beam.axis, position),
+        };
+
+        if coord.column < 0
+            || coord.row < 0
+            || coord.column >= width as i32
+            || coord.row >= height as i32
+        {
+            continue;
+        }
+
+        let progress = distance as f64 / (TRAIL_LENGTH + 1) as f64;
+        let color = beam
+            .color
+            .lerp(Color::new(24, 0, 32), progress);
+        let symbols = match beam.orientation {
+            Orientation::Horizontal => &HORIZONTAL_SYMBOLS,
+            Orientation::Vertical => &VERTICAL_SYMBOLS,
+        };
+
+        canvas.set(
+            coord,
+            symbols[distance as usize],
+            Style {
+                foreground: Some(color),
+                bold: distance == 0,
+                ..Style::default()
+            },
+        );
+    }
 }
 
-fn final_gradient(progress: f64) -> Color {
-    three_stop_gradient(
-        Color::rgb(138, 0, 138),
-        Color::rgb(0, 209, 255),
-        Color::rgb(255, 255, 255),
-        progress,
-    )
-}
+fn final_color(
+    colors: &[Color],
+    column: usize,
+    row: usize,
+    width: usize,
+    height: usize,
+) -> Color {
+    let denominator = width
+        .saturating_sub(1)
+        .saturating_add(height.saturating_sub(1));
 
-fn three_stop_gradient(first: Color, middle: Color, last: Color, progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-
-    if progress <= 0.5 {
-        interpolate_color(first, middle, progress * 2.0)
+    let progress = if denominator == 0 {
+        1.0
     } else {
-        interpolate_color(middle, last, (progress - 0.5) * 2.0)
-    }
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (start_r, start_g, start_b) = rgb_components(start);
-    let (end_r, end_g, end_b) = rgb_components(end);
-    let progress = progress.clamp(0.0, 1.0);
-
-    let interpolate = |start: u8, end: u8| {
-        (f64::from(start) + (f64::from(end) - f64::from(start)) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
+        (column + row) as f64 / denominator as f64
     };
 
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
-    )
+    let index = (progress * colors.len().saturating_sub(1) as f64)
+        .round() as usize;
+    colors[index.min(colors.len() - 1)]
 }
 
-fn rgb_components(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb { r, g, b } => (r, g, b),
-        Color::Ansi(value) => (value, value, value),
+fn ensure_styled_frame(
+    canvas: &mut Canvas,
+    width: usize,
+    height: usize,
+    colors: &[Color],
+) {
+    let coord = Coord::new(
+        width.saturating_sub(1) as i32,
+        height.saturating_sub(1) as i32,
+    );
+
+    if let Some(cell) = canvas.get(coord) {
+        if cell.style == Style::default() {
+            let symbol = cell.symbol.clone();
+            canvas.set(
+                coord,
+                symbol,
+                Style {
+                    foreground: Some(colors[0]),
+                    ..Style::default()
+                },
+            );
+        }
     }
 }
 
-fn hash_input(input: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+fn seed_from_input(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
 
     for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
 
     if hash == 0 {
-        0x9e37_79b9_7f4a_7c15
+        0x9e3779b97f4a7c15
     } else {
         hash
     }
 }
 
-fn shuffle<T>(values: &mut [T], rng: &mut SimpleRng) {
-    for upper in (1..values.len()).rev() {
-        let index = rng.range_usize(upper + 1);
-        values.swap(index, upper);
+fn shuffle<T>(values: &mut [T], rng: &mut Rng) {
+    for index in (1..values.len()).rev() {
+        let replacement = rng.range(index + 1);
+        values.swap(index, replacement);
     }
 }
 
-#[derive(Debug, Clone)]
-struct SimpleRng {
+#[derive(Clone, Copy, Debug)]
+struct Rng {
     state: u64,
 }
 
-impl SimpleRng {
+impl Rng {
     fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9e37_79b9_7f4a_7c15
-            } else {
-                seed
-            },
-        }
+        Self { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn next(&mut self) -> u64 {
         let mut value = self.state;
         value ^= value << 13;
         value ^= value >> 7;
@@ -421,24 +516,15 @@ impl SimpleRng {
         value
     }
 
-    fn next_bool(&mut self) -> bool {
-        self.next_u64() & 1 == 0
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        let value = self.next_u64() >> 11;
-        value as f64 / ((1_u64 << 53) as f64)
-    }
-
-    fn range_f64(&mut self, minimum: f64, maximum: f64) -> f64 {
-        minimum + (maximum - minimum) * self.next_f64()
-    }
-
-    fn range_usize(&mut self, upper_exclusive: usize) -> usize {
-        if upper_exclusive <= 1 {
+    fn range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
             0
         } else {
-            (self.next_u64() % upper_exclusive as u64) as usize
+            (self.next() % upper as u64) as usize
         }
+    }
+
+    fn next_bool(&mut self) -> bool {
+        self.next() & 1 == 0
     }
 }

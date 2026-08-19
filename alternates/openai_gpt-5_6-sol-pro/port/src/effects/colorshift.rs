@@ -1,17 +1,26 @@
 
 use super::Effect;
-use crate::engine::{CharacterVisual, Frame, Scene, Terminal};
-use crate::utils::{Color, Style};
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
-const GRADIENT_STEPS: usize = 12;
-const GRADIENT_FRAMES: u32 = 5;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Colorshift;
+#[derive(Clone, Debug)]
+pub struct Colorshift {
+    gradient_steps: usize,
+    frames_per_color: usize,
+}
 
 impl Colorshift {
     pub fn new() -> Self {
-        Self
+        Self {
+            gradient_steps: 12,
+            frames_per_color: 5,
+        }
+    }
+}
+
+impl Default for Colorshift {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -21,111 +30,73 @@ impl Effect for Colorshift {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let mut lines: Vec<Vec<char>> = input
+            .lines()
+            .map(|line| line.trim_end_matches('\r').chars().collect())
+            .collect();
 
-        if terminal.characters().is_empty() {
-            return Vec::new();
+        if lines.is_empty() {
+            lines.push(Vec::new());
         }
 
-        let spectrum = build_spectrum();
-        let canvas_width = terminal.canvas().width();
-        let final_spectrum_index = spectrum.len().saturating_sub(1);
+        let width = lines
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
 
-        for character in terminal.characters_mut() {
-            let phase = if canvas_width <= 1 {
-                0
-            } else {
-                let x = character
-                    .position
-                    .x
-                    .clamp(0, canvas_width.saturating_sub(1) as i32)
-                    as usize;
+        // The repeated first stop closes the gradient smoothly when the
+        // animation cycles from its final frame back to its first.
+        let stops = [
+            Color::new(0xe8, 0x14, 0x16),
+            Color::new(0xff, 0xa5, 0x00),
+            Color::new(0xfa, 0xeb, 0x36),
+            Color::new(0x79, 0xc3, 0x14),
+            Color::new(0x48, 0x7d, 0xe7),
+            Color::new(0x4b, 0x36, 0x9d),
+            Color::new(0x70, 0x36, 0x9d),
+            Color::new(0xe8, 0x14, 0x16),
+        ];
+        let color_count =
+            self.gradient_steps.max(1) * (stops.len() - 1);
+        let colors = Gradient::new(stops, color_count).colors();
 
-                x * final_spectrum_index / canvas_width.saturating_sub(1)
+        let mut frames =
+            Vec::with_capacity(colors.len() * self.frames_per_color.max(1));
+
+        for color in colors {
+            let style = Style {
+                foreground: Some(color),
+                ..Style::default()
             };
+            let mut canvas = Canvas::new(width, height);
+            let mut drew_character = false;
 
-            let mut scene = Scene::new(false);
-
-            for offset in 0..spectrum.len() {
-                let color = spectrum[(phase + offset) % spectrum.len()];
-                let style = Style::default().with_foreground(color);
-
-                scene.add_frame(Frame::new(
-                    CharacterVisual::new(character.input_symbol, style),
-                    GRADIENT_FRAMES,
-                ));
+            for (row, line) in lines.iter().enumerate() {
+                for (column, symbol) in line.iter().enumerate() {
+                    canvas.set(
+                        Coord::new(column as i32, row as i32),
+                        symbol.to_string(),
+                        style,
+                    );
+                    drew_character = true;
+                }
             }
 
-            character.animation.activate_scene(scene);
-        }
+            // Keep even empty input ANSI-styled so every emitted frame remains
+            // a genuine color-shift frame rather than unstyled plain text.
+            if !drew_character {
+                canvas.set(Coord::new(0, 0), " ", style);
+            }
 
-        let mut frames = Vec::new();
-
-        while terminal.characters().iter().any(|character| {
-            character
-                .animation
-                .active_scene()
-                .map_or(false, Scene::is_active)
-        }) {
-            terminal.step();
-            frames.push(terminal.render_frame());
+            let rendered = canvas.render();
+            for _ in 0..self.frames_per_color.max(1) {
+                frames.push(rendered.clone());
+            }
         }
 
         frames
     }
-}
-
-fn build_spectrum() -> Vec<Color> {
-    const STOPS: [Color; 7] = [
-        Color::rgb(0xe8, 0x14, 0x16),
-        Color::rgb(0xff, 0xa5, 0x00),
-        Color::rgb(0xfa, 0xeb, 0x36),
-        Color::rgb(0x79, 0xc3, 0x14),
-        Color::rgb(0x48, 0x7d, 0xe7),
-        Color::rgb(0x4b, 0x36, 0x9d),
-        Color::rgb(0x70, 0x36, 0x9d),
-    ];
-
-    let mut spectrum = Vec::with_capacity(STOPS.len() * GRADIENT_STEPS);
-
-    for index in 0..STOPS.len() {
-        let start = STOPS[index];
-        let end = STOPS[(index + 1) % STOPS.len()];
-
-        for step in 0..GRADIENT_STEPS {
-            let progress = step as f64 / GRADIENT_STEPS as f64;
-            spectrum.push(interpolate_color(start, end, progress));
-        }
-    }
-
-    spectrum
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return start;
-    };
-
-    Color::rgb(
-        interpolate_channel(start_r, end_r, progress),
-        interpolate_channel(start_g, end_g, progress),
-        interpolate_channel(start_b, end_b, progress),
-    )
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

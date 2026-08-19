@@ -1,33 +1,15 @@
+
 use super::Effect;
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::{Color, Gradient, Style};
 
-use crate::engine::Terminal;
-use crate::utils::graphics::{Color, Style};
-
-const SPOTLIGHT_COLOR: Rgb = Rgb::new(255, 255, 255);
-const DARK_COLOR: Rgb = Rgb::new(8, 8, 12);
-const SPOTLIGHT_WIDTH: f64 = 10.0;
-const SEARCH_FRAMES: usize = 100;
-const CONVERGE_FRAMES: usize = 30;
-const EXPAND_FRAMES: usize = 35;
-const SPOTLIGHT_COUNT: usize = 3;
-
-const FINAL_GRADIENT: [Rgb; 3] = [
-    Rgb::new(171, 72, 255),
-    Rgb::new(231, 178, 178),
-    Rgb::new(255, 254, 189),
-];
-
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Spotlights;
 
 impl Spotlights {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for Spotlights {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -37,337 +19,245 @@ impl Effect for Spotlights {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        const SEARCH_FRAMES: usize = 54;
+        const CONVERGE_FRAMES: usize = 20;
 
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
-        }
-
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let center_x = (width.saturating_sub(1)) as f64 / 2.0;
-        let center_y = (height.saturating_sub(1)) as f64 / 2.0;
-
-        let mut rng = SmallRng::new(seed_from_input(input));
-        let mut spotlights = Vec::with_capacity(SPOTLIGHT_COUNT);
-
-        for index in 0..SPOTLIGHT_COUNT {
-            let x = if SPOTLIGHT_COUNT == 1 {
-                center_x
-            } else {
-                index as f64 * width.saturating_sub(1) as f64
-                    / (SPOTLIGHT_COUNT - 1) as f64
-            };
-            let y = if index % 2 == 0 {
-                0.0
-            } else {
-                height.saturating_sub(1) as f64
-            };
-
-            let target_x = random_axis(&mut rng, width);
-            let target_y = random_axis(&mut rng, height);
-            let duration = travel_duration(x, y, target_x, target_y);
-
-            spotlights.push(Spotlight {
-                x,
-                y,
-                start_x: x,
-                start_y: y,
-                target_x,
-                target_y,
-                elapsed: 0,
-                duration,
-            });
-        }
-
-        set_all_color(&mut terminal, DARK_COLOR);
-
-        let mut frames =
-            Vec::with_capacity(1 + SEARCH_FRAMES + CONVERGE_FRAMES + EXPAND_FRAMES + 1);
-        frames.push(terminal.render_frame());
-
-        for _ in 0..SEARCH_FRAMES {
-            for spotlight in &mut spotlights {
-                spotlight.advance(&mut rng, width, height);
-            }
-
-            apply_search_lighting(&mut terminal, &spotlights);
-            frames.push(terminal.render_frame());
-        }
-
-        let convergence_origins: Vec<(f64, f64)> = spotlights
+        let lines = parse_input(input);
+        let width = lines
             .iter()
-            .map(|spotlight| (spotlight.x, spotlight.y))
-            .collect();
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
 
-        for step in 1..=CONVERGE_FRAMES {
-            let raw_progress = step as f64 / CONVERGE_FRAMES as f64;
-            let progress = ease_in_out_sine(raw_progress);
+        let final_colors = Gradient::new(
+            [
+                Color::new(0xab, 0x48, 0xff),
+                Color::new(0xe7, 0xb2, 0xb2),
+                Color::new(0xff, 0xfe, 0xbd),
+            ],
+            height,
+        )
+        .colors();
 
-            for (spotlight, (origin_x, origin_y)) in
-                spotlights.iter_mut().zip(convergence_origins.iter())
-            {
-                spotlight.x = lerp(*origin_x, center_x, progress);
-                spotlight.y = lerp(*origin_y, center_y, progress);
-            }
+        let dark = Color::new(12, 8, 24);
+        let spotlight = Color::new(255, 255, 238);
+        let radius = ((width as f64).max(height as f64 * 2.0) * 0.24)
+            .max(2.5);
 
-            apply_search_lighting(&mut terminal, &spotlights);
-            frames.push(terminal.render_frame());
-        }
+        let routes: [&[(f64, f64)]; 3] = [
+            &[
+                (-0.20, -0.10),
+                (0.20, 0.24),
+                (0.78, 0.18),
+                (0.36, 0.76),
+                (0.86, 0.72),
+                (0.22, 0.46),
+            ],
+            &[
+                (1.20, -0.12),
+                (0.72, 0.34),
+                (0.24, 0.16),
+                (0.66, 0.82),
+                (0.14, 0.70),
+                (0.76, 0.42),
+            ],
+            &[
+                (0.48, 1.20),
+                (0.46, 0.62),
+                (0.88, 0.46),
+                (0.18, 0.36),
+                (0.52, 0.12),
+                (0.52, 0.78),
+            ],
+        ];
 
-        let maximum_radius = {
-            let horizontal = width as f64;
-            let vertical = height as f64 * 2.0;
-            horizontal.hypot(vertical) + SPOTLIGHT_WIDTH
-        };
+        let mut frames = Vec::with_capacity(SEARCH_FRAMES + CONVERGE_FRAMES);
 
-        for step in 1..=EXPAND_FRAMES {
-            let raw_progress = step as f64 / EXPAND_FRAMES as f64;
-            let progress = ease_out_quad(raw_progress);
-            let radius = SPOTLIGHT_WIDTH * 0.5 + maximum_radius * progress;
+        for frame_index in 0..SEARCH_FRAMES {
+            let progress = if SEARCH_FRAMES <= 1 {
+                1.0
+            } else {
+                frame_index as f64 / (SEARCH_FRAMES - 1) as f64
+            };
 
-            apply_expanding_light(
-                &mut terminal,
-                center_x,
-                center_y,
-                radius,
-                SPOTLIGHT_WIDTH * 0.75,
+            let positions = [
+                route_position(routes[0], progress, width, height),
+                route_position(routes[1], progress, width, height),
+                route_position(routes[2], progress, width, height),
+            ];
+
+            frames.push(render_frame(
+                &lines,
                 width,
                 height,
-            );
-            frames.push(terminal.render_frame());
+                &final_colors,
+                dark,
+                spotlight,
+                &positions,
+                radius,
+                0.0,
+            ));
         }
 
-        apply_final_gradient(&mut terminal, width, height);
-        frames.push(terminal.render_frame());
+        let route_ends = [
+            route_position(routes[0], 1.0, width, height),
+            route_position(routes[1], 1.0, width, height),
+            route_position(routes[2], 1.0, width, height),
+        ];
+        let center = (
+            (width.saturating_sub(1)) as f64 / 2.0,
+            (height.saturating_sub(1)) as f64 / 2.0,
+        );
+
+        for frame_index in 1..=CONVERGE_FRAMES {
+            let linear_progress = frame_index as f64 / CONVERGE_FRAMES as f64;
+            let progress = easing::in_out_quad(linear_progress);
+
+            let positions = route_ends.map(|start| {
+                (
+                    start.0 + (center.0 - start.0) * progress,
+                    start.1 + (center.1 - start.1) * progress,
+                )
+            });
+
+            frames.push(render_frame(
+                &lines,
+                width,
+                height,
+                &final_colors,
+                dark,
+                spotlight,
+                &positions,
+                radius * (1.0 + progress * 0.35),
+                easing::in_out_sine(linear_progress),
+            ));
+        }
+
         frames
     }
 }
 
-#[derive(Clone, Copy)]
-struct Rgb {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl Rgb {
-    const fn new(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
-    }
-
-    fn mix(self, other: Self, progress: f64) -> Self {
-        let progress = progress.clamp(0.0, 1.0);
-
-        Self {
-            r: mix_channel(self.r, other.r, progress),
-            g: mix_channel(self.g, other.g, progress),
-            b: mix_channel(self.b, other.b, progress),
-        }
-    }
-
-    fn color(self) -> Color {
-        Color::rgb(self.r, self.g, self.b)
-    }
-}
-
-struct Spotlight {
-    x: f64,
-    y: f64,
-    start_x: f64,
-    start_y: f64,
-    target_x: f64,
-    target_y: f64,
-    elapsed: usize,
-    duration: usize,
-}
-
-impl Spotlight {
-    fn advance(&mut self, rng: &mut SmallRng, width: usize, height: usize) {
-        if self.elapsed >= self.duration {
-            self.start_x = self.x;
-            self.start_y = self.y;
-            self.target_x = random_axis(rng, width);
-            self.target_y = random_axis(rng, height);
-            self.elapsed = 0;
-            self.duration = travel_duration(
-                self.start_x,
-                self.start_y,
-                self.target_x,
-                self.target_y,
-            );
-        }
-
-        self.elapsed += 1;
-        let raw_progress = self.elapsed as f64 / self.duration.max(1) as f64;
-        let progress = ease_in_out_sine(raw_progress);
-
-        self.x = lerp(self.start_x, self.target_x, progress);
-        self.y = lerp(self.start_y, self.target_y, progress);
-    }
-}
-
-fn apply_search_lighting(terminal: &mut Terminal, spotlights: &[Spotlight]) {
-    for character in terminal.characters_mut() {
-        let x = character.position.x as f64;
-        let y = character.position.y as f64;
-        let mut intensity: f64 = 0.0;
-
-        for spotlight in spotlights {
-            let dx = x - spotlight.x;
-            let dy = (y - spotlight.y) * 2.0;
-            let distance = dx.hypot(dy);
-            let light = (1.0 - distance / SPOTLIGHT_WIDTH).clamp(0.0, 1.0);
-            intensity = intensity.max(light * light);
-        }
-
-        let color = DARK_COLOR.mix(SPOTLIGHT_COLOR, intensity);
-        character.set_appearance(character.input_symbol, foreground_style(color));
-    }
-}
-
-fn apply_expanding_light(
-    terminal: &mut Terminal,
-    center_x: f64,
-    center_y: f64,
-    radius: f64,
-    feather: f64,
+#[allow(clippy::too_many_arguments)]
+fn render_frame(
+    lines: &[Vec<char>],
     width: usize,
     height: usize,
-) {
-    for character in terminal.characters_mut() {
-        let dx = character.position.x as f64 - center_x;
-        let dy = (character.position.y as f64 - center_y) * 2.0;
-        let distance = dx.hypot(dy);
-        let intensity = ((radius - distance) / feather.max(1.0)).clamp(0.0, 1.0);
-        let final_color = gradient_color(character.position.x, character.position.y, width, height);
-        let color = DARK_COLOR.mix(final_color, ease_out_quad(intensity));
+    final_colors: &[Color],
+    dark: Color,
+    spotlight: Color,
+    positions: &[(f64, f64); 3],
+    radius: f64,
+    reveal: f64,
+) -> String {
+    let mut canvas = Canvas::new(width, height);
+    canvas.fill(
+        " ",
+        Style {
+            foreground: Some(dark),
+            ..Style::default()
+        },
+    );
 
-        character.set_appearance(character.input_symbol, foreground_style(color));
-    }
-}
+    for (row, line) in lines.iter().enumerate() {
+        let final_color = final_colors
+            .get(row)
+            .copied()
+            .unwrap_or(Color::new(255, 254, 189));
 
-fn apply_final_gradient(terminal: &mut Terminal, width: usize, height: usize) {
-    for character in terminal.characters_mut() {
-        let color = gradient_color(character.position.x, character.position.y, width, height);
-        character.set_appearance(character.input_symbol, foreground_style(color));
-    }
-}
+        for (column, symbol) in line.iter().enumerate() {
+            let x = column as f64;
+            let y = row as f64;
 
-fn set_all_color(terminal: &mut Terminal, color: Rgb) {
-    for character in terminal.characters_mut() {
-        character.set_appearance(character.input_symbol, foreground_style(color));
-    }
-}
+            let illumination = positions.iter().fold(0.0_f64, |current, position| {
+                let dx = x - position.0;
+                let dy = (y - position.1) * 2.0;
+                let distance = dx.hypot(dy);
+                let intensity = (1.0 - distance / radius).clamp(0.0, 1.0);
+                let softened = intensity * intensity * (3.0 - 2.0 * intensity);
+                current.max(softened)
+            });
 
-fn foreground_style(color: Rgb) -> Style {
-    Style::default().with_foreground(color.color())
-}
+            let shadow_color = dark.lerp(final_color, 0.16);
+            let illuminated_color =
+                shadow_color.lerp(spotlight, illumination * 0.94);
+            let color = illuminated_color.lerp(final_color, reveal);
 
-fn gradient_color(x: i32, y: i32, width: usize, height: usize) -> Rgb {
-    let center_x = width.saturating_sub(1) as f64 / 2.0;
-    let center_y = height.saturating_sub(1) as f64 / 2.0;
-    let dx = x as f64 - center_x;
-    let dy = (y as f64 - center_y) * 2.0;
-
-    let corner_x = center_x.max(1.0);
-    let corner_y = (center_y * 2.0).max(1.0);
-    let maximum_distance = corner_x.hypot(corner_y).max(1.0);
-    let progress = (dx.hypot(dy) / maximum_distance).clamp(0.0, 1.0);
-
-    sample_gradient(&FINAL_GRADIENT, progress)
-}
-
-fn sample_gradient(stops: &[Rgb], progress: f64) -> Rgb {
-    if stops.is_empty() {
-        return SPOTLIGHT_COLOR;
-    }
-
-    if stops.len() == 1 {
-        return stops[0];
-    }
-
-    let scaled = progress.clamp(0.0, 1.0) * (stops.len() - 1) as f64;
-    let index = (scaled.floor() as usize).min(stops.len() - 2);
-    let local_progress = scaled - index as f64;
-
-    stops[index].mix(stops[index + 1], local_progress)
-}
-
-fn mix_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress;
-    value.round().clamp(0.0, 255.0) as u8
-}
-
-fn travel_duration(start_x: f64, start_y: f64, end_x: f64, end_y: f64) -> usize {
-    let dx = end_x - start_x;
-    let dy = (end_y - start_y) * 2.0;
-    (dx.hypot(dy) / 0.45).ceil().max(8.0) as usize
-}
-
-fn random_axis(rng: &mut SmallRng, length: usize) -> f64 {
-    if length <= 1 {
-        0.0
-    } else {
-        rng.next_f64() * length.saturating_sub(1) as f64
-    }
-}
-
-fn lerp(start: f64, end: f64, progress: f64) -> f64 {
-    start + (end - start) * progress.clamp(0.0, 1.0)
-}
-
-fn ease_in_out_sine(progress: f64) -> f64 {
-    let progress = progress.clamp(0.0, 1.0);
-    -((std::f64::consts::PI * progress).cos() - 1.0) / 2.0
-}
-
-fn ease_out_quad(progress: f64) -> f64 {
-    let progress = progress.clamp(0.0, 1.0);
-    1.0 - (1.0 - progress) * (1.0 - progress)
-}
-
-fn seed_from_input(input: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    if hash == 0 {
-        0x9e37_79b9_7f4a_7c15
-    } else {
-        hash
-    }
-}
-
-struct SmallRng {
-    state: u64,
-}
-
-impl SmallRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9e37_79b9_7f4a_7c15
-            } else {
-                seed
-            },
+            canvas.set(
+                crate::utils::Coord::new(column as i32, row as i32),
+                symbol.to_string(),
+                Style {
+                    foreground: Some(color),
+                    bold: illumination > 0.82 && reveal < 0.9,
+                    ..Style::default()
+                },
+            );
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        value
+    canvas.render()
+}
+
+fn route_position(
+    route: &[(f64, f64)],
+    progress: f64,
+    width: usize,
+    height: usize,
+) -> (f64, f64) {
+    if route.len() == 1 {
+        return scale_position(route[0], width, height);
     }
 
-    fn next_f64(&mut self) -> f64 {
-        const SCALE: f64 = 1.0 / ((1_u64 << 53) as f64);
-        ((self.next_u64() >> 11) as f64) * SCALE
+    let scaled = progress.clamp(0.0, 1.0) * (route.len() - 1) as f64;
+    let segment = (scaled.floor() as usize).min(route.len() - 2);
+    let local_progress = easing::in_out_sine(scaled - segment as f64);
+    let start = route[segment];
+    let end = route[segment + 1];
+
+    scale_position(
+        (
+            start.0 + (end.0 - start.0) * local_progress,
+            start.1 + (end.1 - start.1) * local_progress,
+        ),
+        width,
+        height,
+    )
+}
+
+fn scale_position(
+    position: (f64, f64),
+    width: usize,
+    height: usize,
+) -> (f64, f64) {
+    (
+        position.0 * width as f64 - 0.5,
+        position.1 * height as f64 - 0.5,
+    )
+}
+
+fn parse_input(input: &str) -> Vec<Vec<char>> {
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim_end_matches('\n');
+
+    if normalized.is_empty() {
+        return vec![Vec::new()];
     }
+
+    normalized
+        .split('\n')
+        .map(|line| {
+            let mut characters = Vec::new();
+
+            for character in line.chars() {
+                if character == '\t' {
+                    characters.extend([' ', ' ', ' ', ' ']);
+                } else {
+                    characters.push(character);
+                }
+            }
+
+            characters
+        })
+        .collect()
 }

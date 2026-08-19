@@ -1,7 +1,14 @@
 
 use super::Effect;
-use crate::engine::{CharacterVisual, Frame, Path, Scene, Terminal, Waypoint};
-use crate::utils::{Color, Coord, Style};
+use crate::engine::{
+    Canvas, CharacterId, CharacterVisual, EffectCharacter, Frame, Path, Scene,
+    Waypoint,
+};
+use crate::utils::{Color, Coord, Gradient, Style};
+
+const SMOKE_DELAY: usize = 5;
+const SMOKE_SCENE: &str = "smoke";
+const FINAL_SCENE: &str = "final";
 
 pub struct Smoke;
 
@@ -23,267 +30,284 @@ impl Effect for Smoke {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let lines = input
+            .lines()
+            .map(|line| line.trim_end_matches('\r').to_owned())
+            .collect::<Vec<_>>();
 
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
-        }
-
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let targets: Vec<Coord> = terminal
-            .characters()
+        let width = lines
             .iter()
-            .map(|character| character.position)
-            .collect();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
 
-        let final_styles: Vec<Style> = targets
-            .iter()
-            .map(|target| final_style(*target, width, height))
-            .collect();
+        let mut canvas = Canvas::new(width, height);
+        let mut rng = SmokeRng::new(seed_from_input(input));
 
-        let mut rng = SmokeRng::new(hash_input(input));
-        let mut pending: Vec<usize> = (0..terminal.characters().len()).collect();
-        shuffle(&mut pending, &mut rng);
+        let smoke_colors = Gradient::new(
+            [
+                Color::new(58, 58, 58),
+                Color::new(98, 98, 98),
+                Color::new(154, 154, 154),
+                Color::new(210, 210, 210),
+            ],
+            12,
+        )
+        .colors();
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
-        }
+        let final_colors = Gradient::new(
+            [
+                Color::new(138, 0, 138),
+                Color::new(0, 209, 255),
+                Color::new(255, 255, 255),
+            ],
+            height,
+        )
+        .colors();
 
-        let launch_count = (width / 12).max(1);
-        let mut next_pending = 0;
-        let mut launch_delay = 0usize;
-        let mut frames = Vec::new();
-        let mut steps = 0usize;
-        let maximum_steps = pending
-            .len()
-            .saturating_mul(4)
-            .saturating_add(height.saturating_mul(4))
-            .saturating_add(256);
+        let mut characters = Vec::new();
+        let mut next_id = 0_u32;
 
-        while next_pending < pending.len() || has_active_characters(&terminal) {
-            if launch_delay == 0 && next_pending < pending.len() {
-                let remaining = pending.len() - next_pending;
-                let burst = launch_count.min(remaining);
-
-                for _ in 0..burst {
-                    let index = pending[next_pending];
-                    next_pending += 1;
-
-                    let target = targets[index];
-                    let final_style = final_styles[index].clone();
-                    let symbol = terminal.characters()[index].input_symbol;
-
-                    let horizontal_drift = rng.range_i32(-2, 3);
-                    let vertical_offset = rng.range_i32(2, 6);
-                    let start = Coord::new(
-                        target.x + horizontal_drift,
-                        height as i32 - 1 + vertical_offset,
-                    );
-
-                    let distance = start.distance(target);
-                    let speed = 0.55 + rng.next_f64() * 0.30;
-                    let travel_steps = ((distance / speed).ceil() as usize).max(8);
-
-                    let mut path = Path::new(speed);
-                    path.add_waypoint(Waypoint::new(start));
-                    path.add_waypoint(Waypoint::new(target));
-
-                    let scene = smoke_scene(
-                        symbol,
-                        final_style.clone(),
-                        travel_steps,
-                        rng.range_usize(0, SMOKE_SYMBOLS.len()),
-                    );
-
-                    let character = &mut terminal.characters_mut()[index];
-                    character.visible = true;
-                    character.set_position(start);
-                    character.set_appearance(
-                        SMOKE_SYMBOLS[0],
-                        Style::default().with_foreground(SMOKE_COLORS[0]),
-                    );
-                    character.motion.activate_path(path);
-                    character.animation.activate_scene(scene);
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                if symbol.is_whitespace() {
+                    continue;
                 }
 
-                launch_delay = 1 + rng.range_usize(0, 3);
+                let target = Coord::new(column as i32, row as i32);
+                let horizontal_drift = rng.range_i32(-2, 2);
+                let starting_column =
+                    (target.column + horizontal_drift).clamp(0, width as i32 - 1);
+                let starting_position =
+                    Coord::new(starting_column, height as i32 - 1);
+
+                let smoke_offset = rng.range_usize(0, smoke_colors.len() - 1);
+                let speed = 0.35 + rng.range_usize(0, 25) as f64 / 100.0;
+                let final_color = final_colors
+                    .get(row)
+                    .copied()
+                    .unwrap_or(Color::new(255, 255, 255));
+
+                let mut character = EffectCharacter::new(
+                    CharacterId(next_id),
+                    symbol.to_string(),
+                    starting_position,
+                );
+                next_id += 1;
+                character.visible = false;
+
+                let mut smoke_scene = Scene::new(SMOKE_SCENE, true);
+                let smoke_symbols = ["▂", "▃", "▄", "▅", "▆", "▇", "█", "▓", "▒", "░"];
+
+                for index in 0..smoke_symbols.len() {
+                    let color =
+                        smoke_colors[(index + smoke_offset) % smoke_colors.len()];
+                    smoke_scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            smoke_symbols[index],
+                            foreground_style(color),
+                        ),
+                        2,
+                    ));
+                }
+
+                let transition_start =
+                    smoke_colors[(smoke_offset + smoke_colors.len() - 1)
+                        % smoke_colors.len()];
+                let transition_colors =
+                    Gradient::new([transition_start, final_color], 7).colors();
+
+                let mut final_scene = Scene::new(FINAL_SCENE, false);
+                let transition_symbols = ["▓", "▒", "░"];
+
+                for (index, transition_symbol) in
+                    transition_symbols.iter().enumerate()
+                {
+                    let color = transition_colors
+                        .get(index)
+                        .copied()
+                        .unwrap_or(transition_start);
+                    final_scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            *transition_symbol,
+                            foreground_style(color),
+                        ),
+                        2,
+                    ));
+                }
+
+                for color in transition_colors
+                    .iter()
+                    .copied()
+                    .skip(transition_symbols.len())
+                {
+                    final_scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            symbol.to_string(),
+                            foreground_style(color),
+                        ),
+                        2,
+                    ));
+                }
+
+                final_scene.add_frame(Frame::new(
+                    CharacterVisual::new(
+                        symbol.to_string(),
+                        foreground_style(final_color),
+                    ),
+                    1,
+                ));
+
+                character.animation.add_scene(smoke_scene);
+                character.animation.add_scene(final_scene);
+
+                let mut path = Path::new(SMOKE_SCENE, speed);
+                path.add_waypoint(Waypoint::new("input", target));
+                character.motion.add_path(path);
+
+                characters.push(SmokeCharacter {
+                    character,
+                    phase: SmokePhase::Pending,
+                });
+            }
+        }
+
+        if characters.is_empty() {
+            canvas.fill(
+                " ",
+                foreground_style(Color::new(154, 154, 154)),
+            );
+            return vec![canvas.render()];
+        }
+
+        let mut launch_order = (0..characters.len()).collect::<Vec<_>>();
+        rng.shuffle(&mut launch_order);
+
+        let mut launch_index = 0;
+        let mut delay_counter = SMOKE_DELAY;
+        let mut frames = Vec::new();
+
+        loop {
+            if launch_index < launch_order.len()
+                && delay_counter >= SMOKE_DELAY
+            {
+                let index = launch_order[launch_index];
+                launch_index += 1;
+                delay_counter = 0;
+
+                let smoke_character = &mut characters[index];
+                smoke_character.character.visible = true;
+                smoke_character.character.motion.activate(
+                    SMOKE_SCENE,
+                    smoke_character.character.position,
+                );
+                smoke_character.character.animation.activate(SMOKE_SCENE);
+
+                if let Some(visual) = smoke_character
+                    .character
+                    .animation
+                    .current_visual()
+                    .cloned()
+                {
+                    smoke_character.character.set_appearance(visual);
+                }
+
+                smoke_character.phase = SmokePhase::Rising;
             } else {
-                launch_delay = launch_delay.saturating_sub(1);
+                delay_counter += 1;
             }
 
-            terminal.step();
-            frames.push(terminal.render_frame());
-            steps += 1;
+            for smoke_character in &mut characters {
+                match smoke_character.phase {
+                    SmokePhase::Pending | SmokePhase::Settled => {}
+                    SmokePhase::Rising => {
+                        smoke_character.character.step();
 
-            if steps >= maximum_steps {
+                        if !smoke_character.character.motion.is_active() {
+                            smoke_character
+                                .character
+                                .animation
+                                .activate(FINAL_SCENE);
+
+                            if let Some(visual) = smoke_character
+                                .character
+                                .animation
+                                .current_visual()
+                                .cloned()
+                            {
+                                smoke_character
+                                    .character
+                                    .set_appearance(visual);
+                            }
+
+                            smoke_character.phase = SmokePhase::Coalescing;
+                        }
+                    }
+                    SmokePhase::Coalescing => {
+                        smoke_character.character.step();
+
+                        if !smoke_character.character.animation.is_active() {
+                            smoke_character.phase = SmokePhase::Settled;
+                        }
+                    }
+                }
+            }
+
+            canvas.clear();
+            for smoke_character in &characters {
+                if smoke_character.phase != SmokePhase::Pending {
+                    canvas.draw_character(&smoke_character.character);
+                }
+            }
+            frames.push(canvas.render());
+
+            if launch_index >= launch_order.len()
+                && characters
+                    .iter()
+                    .all(|character| character.phase == SmokePhase::Settled)
+            {
                 break;
             }
-        }
-
-        for (index, character) in terminal.characters_mut().iter_mut().enumerate() {
-            character.visible = true;
-            character.motion.deactivate();
-            character.animation.deactivate();
-            character.set_position(targets[index]);
-            character.set_appearance(character.input_symbol, final_styles[index].clone());
-        }
-
-        let final_frame = terminal.render_frame();
-        if frames.last() != Some(&final_frame) {
-            frames.push(final_frame);
-        }
-
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
         }
 
         frames
     }
 }
 
-const SMOKE_SYMBOLS: [char; 8] = ['░', '▒', '▓', '█', '▓', '▒', '░', '·'];
-
-const SMOKE_COLORS: [Color; 5] = [
-    Color::rgb(72, 72, 72),
-    Color::rgb(104, 104, 104),
-    Color::rgb(144, 144, 144),
-    Color::rgb(184, 184, 184),
-    Color::rgb(220, 220, 220),
-];
-
-fn smoke_scene(
-    final_symbol: char,
-    final_style: Style,
-    travel_steps: usize,
-    symbol_offset: usize,
-) -> Scene {
-    let mut frames = Vec::with_capacity(travel_steps + 1);
-
-    for step in 0..travel_steps {
-        let progress = if travel_steps <= 1 {
-            1.0
-        } else {
-            step as f64 / (travel_steps - 1) as f64
-        };
-
-        let symbol_index = (symbol_offset + step) % SMOKE_SYMBOLS.len();
-        let color_position = progress * (SMOKE_COLORS.len() - 1) as f64;
-        let color_index = color_position.floor() as usize;
-        let next_color_index = (color_index + 1).min(SMOKE_COLORS.len() - 1);
-        let color_progress = color_position - color_index as f64;
-        let color = mix_color(
-            SMOKE_COLORS[color_index],
-            SMOKE_COLORS[next_color_index],
-            color_progress,
-        );
-
-        frames.push(Frame::new(
-            CharacterVisual::new(
-                SMOKE_SYMBOLS[symbol_index],
-                Style::default().with_foreground(color),
-            ),
-            1,
-        ));
-    }
-
-    frames.push(Frame::new(
-        CharacterVisual::new(final_symbol, final_style),
-        1,
-    ));
-
-    Scene::with_frames(frames, false)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmokePhase {
+    Pending,
+    Rising,
+    Coalescing,
+    Settled,
 }
 
-fn has_active_characters(terminal: &Terminal) -> bool {
-    terminal.characters().iter().any(|character| {
-        character
-            .motion
-            .active_path()
-            .is_some_and(|path| path.is_active())
-            || character
-                .animation
-                .active_scene()
-                .is_some_and(|scene| scene.is_active())
-    })
+struct SmokeCharacter {
+    character: EffectCharacter,
+    phase: SmokePhase,
 }
 
-fn final_style(coord: Coord, width: usize, height: usize) -> Style {
-    let progress = if height > 1 {
-        coord.y.max(0) as f64 / (height - 1) as f64
-    } else if width > 1 {
-        coord.x.max(0) as f64 / (width - 1) as f64
-    } else {
-        1.0
-    }
-    .clamp(0.0, 1.0);
-
-    let color = if progress < 0.5 {
-        mix_rgb((138, 0, 138), (0, 209, 255), progress * 2.0)
-    } else {
-        mix_rgb((0, 209, 255), (255, 255, 255), (progress - 0.5) * 2.0)
-    };
-
-    Style::default().with_foreground(color)
-}
-
-fn mix_color(start: Color, end: Color, progress: f64) -> Color {
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
-            },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => mix_rgb(
-            (start_r, start_g, start_b),
-            (end_r, end_g, end_b),
-            progress,
-        ),
-        _ if progress < 0.5 => start,
-        _ => end,
+fn foreground_style(color: Color) -> Style {
+    Style {
+        foreground: Some(color),
+        ..Style::default()
     }
 }
 
-fn mix_rgb(start: (u8, u8, u8), end: (u8, u8, u8), progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-    let interpolate = |from: u8, to: u8| {
-        (from as f64 + (to as f64 - from as f64) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        interpolate(start.0, end.0),
-        interpolate(start.1, end.1),
-        interpolate(start.2, end.2),
-    )
-}
-
-fn hash_input(input: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
+fn seed_from_input(input: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
 
     for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 
     if hash == 0 {
-        0x9e3779b97f4a7c15
+        0x9e37_79b9_7f4a_7c15
     } else {
         hash
-    }
-}
-
-fn shuffle(values: &mut [usize], rng: &mut SmokeRng) {
-    for index in (1..values.len()).rev() {
-        let swap_index = rng.range_usize(0, index + 1);
-        values.swap(index, swap_index);
     }
 }
 
@@ -293,36 +317,38 @@ struct SmokeRng {
 
 impl SmokeRng {
     fn new(seed: u64) -> Self {
-        Self {
-            state: seed.max(1),
-        }
+        Self { state: seed }
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.state
     }
 
-    fn next_f64(&mut self) -> f64 {
-        let value = self.next_u64() >> 11;
-        value as f64 / ((1_u64 << 53) - 1) as f64
-    }
-
-    fn range_usize(&mut self, start: usize, end: usize) -> usize {
-        if end <= start {
-            return start;
+    fn range_usize(&mut self, minimum: usize, maximum: usize) -> usize {
+        if minimum >= maximum {
+            return minimum;
         }
 
-        start + (self.next_u64() as usize % (end - start))
+        minimum + self.next_u64() as usize % (maximum - minimum + 1)
     }
 
-    fn range_i32(&mut self, start: i32, end: i32) -> i32 {
-        if end <= start {
-            return start;
+    fn range_i32(&mut self, minimum: i32, maximum: i32) -> i32 {
+        if minimum >= maximum {
+            return minimum;
         }
 
-        start + (self.next_u64() % (end - start) as u64) as i32
+        minimum
+            + (self.next_u64() % (maximum - minimum + 1) as u64) as i32
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            let replacement = self.range_usize(0, index);
+            values.swap(index, replacement);
+        }
     }
 }

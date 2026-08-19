@@ -2,40 +2,37 @@ use crate::engine::character::EffectCharacter;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::Style;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    pub symbol: char,
+    pub symbol: String,
     pub style: Style,
 }
 
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            symbol: ' ',
+            symbol: " ".to_owned(),
             style: Style::default(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Canvas {
     width: usize,
     height: usize,
     cells: Vec<Cell>,
-    blank: Cell,
 }
 
 impl Canvas {
     pub fn new(width: usize, height: usize) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        let blank = Cell::default();
 
         Self {
             width,
             height,
-            cells: vec![blank.clone(); width * height],
-            blank,
+            cells: vec![Cell::default(); width * height],
         }
     }
 
@@ -48,10 +45,22 @@ impl Canvas {
     }
 
     pub fn contains(&self, coord: Coord) -> bool {
-        coord.x >= 0
-            && coord.y >= 0
-            && (coord.x as usize) < self.width
-            && (coord.y as usize) < self.height
+        coord.column >= 0
+            && coord.row >= 0
+            && (coord.column as usize) < self.width
+            && (coord.row as usize) < self.height
+    }
+
+    pub fn clear(&mut self) {
+        self.cells.fill(Cell::default());
+    }
+
+    pub fn fill(&mut self, symbol: impl Into<String>, style: Style) {
+        let symbol = symbol.into();
+        for cell in &mut self.cells {
+            cell.symbol.clone_from(&symbol);
+            cell.style = style;
+        }
     }
 
     pub fn get(&self, coord: Coord) -> Option<&Cell> {
@@ -59,35 +68,24 @@ impl Canvas {
     }
 
     pub fn get_mut(&mut self, coord: Coord) -> Option<&mut Cell> {
-        let index = self.index(coord)?;
-        Some(&mut self.cells[index])
+        self.index(coord).map(|index| &mut self.cells[index])
     }
 
-    pub fn set(&mut self, coord: Coord, cell: Cell) -> bool {
+    pub fn set(
+        &mut self,
+        coord: Coord,
+        symbol: impl Into<String>,
+        style: Style,
+    ) -> bool {
         let Some(index) = self.index(coord) else {
             return false;
         };
 
-        self.cells[index] = cell;
-        true
-    }
-
-    pub fn set_symbol(&mut self, coord: Coord, symbol: char) -> bool {
-        let Some(cell) = self.get_mut(coord) else {
-            return false;
+        self.cells[index] = Cell {
+            symbol: symbol.into(),
+            style,
         };
-
-        cell.symbol = symbol;
         true
-    }
-
-    pub fn clear(&mut self) {
-        self.cells.fill(self.blank.clone());
-    }
-
-    pub fn clear_with(&mut self, cell: Cell) {
-        self.blank = cell;
-        self.clear();
     }
 
     pub fn draw_character(&mut self, character: &EffectCharacter) -> bool {
@@ -97,10 +95,8 @@ impl Canvas {
 
         self.set(
             character.position,
-            Cell {
-                symbol: character.symbol,
-                style: character.style.clone(),
-            },
+            character.symbol.clone(),
+            character.style,
         )
     }
 
@@ -108,30 +104,26 @@ impl Canvas {
         let mut output = String::new();
         let mut active_style = Style::default();
 
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let cell = &self.cells[y * self.width + x];
+        for row in 0..self.height {
+            for column in 0..self.width {
+                let cell = &self.cells[row * self.width + column];
 
                 if cell.style != active_style {
-                    if !active_style.is_default() {
-                        output.push_str("\x1b[0m");
-                    }
-
+                    output.push_str("\x1b[0m");
                     output.push_str(&cell.style.ansi_prefix());
-                    active_style = cell.style.clone();
+                    active_style = cell.style;
                 }
 
-                output.push(cell.symbol);
+                output.push_str(&cell.symbol);
             }
 
-            if !active_style.is_default() {
-                output.push_str("\x1b[0m");
-                active_style = Style::default();
-            }
-
-            if y + 1 < self.height {
+            if row + 1 < self.height {
                 output.push('\n');
             }
+        }
+
+        if active_style != Style::default() {
+            output.push_str("\x1b[0m");
         }
 
         output
@@ -142,6 +134,30 @@ impl Canvas {
             return None;
         }
 
-        Some(coord.y as usize * self.width + coord.x as usize)
+        Some(coord.row as usize * self.width + coord.column as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::graphics::Color;
+
+    #[test]
+    fn sets_and_renders_cells() {
+        let mut canvas = Canvas::new(2, 1);
+        canvas.set(
+            Coord::new(0, 0),
+            "A",
+            Style {
+                foreground: Some(Color::new(255, 0, 0)),
+                ..Style::default()
+            },
+        );
+        canvas.set(Coord::new(1, 0), "B", Style::default());
+
+        let rendered = canvas.render();
+        assert!(rendered.contains('A'));
+        assert!(rendered.contains('B'));
     }
 }

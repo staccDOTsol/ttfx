@@ -1,11 +1,12 @@
 
 use super::Effect;
-use crate::engine::animation::{CharacterVisual, Frame, Scene};
-use crate::engine::motion::{Path, Waypoint};
-use crate::engine::terminal::Terminal;
-use crate::utils::easing;
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{
+    CharacterId, CharacterVisual, EffectCharacter, Frame, Path, Scene,
+    Terminal, Waypoint,
+};
+use crate::utils::{
+    Color, ColorPair, Coord, Gradient, Style,
+};
 
 pub struct Rain;
 
@@ -27,209 +28,186 @@ impl Effect for Rain {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        const RAIN_COLORS: [Color; 4] = [
-            Color::rgb(0x00, 0x31, 0x5c),
-            Color::rgb(0x00, 0x4c, 0x8f),
-            Color::rgb(0x00, 0x75, 0xdb),
-            Color::rgb(0x3f, 0x91, 0xd9),
-        ];
-
-        let mut terminal = Terminal::from_text(input);
-        let character_count = terminal.characters().len();
-
-        if character_count == 0 {
-            return vec![terminal.render_frame()];
+        let mut lines: Vec<&str> = input.split('\n').collect();
+        if input.ends_with('\n') {
+            lines.pop();
         }
 
-        let canvas_height = terminal.canvas().height();
-        let mut rng = RainRng::new(seed_from_input(input));
+        for line in &mut lines {
+            *line = line.strip_suffix('\r').unwrap_or(line);
+        }
 
-        let targets: Vec<Coord> = terminal
-            .characters()
+        if lines.is_empty() {
+            lines.push("");
+        }
+
+        let width = lines
             .iter()
-            .map(|character| character.position)
-            .collect();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
 
-        let final_colors: Vec<Color> = targets
-            .iter()
-            .map(|coord| final_gradient_color(coord.y, canvas_height))
-            .collect();
+        let rain_colors = [
+            Color::new(0x00, 0x31, 0x5c),
+            Color::new(0x00, 0x4c, 0x6d),
+            Color::new(0x00, 0x7f, 0x7b),
+            Color::new(0x00, 0xb1, 0x79),
+            Color::new(0x81, 0xd1, 0x52),
+            Color::new(0xf9, 0xf8, 0x71),
+        ];
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
-            character.motion.deactivate();
-            character.animation.deactivate();
+        let final_colors = Gradient::new(
+            [
+                Color::new(0x8a, 0x00, 0x8a),
+                Color::new(0x00, 0xd1, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+            ],
+            height.max(12),
+        )
+        .colors();
+
+        let mut rng = RainRng::new(hash_input(input));
+        let mut terminal = Terminal::new(width, height);
+        let mut character_count = 0usize;
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                let target = Coord::new(column as i32, row as i32);
+                let distance_above = rng.range_usize(1, height.max(1)) as i32;
+                let start = Coord::new(column as i32, -distance_above);
+
+                let rain_color =
+                    rain_colors[rng.range_usize(0, rain_colors.len() - 1)];
+                let gradient_row = height.saturating_sub(row + 1);
+                let gradient_index = if height <= 1 {
+                    0
+                } else {
+                    gradient_row * (final_colors.len() - 1) / (height - 1)
+                };
+                let final_color = final_colors[gradient_index];
+
+                let mut character = EffectCharacter::new(
+                    CharacterId(character_count as u32),
+                    symbol.to_string(),
+                    start,
+                );
+                character.visible = false;
+                character.style = Style::with_colors(ColorPair::new(
+                    Some(rain_color),
+                    None,
+                ));
+
+                let speed = 0.1 + rng.next_f64() * 0.1;
+                let mut path = Path::new("fall", speed);
+                path.add_waypoint(Waypoint::new("input", target));
+                character.motion.add_path(path);
+
+                let transition =
+                    Gradient::new([rain_color, final_color], 7).colors();
+                let mut scene = Scene::new("settle", false);
+
+                for color in transition {
+                    scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            symbol.to_string(),
+                            Style::with_colors(ColorPair::new(
+                                Some(color),
+                                None,
+                            )),
+                        ),
+                        5,
+                    ));
+                }
+
+                character.animation.add_scene(scene);
+                terminal.add_character(character);
+                character_count += 1;
+            }
+        }
+
+        if character_count == 0 {
+            return Vec::new();
         }
 
         let mut pending: Vec<usize> = (0..character_count).collect();
-        shuffle(&mut pending, &mut rng);
+        rng.shuffle(&mut pending);
 
-        // 0 = pending, 1 = falling, 2 = fading, 3 = complete.
-        let mut states = vec![0_u8; character_count];
-        let mut completed = 0_usize;
+        let mut pending_index = 0usize;
+        let mut falling = vec![false; character_count];
+        let mut delay = 0usize;
+        let maximum_frames = 256usize
+            .saturating_add(character_count.saturating_mul(6))
+            .saturating_add(height.saturating_mul(24))
+            .min(100_000);
+
         let mut frames = Vec::new();
 
-        let maximum_steps = character_count
-            .saturating_mul(4)
-            .saturating_add(canvas_height.saturating_mul(20))
-            .saturating_add(64);
+        for _ in 0..maximum_frames {
+            if pending_index < pending.len() {
+                if delay == 0 {
+                    let batch_size = rng.range_usize(1, 3);
 
-        for _ in 0..maximum_steps {
-            if completed == character_count {
-                break;
-            }
+                    for _ in 0..batch_size {
+                        let Some(&character_index) =
+                            pending.get(pending_index)
+                        else {
+                            break;
+                        };
+                        pending_index += 1;
 
-            let spawn_count = rng.range_usize(1, 3);
-            for _ in 0..spawn_count {
-                let Some(index) = pending.pop() else {
-                    break;
-                };
-
-                let target = targets[index];
-                let start = Coord::new(target.x, 0);
-                let rain_color = RAIN_COLORS[rng.range_usize(0, RAIN_COLORS.len() - 1)];
-                let speed = 0.1 + rng.unit_f64() * 0.1;
-                let style = Style::default().with_foreground(rain_color);
-
-                let mut path = Path::with_waypoints(
-                    vec![Waypoint::new(start), Waypoint::new(target)],
-                    speed,
-                );
-                path.set_easing(easing::in_quad);
-
-                let character = &mut terminal.characters_mut()[index];
-                character.visible = true;
-                character.set_position(start);
-                character.set_appearance(character.input_symbol, style);
-                character.motion.activate_path(path);
-                states[index] = 1;
-            }
-
-            terminal.step();
-
-            for index in 0..character_count {
-                if states[index] == 1 {
-                    let still_falling = terminal.characters()[index]
-                        .motion
-                        .active_path()
-                        .is_some_and(Path::is_active);
-
-                    if !still_falling {
-                        let symbol = terminal.characters()[index].input_symbol;
-                        let rain_color = terminal.characters()[index]
-                            .style
-                            .colors
-                            .foreground
-                            .unwrap_or(RAIN_COLORS[0]);
-                        let final_color = final_colors[index];
-                        let scene = make_fade_scene(symbol, rain_color, final_color);
-
-                        let character = &mut terminal.characters_mut()[index];
-                        character.set_position(targets[index]);
-                        character.set_appearance(
-                            symbol,
-                            Style::default().with_foreground(rain_color),
-                        );
-                        character.animation.activate_scene(scene);
-                        states[index] = 2;
+                        let character =
+                            &mut terminal.characters_mut()[character_index];
+                        character.visible = true;
+                        character
+                            .motion
+                            .activate("fall", character.position);
+                        falling[character_index] = true;
                     }
-                } else if states[index] == 2 {
-                    let fade_finished = terminal.characters()[index]
-                        .animation
-                        .active_scene()
-                        .is_some_and(Scene::is_finished);
 
-                    if fade_finished {
-                        states[index] = 3;
-                        completed += 1;
-                    }
+                    delay = rng.range_usize(1, 3);
+                } else {
+                    delay -= 1;
                 }
             }
 
-            frames.push(terminal.render_frame());
-        }
+            let frame = terminal.step_frame();
 
-        if completed < character_count {
-            for index in 0..character_count {
-                let symbol = terminal.characters()[index].input_symbol;
-                let character = &mut terminal.characters_mut()[index];
-                character.visible = true;
-                character.set_position(targets[index]);
-                character.motion.deactivate();
-                character.animation.deactivate();
-                character.set_appearance(
-                    symbol,
-                    Style::default().with_foreground(final_colors[index]),
-                );
+            for (index, character) in
+                terminal.characters_mut().iter_mut().enumerate()
+            {
+                if falling[index] && !character.motion.is_active() {
+                    falling[index] = false;
+                    character.animation.activate("settle");
+                }
             }
-            frames.push(terminal.render_frame());
+
+            if frame.contains("\x1b[") {
+                frames.push(frame);
+            }
+
+            let pending_remains = pending_index < pending.len();
+            let falling_remains = falling.iter().any(|is_falling| *is_falling);
+            let animation_remains = terminal
+                .characters()
+                .iter()
+                .any(|character| character.animation.is_active());
+
+            if !pending_remains && !falling_remains && !animation_remains {
+                break;
+            }
         }
 
         frames
     }
 }
 
-fn make_fade_scene(symbol: char, start: Color, end: Color) -> Scene {
-    const FADE_STEPS: u32 = 8;
-
-    let mut scene = Scene::new(false);
-    for step in 0..FADE_STEPS {
-        let progress = step as f64 / (FADE_STEPS - 1) as f64;
-        let color = interpolate_color(start, end, progress);
-        let style = Style::default().with_foreground(color);
-        scene.add_frame(Frame::new(CharacterVisual::new(symbol, style), 1));
-    }
-    scene
-}
-
-fn final_gradient_color(y: i32, height: usize) -> Color {
-    const STOPS: [Color; 3] = [
-        Color::rgb(0x8a, 0x00, 0x8a),
-        Color::rgb(0x00, 0xd1, 0xff),
-        Color::rgb(0xff, 0xff, 0xff),
-    ];
-
-    let progress = if height <= 1 {
-        0.0
-    } else {
-        let y = y.clamp(0, height.saturating_sub(1) as i32) as f64;
-        1.0 - y / (height - 1) as f64
-    };
-
-    let scaled = progress.clamp(0.0, 1.0) * (STOPS.len() - 1) as f64;
-    let lower = scaled.floor() as usize;
-    let upper = (lower + 1).min(STOPS.len() - 1);
-    interpolate_color(STOPS[lower], STOPS[upper], scaled - lower as f64)
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (start_r, start_g, start_b) = color_rgb(start);
-    let (end_r, end_g, end_b) = color_rgb(end);
-    let progress = progress.clamp(0.0, 1.0);
-
-    let interpolate = |start: u8, end: u8| {
-        (start as f64 + (end as f64 - start as f64) * progress).round() as u8
-    };
-
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
-    )
-}
-
-fn color_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb { r, g, b } => (r, g, b),
-        Color::Ansi(value) => (value, value, value),
-    }
-}
-
-fn seed_from_input(input: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+fn hash_input(input: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
 
     for byte in input.bytes() {
-        hash ^= u64::from(byte);
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 
@@ -237,13 +215,6 @@ fn seed_from_input(input: &str) -> u64 {
         0x9e37_79b9_7f4a_7c15
     } else {
         hash
-    }
-}
-
-fn shuffle<T>(values: &mut [T], rng: &mut RainRng) {
-    for index in (1..values.len()).rev() {
-        let swap_index = rng.range_usize(0, index);
-        values.swap(index, swap_index);
     }
 }
 
@@ -271,16 +242,23 @@ impl RainRng {
         value
     }
 
-    fn unit_f64(&mut self) -> f64 {
-        const SCALE: f64 = 1.0 / ((1_u64 << 53) as f64);
+    fn next_f64(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / ((1u64 << 53) as f64);
         ((self.next_u64() >> 11) as f64) * SCALE
     }
 
     fn range_usize(&mut self, minimum: usize, maximum: usize) -> usize {
-        if minimum >= maximum {
+        if maximum <= minimum {
             return minimum;
         }
 
-        minimum + (self.next_u64() as usize % (maximum - minimum + 1))
+        minimum + self.next_u64() as usize % (maximum - minimum + 1)
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            let other = self.range_usize(0, index);
+            values.swap(index, other);
+        }
     }
 }

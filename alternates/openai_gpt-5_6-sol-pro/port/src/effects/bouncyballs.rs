@@ -1,79 +1,8 @@
 
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::{Color, Coord, Style};
-
-const BALL_DELAY: u32 = 7;
-const MOVEMENT_SPEED: f64 = 0.25;
-
-const BALL_COLORS: [Color; 5] = [
-    Color::rgb(0xd1, 0xf4, 0xa5),
-    Color::rgb(0x96, 0xe2, 0xa4),
-    Color::rgb(0x5a, 0xcd, 0xa9),
-    Color::rgb(0x3a, 0xb8, 0xb0),
-    Color::rgb(0x2e, 0x9d, 0xb2),
-];
-
-const FINAL_START: (u8, u8, u8) = (0xc1, 0xf8, 0x0a);
-const FINAL_END: (u8, u8, u8) = (0x00, 0xd1, 0xff);
-const FINAL_GRADIENT_STEPS: usize = 12;
-
-#[derive(Debug, Clone)]
-struct PendingBall {
-    id: CharacterId,
-    start: Coord,
-    target: Coord,
-    ball_style: Style,
-    final_style: Style,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveBall {
-    id: CharacterId,
-    target: Coord,
-    final_style: Style,
-}
-
-#[derive(Debug, Clone)]
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 {
-                0x9e37_79b9_7f4a_7c15
-            } else {
-                seed
-            },
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut value = self.state;
-        value ^= value << 13;
-        value ^= value >> 7;
-        value ^= value << 17;
-        self.state = value;
-        value
-    }
-
-    fn index(&mut self, upper_bound: usize) -> usize {
-        if upper_bound <= 1 {
-            0
-        } else {
-            (self.next_u64() % upper_bound as u64) as usize
-        }
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        for index in (1..values.len()).rev() {
-            let swap_index = self.index(index + 1);
-            values.swap(index, swap_index);
-        }
-    }
-}
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::{Color, Coord, Gradient, Style};
 
 pub struct Bouncyballs;
 
@@ -95,160 +24,201 @@ impl Effect for Bouncyballs {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-
-        let mut rng = SimpleRng::new(seed_from_input(input));
-        let character_data = terminal
-            .characters()
+        let lines: Vec<&str> = input.lines().collect();
+        let width = lines
             .iter()
-            .filter(|character| !character.input_symbol.is_whitespace())
-            .map(|character| {
-                (
-                    character.id,
-                    character.position,
-                    BALL_COLORS[rng.index(BALL_COLORS.len())],
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
 
-        let mut pending = Vec::with_capacity(character_data.len());
+        let final_colors = Gradient::new(
+            [
+                Color::new(0x31, 0xa0, 0xd4),
+                Color::new(0x5a, 0xcd, 0xa9),
+                Color::new(0x8a, 0x5b, 0xac),
+            ],
+            24,
+        )
+        .colors();
 
-        for (id, target, ball_color) in character_data {
-            let start = Coord::new(rng.index(width) as i32, 0);
-            let final_color = final_gradient_color(target, width, height);
+        let ball_colors = Gradient::new(
+            [
+                Color::new(0xd1, 0xf4, 0xa5),
+                Color::new(0x96, 0xe2, 0xa4),
+                Color::new(0x5a, 0xcd, 0xa9),
+                Color::new(0x00, 0xb8, 0xb8),
+                Color::new(0x00, 0x81, 0x8a),
+            ],
+            24,
+        )
+        .colors();
 
-            pending.push(PendingBall {
-                id,
-                start,
-                target,
-                ball_style: Style::default().with_foreground(ball_color),
-                final_style: Style::default().with_foreground(final_color),
-            });
+        let mut balls = Vec::new();
 
-            if let Some(character) = terminal.character_mut(id) {
-                character.visible = false;
-            }
-        }
-
-        rng.shuffle(&mut pending);
-
-        if pending.is_empty() {
-            return Vec::new();
-        }
-
-        let mut active = Vec::<ActiveBall>::new();
-        let mut frames = Vec::new();
-        let mut launch_delay = 0_u32;
-
-        while !pending.is_empty() || !active.is_empty() {
-            if launch_delay == 0 {
-                if let Some(ball) = pending.pop() {
-                    if let Some(character) = terminal.character_mut(ball.id) {
-                        character.visible = true;
-                        character.set_position(ball.start);
-                        character.set_appearance('●', ball.ball_style);
-
-                        let mut path = Path::with_waypoints(
-                            vec![Waypoint::new(ball.start), Waypoint::new(ball.target)],
-                            MOVEMENT_SPEED,
-                        );
-                        path.set_easing(out_bounce);
-                        character.motion.activate_path(path);
-
-                        active.push(ActiveBall {
-                            id: ball.id,
-                            target: ball.target,
-                            final_style: ball.final_style,
-                        });
-                    }
-
-                    launch_delay = BALL_DELAY;
-                }
-            } else {
-                launch_delay -= 1;
-            }
-
-            terminal.step();
-
-            let mut index = 0;
-            while index < active.len() {
-                let finished = terminal
-                    .character(active[index].id)
-                    .and_then(|character| character.motion.active_path())
-                    .map(|path| !path.is_active())
-                    .unwrap_or(true);
-
-                if finished {
-                    let ball = active.swap_remove(index);
-
-                    if let Some(character) = terminal.character_mut(ball.id) {
-                        let symbol = character.input_symbol;
-                        character.set_position(ball.target);
-                        character.set_appearance(symbol, ball.final_style);
-                    }
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                let denominator = width.saturating_sub(1) + height.saturating_sub(1);
+                let gradient_progress = if denominator == 0 {
+                    0.0
                 } else {
-                    index += 1;
-                }
+                    (column + row) as f64 / denominator as f64
+                };
+                let color_index = (gradient_progress
+                    * final_colors.len().saturating_sub(1) as f64)
+                    .round() as usize;
+
+                balls.push(Ball {
+                    symbol: symbol.to_string(),
+                    target: Coord::new(column as i32, row as i32),
+                    launch_frame: 0,
+                    duration: (12 + row * 4).max(12),
+                    ball_color: ball_colors[0],
+                    final_color: final_colors[color_index.min(final_colors.len() - 1)],
+                });
+            }
+        }
+
+        if balls.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                Style {
+                    foreground: Some(final_colors[0]),
+                    ..Style::default()
+                },
+            );
+            return vec![canvas.render()];
+        }
+
+        let mut random = DeterministicRandom::new(hash_input(input));
+        let mut order: Vec<usize> = (0..balls.len()).collect();
+
+        for index in (1..order.len()).rev() {
+            let other = random.range(index + 1);
+            order.swap(index, other);
+        }
+
+        let mut cursor = 0;
+        let mut launch_frame = 0;
+
+        while cursor < order.len() {
+            let group_size = (2 + random.range(5)).min(order.len() - cursor);
+
+            for &ball_index in &order[cursor..cursor + group_size] {
+                balls[ball_index].launch_frame = launch_frame;
+                balls[ball_index].ball_color =
+                    ball_colors[random.range(ball_colors.len())];
             }
 
-            frames.push(terminal.render_frame());
+            cursor += group_size;
+            launch_frame += 3;
+        }
+
+        let final_frame = balls
+            .iter()
+            .map(|ball| ball.launch_frame + ball.duration)
+            .max()
+            .unwrap_or(0);
+
+        let mut frames = Vec::with_capacity(final_frame + 3);
+
+        for frame_number in 0..=final_frame + 2 {
+            let mut canvas = Canvas::new(width, height);
+
+            for ball in &balls {
+                if frame_number < ball.launch_frame {
+                    continue;
+                }
+
+                let elapsed = frame_number - ball.launch_frame;
+                let settled = elapsed >= ball.duration;
+                let progress = if settled {
+                    1.0
+                } else {
+                    elapsed as f64 / ball.duration as f64
+                };
+                let bounced_progress = easing::out_bounce(progress);
+
+                let row = if settled {
+                    ball.target.row
+                } else {
+                    (ball.target.row as f64 * bounced_progress).round() as i32
+                };
+
+                let color = if settled {
+                    ball.final_color
+                } else {
+                    ball.ball_color
+                };
+
+                canvas.set(
+                    Coord::new(ball.target.column, row),
+                    ball.symbol.clone(),
+                    Style {
+                        foreground: Some(color),
+                        bold: !settled,
+                        ..Style::default()
+                    },
+                );
+            }
+
+            frames.push(canvas.render());
         }
 
         frames
     }
 }
 
-fn out_bounce(progress: f64) -> f64 {
-    let progress = progress.clamp(0.0, 1.0);
-    const N1: f64 = 7.5625;
-    const D1: f64 = 2.75;
+struct Ball {
+    symbol: String,
+    target: Coord,
+    launch_frame: usize,
+    duration: usize,
+    ball_color: Color,
+    final_color: Color,
+}
 
-    if progress < 1.0 / D1 {
-        N1 * progress * progress
-    } else if progress < 2.0 / D1 {
-        let shifted = progress - 1.5 / D1;
-        N1 * shifted * shifted + 0.75
-    } else if progress < 2.5 / D1 {
-        let shifted = progress - 2.25 / D1;
-        N1 * shifted * shifted + 0.9375
-    } else {
-        let shifted = progress - 2.625 / D1;
-        N1 * shifted * shifted + 0.984375
+struct DeterministicRandom {
+    state: u64,
+}
+
+impl DeterministicRandom {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
+    }
+
+    fn range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next() % upper as u64) as usize
+        }
     }
 }
 
-fn final_gradient_color(coord: Coord, width: usize, height: usize) -> Color {
-    let maximum = width.saturating_sub(1) + height.saturating_sub(1);
-    let diagonal = coord.x.max(0) as usize + coord.y.max(0) as usize;
-
-    let progress = if maximum == 0 {
-        0.0
-    } else {
-        diagonal.min(maximum) as f64 / maximum as f64
-    };
-
-    let intervals = FINAL_GRADIENT_STEPS.saturating_sub(1).max(1);
-    let quantized = (progress * intervals as f64).round() / intervals as f64;
-
-    Color::rgb(
-        interpolate_channel(FINAL_START.0, FINAL_END.0, quantized),
-        interpolate_channel(FINAL_START.1, FINAL_END.1, quantized),
-        interpolate_channel(FINAL_START.2, FINAL_END.2, quantized),
-    )
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = start as f64 + (end as f64 - start as f64) * progress.clamp(0.0, 1.0);
-    value.round().clamp(0.0, 255.0) as u8
-}
-
-fn seed_from_input(input: &str) -> u64 {
+fn hash_input(input: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
 
     for byte in input.bytes() {
-        hash ^= u64::from(byte);
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 

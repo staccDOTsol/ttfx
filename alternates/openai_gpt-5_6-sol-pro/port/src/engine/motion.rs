@@ -1,45 +1,38 @@
-use crate::utils::easing::{linear, EasingFn};
+use std::collections::BTreeMap;
+
 use crate::utils::geometry::Coord;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Waypoint {
+    pub id: String,
     pub coord: Coord,
 }
 
 impl Waypoint {
-    pub const fn new(coord: Coord) -> Self {
-        Self { coord }
+    pub fn new(id: impl Into<String>, coord: Coord) -> Self {
+        Self {
+            id: id.into(),
+            coord,
+        }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Path {
+    pub id: String,
+    pub speed: f64,
+    pub loop_path: bool,
     waypoints: Vec<Waypoint>,
-    speed: f64,
-    easing: EasingFn,
-    segment_index: usize,
-    segment_progress: f64,
-    active: bool,
-    looping: bool,
 }
 
 impl Path {
-    pub fn new(speed: f64) -> Self {
+    pub fn new(id: impl Into<String>, speed: f64) -> Self {
         Self {
-            waypoints: Vec::new(),
+            id: id.into(),
             speed: speed.max(0.0),
-            easing: linear,
-            segment_index: 0,
-            segment_progress: 0.0,
-            active: false,
-            looping: false,
+            loop_path: false,
+            waypoints: Vec::new(),
         }
-    }
-
-    pub fn with_waypoints(waypoints: Vec<Waypoint>, speed: f64) -> Self {
-        let mut path = Self::new(speed);
-        path.waypoints = waypoints;
-        path
     }
 
     pub fn add_waypoint(&mut self, waypoint: Waypoint) {
@@ -50,110 +43,119 @@ impl Path {
         &self.waypoints
     }
 
-    pub fn set_speed(&mut self, speed: f64) {
-        self.speed = speed.max(0.0);
-    }
-
-    pub fn set_easing(&mut self, easing: EasingFn) {
-        self.easing = easing;
-    }
-
-    pub fn set_looping(&mut self, looping: bool) {
-        self.looping = looping;
-    }
-
-    pub fn activate(&mut self) -> bool {
-        if self.waypoints.is_empty() {
-            return false;
-        }
-
-        self.segment_index = 0;
-        self.segment_progress = 0.0;
-        self.active = true;
-        true
-    }
-
-    pub fn deactivate(&mut self) {
-        self.active = false;
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn step(&mut self) -> Option<Coord> {
-        if !self.active {
-            return None;
-        }
-
-        if self.waypoints.len() == 1 {
-            self.active = self.looping;
-            return Some(self.waypoints[0].coord);
-        }
-
-        let start = self.waypoints[self.segment_index].coord;
-        let end = self.waypoints[self.segment_index + 1].coord;
-        let distance = start.distance(end);
-
-        if distance <= f64::EPSILON {
-            self.segment_progress = 1.0;
-        } else {
-            self.segment_progress += self.speed / distance;
-        }
-
-        let raw_progress = self.segment_progress.clamp(0.0, 1.0);
-        let eased_progress = (self.easing)(raw_progress).clamp(0.0, 1.0);
-        let position = start.lerp(end, eased_progress);
-
-        if self.segment_progress >= 1.0 {
-            self.segment_index += 1;
-            self.segment_progress = 0.0;
-
-            if self.segment_index + 1 >= self.waypoints.len() {
-                if self.looping {
-                    self.segment_index = 0;
-                } else {
-                    self.active = false;
-                }
-            }
-        }
-
-        Some(position)
+    pub fn with_looping(mut self, loop_path: bool) -> Self {
+        self.loop_path = loop_path;
+        self
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Motion {
-    active_path: Option<Path>,
+    paths: BTreeMap<String, Path>,
+    active_path: Option<String>,
+    waypoint_index: usize,
+    precise_position: Option<(f64, f64)>,
 }
 
 impl Motion {
-    pub fn activate_path(&mut self, mut path: Path) -> bool {
-        if !path.activate() {
+    pub fn add_path(&mut self, path: Path) -> Option<Path> {
+        self.paths.insert(path.id.clone(), path)
+    }
+
+    pub fn path(&self, id: &str) -> Option<&Path> {
+        self.paths.get(id)
+    }
+
+    pub fn path_mut(&mut self, id: &str) -> Option<&mut Path> {
+        self.paths.get_mut(id)
+    }
+
+    pub fn activate(&mut self, id: &str, current_position: Coord) -> bool {
+        let Some(path) = self.paths.get(id) else {
+            return false;
+        };
+
+        if path.waypoints.is_empty() || path.speed <= 0.0 {
             return false;
         }
 
-        self.active_path = Some(path);
+        self.active_path = Some(id.to_owned());
+        self.waypoint_index = 0;
+        self.precise_position = Some((
+            current_position.column as f64,
+            current_position.row as f64,
+        ));
         true
     }
 
-    pub fn active_path(&self) -> Option<&Path> {
-        self.active_path.as_ref()
-    }
-
-    pub fn active_path_mut(&mut self) -> Option<&mut Path> {
-        self.active_path.as_mut()
-    }
-
     pub fn deactivate(&mut self) {
-        if let Some(path) = &mut self.active_path {
-            path.deactivate();
-        }
         self.active_path = None;
+        self.precise_position = None;
+        self.waypoint_index = 0;
     }
 
-    pub fn step(&mut self) -> Option<Coord> {
-        let path = self.active_path.as_mut()?;
-        path.step()
+    pub fn is_active(&self) -> bool {
+        self.active_path.is_some()
+    }
+
+    pub fn step(&mut self, current_position: Coord) -> Option<Coord> {
+        let path_id = self.active_path.clone()?;
+        let path = self.paths.get(&path_id)?;
+        let speed = path.speed;
+        let loop_path = path.loop_path;
+        let waypoints = path.waypoints.clone();
+
+        if waypoints.is_empty() || speed <= 0.0 {
+            self.deactivate();
+            return None;
+        }
+
+        let (mut x, mut y) = self.precise_position.unwrap_or((
+            current_position.column as f64,
+            current_position.row as f64,
+        ));
+        let mut remaining = speed;
+
+        while remaining > 0.0 {
+            if self.waypoint_index >= waypoints.len() {
+                if loop_path {
+                    self.waypoint_index = 0;
+                } else {
+                    self.deactivate();
+                    return Some(Coord::new(x.round() as i32, y.round() as i32));
+                }
+            }
+
+            let target = waypoints[self.waypoint_index].coord;
+            let dx = target.column as f64 - x;
+            let dy = target.row as f64 - y;
+            let distance = dx.hypot(dy);
+
+            if distance <= f64::EPSILON {
+                self.waypoint_index += 1;
+                continue;
+            }
+
+            if remaining >= distance {
+                x = target.column as f64;
+                y = target.row as f64;
+                remaining -= distance;
+                self.waypoint_index += 1;
+
+                if self.waypoint_index >= waypoints.len() && !loop_path {
+                    self.active_path = None;
+                    self.precise_position = Some((x, y));
+                    return Some(target);
+                }
+            } else {
+                let ratio = remaining / distance;
+                x += dx * ratio;
+                y += dy * ratio;
+                remaining = 0.0;
+            }
+        }
+
+        self.precise_position = Some((x, y));
+        Some(Coord::new(x.round() as i32, y.round() as i32))
     }
 }

@@ -1,24 +1,24 @@
 
-use std::collections::BTreeMap;
-
 use super::Effect;
-use crate::engine::animation::{CharacterVisual, Frame, Scene};
-use crate::engine::character::{CharacterId, EffectCharacter};
-use crate::engine::terminal::Terminal;
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{
+    Canvas, CharacterId, CharacterVisual, EffectCharacter, Frame, Scene,
+};
+use crate::utils::{Color, ColorPair, Coord, Gradient, Style};
 
-const STARTING_COLOR: Color = Color::rgb(0x83, 0x73, 0x73);
-const BURN_COLORS: [Color; 4] = [
-    Color::rgb(0xff, 0xff, 0xff),
-    Color::rgb(0xff, 0xf7, 0x5d),
-    Color::rgb(0xfe, 0x65, 0x0d),
-    Color::rgb(0x8a, 0x00, 0x3c),
+const STARTING_COLOR: Color = Color::new(0x83, 0x73, 0x73);
+const BURN_COLORS: [Color; 5] = [
+    Color::new(0xff, 0xff, 0xff),
+    Color::new(0xff, 0xf7, 0x5d),
+    Color::new(0xfe, 0x65, 0x0d),
+    Color::new(0x8a, 0x00, 0x3c),
+    Color::new(0x51, 0x01, 0x00),
 ];
-const FINAL_GRADIENT_START: Color = Color::rgb(0x00, 0xc3, 0xff);
-const FINAL_GRADIENT_END: Color = Color::rgb(0xff, 0xff, 0x1c);
-const FINAL_GRADIENT_STEPS: usize = 12;
-const BURN_DELAY: usize = 2;
-const FLAME_SYMBOLS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const FINAL_COLORS: [Color; 2] = [
+    Color::new(0x00, 0xc3, 0xff),
+    Color::new(0xff, 0xff, 0x1c),
+];
+const BURN_SYMBOLS: [&str; 10] =
+    ["▂", "▃", "▄", "▅", "▆", "▇", "█", "▓", "▒", "░"];
 
 pub struct Burn;
 
@@ -40,150 +40,174 @@ impl Effect for Burn {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        let lines: Vec<&str> = input
+            .lines()
+            .map(|line| line.trim_end_matches('\r'))
+            .collect();
 
-        if terminal.characters().is_empty() {
-            return Vec::new();
+        if lines.is_empty() {
+            let mut canvas = Canvas::new(1, 1);
+            canvas.fill(" ", colored_style(STARTING_COLOR));
+            return vec![canvas.render()];
         }
 
-        let canvas_height = terminal.canvas().height();
-        let mut rows: BTreeMap<i32, Vec<CharacterId>> = BTreeMap::new();
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = lines.len().max(1);
+        let final_colors =
+            Gradient::new(FINAL_COLORS, height).colors();
+        let burn_colors =
+            Gradient::new(BURN_COLORS, BURN_SYMBOLS.len()).colors();
 
-        for character in terminal.characters_mut() {
-            rows.entry(character.position.y)
-                .or_default()
-                .push(character.id);
+        let mut characters = Vec::new();
+        let mut rows = vec![Vec::new(); height];
+        let mut next_id = 0_u32;
 
-            prepare_character(character, canvas_height);
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                let mut character = EffectCharacter::new(
+                    CharacterId(next_id),
+                    symbol.to_string(),
+                    Coord::new(column as i32, row as i32),
+                );
+                next_id = next_id.saturating_add(1);
+
+                character.style = colored_style(STARTING_COLOR);
+
+                let final_color = final_colors
+                    .get(row)
+                    .copied()
+                    .unwrap_or(FINAL_COLORS[0]);
+                let mut burn_scene = Scene::new("burn", false);
+
+                for (index, burn_symbol) in BURN_SYMBOLS.iter().enumerate() {
+                    let color = burn_colors
+                        .get(index)
+                        .copied()
+                        .unwrap_or(BURN_COLORS[BURN_COLORS.len() - 1]);
+
+                    burn_scene.add_frame(Frame::new(
+                        CharacterVisual::new(
+                            *burn_symbol,
+                            colored_style(color),
+                        ),
+                        2,
+                    ));
+                }
+
+                burn_scene.add_frame(Frame::new(
+                    CharacterVisual::new(
+                        symbol.to_string(),
+                        colored_style(final_color),
+                    ),
+                    1,
+                ));
+                character.animation.add_scene(burn_scene);
+
+                let index = characters.len();
+                characters.push(character);
+                rows[row].push(index);
+            }
         }
 
-        let pending_rows: Vec<Vec<CharacterId>> = rows.into_iter().rev().map(|(_, ids)| ids).collect();
-        let mut next_row = 0;
-        let mut active = Vec::<CharacterId>::new();
-        let mut delay_remaining = 0;
+        if characters.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            canvas.fill(" ", colored_style(STARTING_COLOR));
+            return vec![canvas.render()];
+        }
+
+        let mut random_state = seed_from_input(input);
+        for row in &mut rows {
+            shuffle(row, &mut random_state);
+        }
+
+        // Burning proceeds from the bottom row toward the top.
+        rows.reverse();
+
+        let mut pending_rows = rows;
         let mut frames = Vec::new();
+        let mut canvas = Canvas::new(width, height);
 
-        while next_row < pending_rows.len() || !active.is_empty() {
-            if next_row < pending_rows.len() {
-                if delay_remaining == 0 {
-                    for &id in &pending_rows[next_row] {
-                        if let Some(character) = terminal.character_mut(id) {
-                            if let Some(scene) = burn_scene(character, canvas_height) {
-                                character.animation.activate_scene(scene);
-                                active.push(id);
-                            }
-                        }
+        loop {
+            while pending_rows.first().is_some_and(Vec::is_empty) {
+                pending_rows.remove(0);
+            }
+
+            if let Some(row) = pending_rows.first_mut() {
+                let ignition_count =
+                    1 + (next_random(&mut random_state) as usize % 3);
+                let mut ignite = Vec::new();
+
+                for _ in 0..ignition_count {
+                    if let Some(index) = row.pop() {
+                        ignite.push(index);
+                    } else {
+                        break;
                     }
+                }
 
-                    next_row += 1;
-                    delay_remaining = BURN_DELAY;
-                } else {
-                    delay_remaining -= 1;
+                for index in ignite {
+                    characters[index].animation.activate("burn");
                 }
             }
 
-            terminal.step();
+            for character in &mut characters {
+                character.step();
+            }
 
-            active.retain(|&id| {
-                terminal
-                    .character(id)
-                    .and_then(|character| character.animation.active_scene())
-                    .is_some_and(|scene| !scene.is_finished())
-            });
+            canvas.fill(" ", colored_style(STARTING_COLOR));
+            for character in &characters {
+                canvas.draw_character(character);
+            }
+            frames.push(canvas.render());
 
-            frames.push(terminal.render_frame());
+            let pending = pending_rows.iter().any(|row| !row.is_empty());
+            let active = characters.iter().any(EffectCharacter::is_active);
+
+            if !pending && !active {
+                break;
+            }
         }
 
         frames
     }
 }
 
-fn prepare_character(character: &mut EffectCharacter, canvas_height: usize) {
-    let style = Style::default().with_foreground(STARTING_COLOR);
-    character.set_appearance(character.input_symbol, style);
-    character.visible = true;
-
-    let _ = canvas_height;
+fn colored_style(color: Color) -> Style {
+    Style::with_colors(ColorPair::new(Some(color), None))
 }
 
-fn burn_scene(character: &EffectCharacter, canvas_height: usize) -> Option<Scene> {
-    let mut frames = Vec::with_capacity(BURN_COLORS.len() + 1);
+fn seed_from_input(input: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
 
-    for (index, color) in BURN_COLORS.iter().copied().enumerate() {
-        let symbol_index = (character.id.0 as usize)
-            .wrapping_mul(5)
-            .wrapping_add(index * 3)
-            % FLAME_SYMBOLS.len();
-
-        frames.push(Frame::new(
-            CharacterVisual::new(
-                FLAME_SYMBOLS[symbol_index],
-                Style::default().with_foreground(color),
-            ),
-            2,
-        ));
+    for byte in input.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 
-    frames.push(Frame::new(
-        CharacterVisual::new(
-            character.input_symbol,
-            Style::default().with_foreground(final_color(
-                character.position.y,
-                canvas_height,
-            )),
-        ),
-        1,
-    ));
-
-    if frames.is_empty() {
-        None
+    if hash == 0 {
+        0x9e37_79b9_7f4a_7c15
     } else {
-        Some(Scene::with_frames(frames, false))
+        hash
     }
 }
 
-fn final_color(row: i32, canvas_height: usize) -> Color {
-    if canvas_height <= 1 {
-        return FINAL_GRADIENT_START;
-    }
-
-    let maximum_row = (canvas_height - 1) as f64;
-    let row = f64::from(row).clamp(0.0, maximum_row);
-
-    // The original canvas coordinates increase upward. Rust canvas coordinates
-    // increase downward, so invert the ratio to retain the original gradient.
-    let vertical_ratio = 1.0 - row / maximum_row;
-    let step = (vertical_ratio * (FINAL_GRADIENT_STEPS - 1) as f64).round();
-    let ratio = step / (FINAL_GRADIENT_STEPS - 1) as f64;
-
-    interpolate_color(FINAL_GRADIENT_START, FINAL_GRADIENT_END, ratio)
+fn next_random(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value
 }
 
-fn interpolate_color(start: Color, end: Color, ratio: f64) -> Color {
-    let ratio = ratio.clamp(0.0, 1.0);
-
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
-            },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => Color::rgb(
-            interpolate_channel(start_r, end_r, ratio),
-            interpolate_channel(start_g, end_g, ratio),
-            interpolate_channel(start_b, end_b, ratio),
-        ),
-        _ if ratio < 0.5 => start,
-        _ => end,
+fn shuffle(values: &mut [usize], state: &mut u64) {
+    for index in (1..values.len()).rev() {
+        let other = next_random(state) as usize % (index + 1);
+        values.swap(index, other);
     }
-}
-
-fn interpolate_channel(start: u8, end: u8, ratio: f64) -> u8 {
-    (f64::from(start) + (f64::from(end) - f64::from(start)) * ratio).round() as u8
 }

@@ -1,21 +1,21 @@
-
 use super::Effect;
-use crate::engine::{CharacterVisual, Frame, Scene, Terminal};
-use crate::utils::graphics::{Color, Style};
+use crate::engine::{
+    CharacterId, CharacterVisual, EffectCharacter, Frame, Scene, Terminal,
+};
+use crate::utils::graphics::{Color, ColorPair, Gradient, Style};
+use crate::utils::Coord;
 
-const WAVE_SYMBOLS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const WAVE_COUNT: usize = 3;
-const WAVE_FRAME_DURATION: u32 = 2;
-
-const GRADIENT_START: Color = Color::rgb(0xf0, 0xff, 0x65);
-const GRADIENT_END: Color = Color::rgb(0x65, 0xc6, 0xff);
-
-#[derive(Debug, Clone, Copy, Default)]
 pub struct Waves;
 
 impl Waves {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for Waves {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -25,140 +25,128 @@ impl Effect for Waves {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
+        const WAVE_SYMBOLS: [&str; 8] = [
+            "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█",
+        ];
+        const WAVE_STOPS: [Color; 5] = [
+            Color::new(0xf0, 0xff, 0x65),
+            Color::new(0x65, 0xff, 0xb4),
+            Color::new(0x65, 0xc7, 0xff),
+            Color::new(0x65, 0x65, 0xff),
+            Color::new(0xff, 0x65, 0xf4),
+        ];
+        const WAVE_COUNT: usize = 2;
+        const WAVE_LENGTH: u32 = 2;
 
-        if terminal.characters().is_empty() {
-            return vec![terminal.render_frame()];
+        let lines: Vec<Vec<char>> = input
+            .lines()
+            .map(|line| {
+                line.strip_suffix('\r')
+                    .unwrap_or(line)
+                    .chars()
+                    .collect()
+            })
+            .collect();
+
+        let width = lines.iter().map(Vec::len).max().unwrap_or(0);
+        let height = lines.len();
+
+        if width == 0 || height == 0 {
+            return Vec::new();
         }
 
-        let height = terminal.canvas().height();
-        let mut longest_delay = 0_u32;
+        let wave_colors =
+            Gradient::new(WAVE_STOPS, WAVE_SYMBOLS.len()).colors();
+        let final_colors = Gradient::new(WAVE_STOPS, height.max(2)).colors();
 
-        for character in terminal.characters_mut() {
-            let delay = u32::try_from(character.position.x.max(0)).unwrap_or(u32::MAX);
-            longest_delay = longest_delay.max(delay);
+        let mut terminal = Terminal::new(width, height);
+        let mut activation_frames = Vec::new();
+        let mut next_id = 0_u32;
 
-            let mut scene = Scene::new(false);
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.iter().enumerate() {
+                let position = Coord::new(column as i32, row as i32);
+                let mut character = EffectCharacter::new(
+                    CharacterId(next_id),
+                    symbol.to_string(),
+                    position,
+                );
+                next_id += 1;
+                character.visible = false;
 
-            if delay > 0 {
-                scene.add_frame(Frame::new(
-                    CharacterVisual::new(character.input_symbol, Style::default()),
-                    delay,
-                ));
-            }
+                let final_color = final_colors
+                    .get(row)
+                    .copied()
+                    .unwrap_or(WAVE_STOPS[WAVE_STOPS.len() - 1]);
+                let mut scene = Scene::new("wave", false);
 
-            for _ in 0..WAVE_COUNT {
-                for (index, symbol) in WAVE_SYMBOLS.iter().copied().enumerate() {
-                    let progress = if WAVE_SYMBOLS.len() <= 1 {
-                        1.0
-                    } else {
-                        index as f64 / (WAVE_SYMBOLS.len() - 1) as f64
-                    };
-
-                    let style =
-                        Style::default().with_foreground(interpolate_color(
-                            GRADIENT_START,
-                            GRADIENT_END,
-                            progress,
+                for _ in 0..WAVE_COUNT {
+                    for (index, wave_symbol) in
+                        WAVE_SYMBOLS.iter().enumerate()
+                    {
+                        let color = wave_colors
+                            .get(index)
+                            .copied()
+                            .unwrap_or(WAVE_STOPS[0]);
+                        let style = Style::with_colors(ColorPair::new(
+                            Some(color),
+                            None,
                         ));
 
-                    scene.add_frame(Frame::new(
-                        CharacterVisual::new(symbol, style),
-                        WAVE_FRAME_DURATION,
-                    ));
+                        scene.add_frame(Frame::new(
+                            CharacterVisual::new(*wave_symbol, style),
+                            WAVE_LENGTH,
+                        ));
+                    }
+                }
+
+                let final_style = Style::with_colors(ColorPair::new(
+                    Some(final_color),
+                    None,
+                ));
+                scene.add_frame(Frame::new(
+                    CharacterVisual::new(symbol.to_string(), final_style),
+                    1,
+                ));
+
+                character.animation.add_scene(scene);
+                terminal.add_character(character);
+
+                // Activate one column per frame, producing a wave that travels
+                // from the left side of the text to the right.
+                activation_frames.push(column);
+            }
+        }
+
+        let last_activation = activation_frames
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let mut frames = Vec::new();
+        let mut tick = 0_usize;
+
+        loop {
+            for (character, activation_frame) in terminal
+                .characters_mut()
+                .iter_mut()
+                .zip(activation_frames.iter().copied())
+            {
+                if activation_frame == tick {
+                    character.visible = true;
+                    character.animation.activate("wave");
                 }
             }
 
-            let row_progress = if height <= 1 {
-                0.0
-            } else {
-                character.position.y.max(0) as f64 / (height - 1) as f64
-            };
+            frames.push(terminal.step_frame());
 
-            let final_style =
-                Style::default().with_foreground(interpolate_color(
-                    GRADIENT_START,
-                    GRADIENT_END,
-                    row_progress,
-                ));
-
-            scene.add_frame(Frame::new(
-                CharacterVisual::new(character.input_symbol, final_style),
-                1,
-            ));
-
-            character.visible = true;
-            character.animation.activate_scene(scene);
-        }
-
-        let wave_duration = WAVE_COUNT
-            .saturating_mul(WAVE_SYMBOLS.len())
-            .saturating_mul(WAVE_FRAME_DURATION as usize);
-        let maximum_steps = usize::try_from(longest_delay)
-            .unwrap_or(usize::MAX)
-            .saturating_add(wave_duration)
-            .saturating_add(2);
-
-        let mut frames = Vec::with_capacity(maximum_steps);
-
-        for _ in 0..maximum_steps {
-            terminal.step();
-            frames.push(terminal.render_frame());
-
-            let finished = terminal.characters().iter().all(|character| {
-                character
-                    .animation
-                    .active_scene()
-                    .map_or(true, Scene::is_finished)
-            });
-
-            if finished {
+            if tick >= last_activation && !terminal.has_active_characters() {
                 break;
             }
-        }
 
-        if frames.is_empty() {
-            frames.push(terminal.render_frame());
+            tick += 1;
         }
 
         frames
     }
-}
-
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
-
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
-            },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => Color::rgb(
-            interpolate_channel(start_r, end_r, progress),
-            interpolate_channel(start_g, end_g, progress),
-            interpolate_channel(start_b, end_b, progress),
-        ),
-        (Color::Ansi(start_value), Color::Ansi(end_value)) => Color::ansi(
-            interpolate_channel(start_value, end_value, progress),
-        ),
-        (_, end) => {
-            if progress < 0.5 {
-                start
-            } else {
-                end
-            }
-        }
-    }
-}
-
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * progress;
-    value.round().clamp(0.0, 255.0) as u8
 }

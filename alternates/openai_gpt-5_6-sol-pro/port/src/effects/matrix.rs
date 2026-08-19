@@ -1,13 +1,8 @@
-use std::collections::BTreeMap;
 
 use super::Effect;
-use crate::engine::{CharacterId, Terminal};
-use crate::utils::{Color, Coord, Style};
+use crate::engine::Canvas;
+use crate::utils::{Color, Coord, Gradient, Style};
 
-const MATRIX_SYMBOLS: &[u8] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ@#$%&*+-=<>";
-
-#[derive(Debug, Clone)]
 pub struct Matrix;
 
 impl Matrix {
@@ -28,348 +23,346 @@ impl Effect for Matrix {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
-        let mut rng = MatrixRng::new(seed_from_input(input));
+        let target = TargetText::from_input(input);
+        let seed = hash_bytes(input.as_bytes());
+        let mut simulation =
+            MatrixSimulation::new(target.width, target.height, seed);
 
-        let mut input_characters = BTreeMap::new();
-        for character in terminal.characters_mut() {
-            input_characters.insert(character.position, character.id);
-            character.visible = false;
+        let rain_frames = (24 + target.height * 3 + target.width / 2)
+            .clamp(24, 120);
+        let resolve_frames = (20 + target.height * 2).clamp(20, 100);
+        let mut frames =
+            Vec::with_capacity(rain_frames + resolve_frames + 3);
+        let mut resolved = vec![false; target.width * target.height];
+
+        for frame_index in 0..rain_frames {
+            simulation.advance(frame_index);
+            frames.push(simulation.render(
+                &target,
+                &resolved,
+                frame_index,
+            ));
         }
 
-        let mut rain_characters = vec![CharacterId(0); width * height];
-        let mut rain_symbols = vec!['0'; width * height];
+        let mut resolution_order =
+            (0..resolved.len()).collect::<Vec<usize>>();
+        shuffle(&mut resolution_order, &mut simulation.rng);
 
-        for x in 0..width {
-            for y in 0..height {
-                let index = y * width + x;
-                let symbol = random_matrix_symbol(&mut rng);
-                let id = terminal.add_character(
-                    symbol,
-                    Coord::new(x as i32, y as i32),
-                );
+        let cells_per_frame =
+            resolution_order.len().div_ceil(resolve_frames).max(1);
+        let mut resolved_count = 0;
 
-                if let Some(character) = terminal.character_mut(id) {
-                    character.visible = false;
-                    character.set_appearance(symbol, rain_style(0, 1));
-                }
+        for frame_offset in 0..resolve_frames {
+            let frame_index = rain_frames + frame_offset;
+            simulation.advance(frame_index);
 
-                rain_characters[index] = id;
-                rain_symbols[index] = symbol;
+            let next_count = (resolved_count + cells_per_frame)
+                .min(resolution_order.len());
+
+            for &index in &resolution_order[resolved_count..next_count] {
+                resolved[index] = true;
             }
-        }
+            resolved_count = next_count;
 
-        let mut columns = (0..width)
-            .map(|_| RainColumn::new(height, &mut rng))
-            .collect::<Vec<_>>();
-        let mut frames = Vec::new();
+            frames.push(simulation.render(
+                &target,
+                &resolved,
+                frame_index,
+            ));
 
-        let rain_duration = (height.saturating_mul(4) + width / 2 + 24).clamp(32, 120);
-
-        for _ in 0..rain_duration {
-            for column in &mut columns {
-                column.step(height, &mut rng);
-            }
-
-            for x in 0..width {
-                let column = &columns[x];
-
-                for y in 0..height {
-                    let index = y * width + x;
-                    let distance = column.head - y as i32;
-                    let visible = distance >= 0 && distance < column.length as i32;
-
-                    if visible && rng.chance(1, 12) {
-                        rain_symbols[index] = random_matrix_symbol(&mut rng);
-                    }
-
-                    if let Some(character) = terminal.character_mut(rain_characters[index]) {
-                        character.visible = visible;
-
-                        if visible {
-                            character.set_appearance(
-                                rain_symbols[index],
-                                rain_style(distance as usize, column.length),
-                            );
-                        }
-                    }
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        // Fill the canvas with code before resolving it back into the input.
-        for reveal_row in 0..height {
-            for y in 0..=reveal_row {
-                for x in 0..width {
-                    let index = y * width + x;
-
-                    if rng.chance(1, 8) {
-                        rain_symbols[index] = random_matrix_symbol(&mut rng);
-                    }
-
-                    if let Some(character) = terminal.character_mut(rain_characters[index]) {
-                        character.visible = true;
-                        character.set_appearance(
-                            rain_symbols[index],
-                            rain_style(reveal_row - y + 1, height.max(1)),
-                        );
-                    }
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        let mut resolve_coords = Vec::with_capacity(width * height);
-        for y in 0..height {
-            for x in 0..width {
-                resolve_coords.push(Coord::new(x as i32, y as i32));
-            }
-        }
-        rng.shuffle(&mut resolve_coords);
-
-        let resolve_steps = (width * height).clamp(12, 36);
-        let resolve_batch = resolve_coords.len().div_ceil(resolve_steps).max(1);
-
-        for coords in resolve_coords.chunks(resolve_batch) {
-            for character in terminal.characters_mut() {
-                if character.visible
-                    && rain_characters.contains(&character.id)
-                    && rng.chance(1, 10)
-                {
-                    let symbol = random_matrix_symbol(&mut rng);
-                    character.set_appearance(symbol, character.style.clone());
-                }
-            }
-
-            for coord in coords {
-                let index = coord.y as usize * width + coord.x as usize;
-
-                if let Some(character) = terminal.character_mut(rain_characters[index]) {
-                    character.visible = false;
-                }
-
-                if let Some(input_id) = input_characters.get(coord).copied() {
-                    let final_color = final_color_for_row(coord.y as usize, height);
-
-                    if let Some(character) = terminal.character_mut(input_id) {
-                        character.visible = true;
-                        character.set_appearance(
-                            character.input_symbol,
-                            Style::default().with_foreground(mix_color(
-                                Color::rgb(235, 255, 235),
-                                final_color,
-                                0.25,
-                            )),
-                        );
-                    }
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        // Fade the newly resolved text from the bright rain head color to its
-        // final green gradient.
-        for fade_step in 1..=8 {
-            let progress = fade_step as f64 / 8.0;
-
-            for character in terminal.characters_mut() {
-                if input_characters
-                    .get(&character.position)
-                    .is_some_and(|id| *id == character.id)
-                {
-                    let final_color =
-                        final_color_for_row(character.position.y as usize, height);
-                    character.visible = true;
-                    character.set_appearance(
-                        character.input_symbol,
-                        Style::default().with_foreground(mix_color(
-                            Color::rgb(235, 255, 235),
-                            final_color,
-                            progress,
-                        )),
-                    );
-                }
-            }
-
-            frames.push(terminal.render_frame());
-        }
-
-        for id in rain_characters {
-            if let Some(character) = terminal.character_mut(id) {
-                character.visible = false;
+            if resolved_count == resolution_order.len() {
+                break;
             }
         }
 
-        for character in terminal.characters_mut() {
-            if input_characters
-                .get(&character.position)
-                .is_some_and(|id| *id == character.id)
-            {
-                character.visible = true;
-                character.set_appearance(
-                    character.input_symbol,
-                    Style::default().with_foreground(final_color_for_row(
-                        character.position.y as usize,
-                        height,
-                    )),
-                );
-            }
-        }
+        resolved.fill(true);
+        let final_frame =
+            simulation.render(&target, &resolved, rain_frames + resolve_frames);
 
-        let final_frame = terminal.render_frame();
-        if frames.last() != Some(&final_frame) {
-            frames.push(final_frame);
+        for _ in 0..3 {
+            frames.push(final_frame.clone());
         }
 
         frames
     }
 }
 
-#[derive(Debug, Clone)]
-struct RainColumn {
-    head: i32,
-    length: usize,
-    fall_delay: usize,
-    delay_tick: usize,
-    restart_delay: usize,
+struct TargetText {
+    width: usize,
+    height: usize,
+    cells: Vec<char>,
+    colors: Vec<Color>,
 }
 
-impl RainColumn {
-    fn new(height: usize, rng: &mut MatrixRng) -> Self {
-        let maximum_length = height.max(3);
-        let minimum_length = maximum_length.min(3);
+impl TargetText {
+    fn from_input(input: &str) -> Self {
+        let trimmed =
+            input.trim_end_matches(|character| character == '\n' || character == '\r');
+
+        let lines = if trimmed.is_empty() {
+            vec![Vec::new()]
+        } else {
+            trimmed
+                .split('\n')
+                .map(|line| {
+                    line.trim_end_matches('\r').chars().collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let width = lines
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
+        let mut cells = vec![' '; width * height];
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.iter().copied().enumerate() {
+                cells[row * width + column] = symbol;
+            }
+        }
+
+        let row_colors = Gradient::new(
+            [
+                Color::new(215, 255, 224),
+                Color::new(90, 255, 135),
+                Color::new(0, 255, 65),
+            ],
+            height,
+        )
+        .colors();
+
+        let mut colors = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let row_color = row_colors[row];
+            for column in 0..width {
+                let horizontal_progress = if width <= 1 {
+                    1.0
+                } else {
+                    column as f64 / (width - 1) as f64
+                };
+                let center_emphasis =
+                    1.0 - (horizontal_progress * 2.0 - 1.0).abs();
+                colors.push(
+                    row_color.lerp(
+                        Color::new(235, 255, 238),
+                        center_emphasis * 0.22,
+                    ),
+                );
+            }
+        }
 
         Self {
-            head: -(rng.range(height.saturating_add(1)) as i32),
-            length: minimum_length
-                + rng.range(maximum_length.saturating_sub(minimum_length) + 1),
-            fall_delay: 1 + rng.range(4),
-            delay_tick: 0,
-            restart_delay: rng.range(10),
-        }
-    }
-
-    fn step(&mut self, height: usize, rng: &mut MatrixRng) {
-        if self.restart_delay > 0 {
-            self.restart_delay -= 1;
-            return;
-        }
-
-        self.delay_tick += 1;
-        if self.delay_tick < self.fall_delay {
-            return;
-        }
-
-        self.delay_tick = 0;
-        self.head += 1;
-
-        if self.head - self.length as i32 > height as i32 {
-            let maximum_length = height.max(3);
-            let minimum_length = maximum_length.min(3);
-
-            self.head = -(rng.range(height.saturating_add(1)) as i32);
-            self.length = minimum_length
-                + rng.range(maximum_length.saturating_sub(minimum_length) + 1);
-            self.fall_delay = 1 + rng.range(4);
-            self.restart_delay = 2 + rng.range(14);
+            width,
+            height,
+            cells,
+            colors,
         }
     }
 }
 
-fn rain_style(distance_from_head: usize, tail_length: usize) -> Style {
-    let progress = if tail_length <= 1 {
-        0.0
-    } else {
-        distance_from_head as f64 / (tail_length - 1) as f64
-    }
-    .clamp(0.0, 1.0);
+struct Stream {
+    head: i32,
+    tail_length: usize,
+    period: usize,
+    phase: usize,
+    symbol_seed: u64,
+}
 
-    let color = if distance_from_head == 0 {
-        Color::rgb(225, 255, 225)
-    } else {
-        mix_color(
-            Color::rgb(80, 255, 105),
-            Color::rgb(0, 55, 12),
-            progress,
+struct MatrixSimulation {
+    width: usize,
+    height: usize,
+    streams: Vec<Stream>,
+    rain_colors: Vec<Color>,
+    rng: MatrixRng,
+}
+
+impl MatrixSimulation {
+    fn new(width: usize, height: usize, seed: u64) -> Self {
+        let mut rng = MatrixRng::new(seed);
+        let mut streams = Vec::with_capacity(width);
+
+        for column in 0..width {
+            let delay_limit = height.saturating_mul(2).saturating_add(8);
+            streams.push(Stream {
+                head: -(rng.range(delay_limit.max(1)) as i32),
+                tail_length: 4 + rng.range(height.clamp(4, 18)),
+                period: 1 + rng.range(2),
+                phase: rng.range(3),
+                symbol_seed: rng.next_u64() ^ column as u64,
+            });
+        }
+
+        let rain_colors = Gradient::new(
+            [
+                Color::new(225, 255, 230),
+                Color::new(90, 255, 120),
+                Color::new(0, 210, 55),
+                Color::new(0, 90, 25),
+                Color::new(0, 24, 8),
+            ],
+            20,
         )
-    };
+        .colors();
 
-    let mut style = Style::default().with_foreground(color);
-    style.bold = distance_from_head <= 1;
-    style.dim = progress > 0.72;
-    style
-}
+        Self {
+            width,
+            height,
+            streams,
+            rain_colors,
+            rng,
+        }
+    }
 
-fn final_color_for_row(row: usize, height: usize) -> Color {
-    let progress = if height <= 1 {
-        0.0
-    } else {
-        row as f64 / (height - 1) as f64
-    };
+    fn advance(&mut self, frame_index: usize) {
+        for stream_index in 0..self.streams.len() {
+            let should_advance = {
+                let stream = &self.streams[stream_index];
+                (frame_index + stream.phase) % stream.period == 0
+            };
 
-    mix_color(
-        Color::rgb(85, 255, 115),
-        Color::rgb(0, 145, 45),
-        progress,
-    )
-}
+            if !should_advance {
+                continue;
+            }
 
-fn mix_color(start: Color, end: Color, progress: f64) -> Color {
-    let progress = progress.clamp(0.0, 1.0);
+            self.streams[stream_index].head += 1;
 
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
+            let finished = {
+                let stream = &self.streams[stream_index];
+                stream.head - stream.tail_length as i32
+                    > self.height as i32
+            };
+
+            if finished {
+                let delay = self.rng.range(
+                    self.height.saturating_mul(2).saturating_add(8),
+                );
+                let stream = &mut self.streams[stream_index];
+                stream.head = -(delay as i32);
+                stream.tail_length =
+                    4 + self.rng.range(self.height.clamp(4, 18));
+                stream.period = 1 + self.rng.range(2);
+                stream.phase = self.rng.range(3);
+                stream.symbol_seed = self.rng.next_u64();
+            }
+        }
+    }
+
+    fn render(
+        &self,
+        target: &TargetText,
+        resolved: &[bool],
+        frame_index: usize,
+    ) -> String {
+        let mut canvas = Canvas::new(self.width, self.height);
+        canvas.fill(
+            " ",
+            Style {
+                foreground: Some(Color::new(0, 18, 5)),
+                ..Style::default()
             },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => Color::rgb(
-            interpolate_channel(start_r, end_r, progress),
-            interpolate_channel(start_g, end_g, progress),
-            interpolate_channel(start_b, end_b, progress),
-        ),
-        (_, color) => color,
+        );
+
+        for (column, stream) in self.streams.iter().enumerate() {
+            for row in 0..self.height {
+                let distance = stream.head - row as i32;
+                if distance < 0 || distance as usize >= stream.tail_length {
+                    continue;
+                }
+
+                let distance = distance as usize;
+                let color_index = if stream.tail_length <= 1 {
+                    0
+                } else {
+                    distance
+                        .saturating_mul(self.rain_colors.len() - 1)
+                        / (stream.tail_length - 1)
+                };
+                let color = self.rain_colors[color_index];
+                let symbol = matrix_symbol(
+                    stream.symbol_seed,
+                    column,
+                    row,
+                    frame_index,
+                );
+
+                canvas.set(
+                    Coord::new(column as i32, row as i32),
+                    symbol.to_string(),
+                    Style {
+                        foreground: Some(color),
+                        bold: distance == 0,
+                        ..Style::default()
+                    },
+                );
+            }
+        }
+
+        for row in 0..target.height {
+            for column in 0..target.width {
+                let index = row * target.width + column;
+                if !resolved[index] {
+                    continue;
+                }
+
+                canvas.set(
+                    Coord::new(column as i32, row as i32),
+                    target.cells[index].to_string(),
+                    Style {
+                        foreground: Some(target.colors[index]),
+                        bold: true,
+                        ..Style::default()
+                    },
+                );
+            }
+        }
+
+        canvas.render()
     }
 }
 
-fn interpolate_channel(start: u8, end: u8, progress: f64) -> u8 {
-    (start as f64 + (end as f64 - start as f64) * progress)
-        .round()
-        .clamp(0.0, 255.0) as u8
+fn matrix_symbol(
+    seed: u64,
+    column: usize,
+    row: usize,
+    frame_index: usize,
+) -> char {
+    const SYMBOLS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut value = seed
+        ^ (column as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (row as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ ((frame_index / 3) as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+
+    SYMBOLS[value as usize % SYMBOLS.len()] as char
 }
 
-fn random_matrix_symbol(rng: &mut MatrixRng) -> char {
-    MATRIX_SYMBOLS[rng.range(MATRIX_SYMBOLS.len())] as char
+fn shuffle(values: &mut [usize], rng: &mut MatrixRng) {
+    for index in (1..values.len()).rev() {
+        let other = rng.range(index + 1);
+        values.swap(index, other);
+    }
 }
 
-fn seed_from_input(input: &str) -> u64 {
+fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
 
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
+    for &byte in bytes {
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 
-    if hash == 0 {
-        0x9e37_79b9_7f4a_7c15
-    } else {
-        hash
-    }
+    hash ^ 0x4d41_5452_4958
 }
 
-#[derive(Debug, Clone)]
 struct MatrixRng {
     state: u64,
 }
@@ -378,7 +371,7 @@ impl MatrixRng {
     fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
-                0x9e37_79b9_7f4a_7c15
+                0x6a09_e667_f3bc_c909
             } else {
                 seed
             },
@@ -394,22 +387,11 @@ impl MatrixRng {
         value
     }
 
-    fn range(&mut self, upper_bound: usize) -> usize {
-        if upper_bound <= 1 {
+    fn range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
             0
         } else {
-            (self.next_u64() % upper_bound as u64) as usize
-        }
-    }
-
-    fn chance(&mut self, numerator: usize, denominator: usize) -> bool {
-        denominator != 0 && self.range(denominator) < numerator
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        for index in (1..values.len()).rev() {
-            let other = self.range(index + 1);
-            values.swap(index, other);
+            (self.next_u64() % upper as u64) as usize
         }
     }
 }

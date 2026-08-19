@@ -1,25 +1,11 @@
-use std::f64::consts::TAU;
+
+use std::f64::consts::PI;
 
 use super::Effect;
-use crate::engine::{CharacterId, Path, Terminal, Waypoint};
-use crate::utils::easing::{out_expo, out_quad};
-use crate::utils::{Color, Coord, Style};
-
-const BUBBLE_DELAY: usize = 50;
-const BUBBLE_SPEED: f64 = 0.1;
-const POP_SPEED: f64 = 0.3;
-const RETURN_SPEED: f64 = 0.3;
-
-const BUBBLE_COLORS: [Color; 4] = [
-    Color::rgb(0xd3, 0x3a, 0xff),
-    Color::rgb(0x43, 0xc2, 0xff),
-    Color::rgb(0x2d, 0xff, 0x8a),
-    Color::rgb(0xff, 0xf7, 0x00),
-];
-
-const POP_COLOR: Color = Color::rgb(0xff, 0xff, 0xff);
-const FINAL_COLOR_TOP: Color = Color::rgb(0x43, 0xc2, 0xff);
-const FINAL_COLOR_BOTTOM: Color = Color::rgb(0xd3, 0x3a, 0xff);
+use crate::engine::Canvas;
+use crate::utils::easing;
+use crate::utils::{Color, Gradient, Style};
+use crate::utils::geometry::Coord;
 
 pub struct Bubbles;
 
@@ -41,319 +27,287 @@ impl Effect for Bubbles {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
+        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines: Vec<&str> = normalized.split('\n').collect();
 
-        let mut members = terminal
-            .characters()
+        if normalized.ends_with('\n') && lines.len() > 1 {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            lines.push("");
+        }
+
+        let width = lines
             .iter()
-            .filter(|character| !character.input_symbol.is_whitespace())
-            .map(|character| Member {
-                id: character.id,
-                home: character.position,
-                symbol: character.input_symbol,
-            })
-            .collect::<Vec<_>>();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
 
-        for character in terminal.characters_mut() {
-            character.visible = false;
+        let mut glyphs = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in line.chars().enumerate() {
+                glyphs.push(Glyph {
+                    symbol: symbol.to_string(),
+                    target: Coord::new(column as i32, row as i32),
+                });
+            }
         }
 
-        if members.is_empty() {
-            return Vec::new();
+        let final_colors = Gradient::new(
+            [
+                Color::new(0x1f, 0x43, 0xff),
+                Color::new(0x00, 0xd9, 0xff),
+                Color::new(0xff, 0xff, 0xff),
+            ],
+            height,
+        )
+        .colors();
+
+        if glyphs.is_empty() {
+            let mut canvas = Canvas::new(width, height);
+            canvas.set(
+                Coord::new(0, 0),
+                " ",
+                colored_style(final_colors[0]),
+            );
+            return vec![canvas.render()];
         }
 
-        let mut rng = SimpleRng::new(seed_from_input(input));
-        shuffle(&mut members, &mut rng);
+        let mut rng = SmallRng::new(hash_input(normalized.as_bytes()));
+        let mut shuffled: Vec<usize> = (0..glyphs.len()).collect();
+        shuffle(&mut shuffled, &mut rng);
+
+        let bubble_colors = Gradient::new(
+            [
+                Color::new(0x00, 0xb8, 0xff),
+                Color::new(0x65, 0x6d, 0xff),
+                Color::new(0xd3, 0x3a, 0xff),
+                Color::new(0xff, 0x5e, 0xb3),
+            ],
+            16,
+        )
+        .colors();
 
         let mut bubbles = Vec::new();
-        let mut remaining = members.as_slice();
+        let mut offset = 0usize;
+        let mut bubble_index = 0usize;
 
-        while !remaining.is_empty() {
-            let maximum = remaining.len().min(20);
-            let minimum = maximum.min(5);
-            let group_size = if minimum == maximum {
-                maximum
+        while offset < shuffled.len() {
+            let remaining = shuffled.len() - offset;
+            let desired = 5 + rng.range_usize(6);
+            let group_size = desired.min(remaining);
+            let members = shuffled[offset..offset + group_size].to_vec();
+            offset += group_size;
+
+            let radius = ((group_size as f64).sqrt() * 0.75)
+                .round()
+                .clamp(1.0, 3.0) as i32;
+            let center_column = rng.range_usize(width) as i32;
+            let destination_row = if height <= 2 {
+                0
             } else {
-                rng.range_inclusive(minimum, maximum)
+                rng.range_usize((height / 2).max(1)) as i32
             };
 
-            let (group, rest) = remaining.split_at(group_size);
-            remaining = rest;
-
-            let radius = ((group_size as f64 / TAU).ceil() as i32).max(1);
-            let start_x = rng.range_i32(0, width.saturating_sub(1) as i32);
-            let start_center = Coord::new(start_x, height as i32 + radius + 1);
-
-            let average_home_y = group
-                .iter()
-                .map(|member| i64::from(member.home.y))
-                .sum::<i64>() as f64
-                / group.len() as f64;
-
-            let target_x = rng.range_i32(0, width.saturating_sub(1) as i32);
-            let target_center = Coord::new(
-                target_x,
-                average_home_y.round().clamp(0.0, height.saturating_sub(1) as f64) as i32,
-            );
-
-            let color = BUBBLE_COLORS[rng.range(0, BUBBLE_COLORS.len())];
-
             bubbles.push(Bubble {
-                members: group.to_vec(),
+                members,
+                start_frame: bubble_index * 5,
+                rise_frames: 18 + rng.range_usize(10),
+                pop_frames: 5,
+                settle_frames: 22 + rng.range_usize(8),
                 radius,
-                start_center,
-                target_center,
-                color,
-                phase: BubblePhase::Pending,
+                center_column,
+                destination_row,
+                angle_offset: rng.next_f64() * 2.0 * PI,
+                color: bubble_colors[rng.range_usize(bubble_colors.len())],
             });
+
+            bubble_index += 1;
         }
 
-        let mut frames = Vec::new();
-        let mut next_release = 0usize;
-        let dimension_allowance = width
-            .saturating_add(height)
-            .saturating_mul(20)
-            .saturating_add(1_000);
-        let max_steps = bubbles
-            .len()
-            .saturating_mul(BUBBLE_DELAY)
-            .saturating_add(dimension_allowance);
-
-        for tick in 0..max_steps {
-            if tick >= next_release {
-                if let Some(bubble) = bubbles
-                    .iter_mut()
-                    .find(|bubble| bubble.phase == BubblePhase::Pending)
-                {
-                    activate_bubble(bubble, &mut terminal);
-                    next_release = next_release.saturating_add(BUBBLE_DELAY);
-                }
-            }
-
-            terminal.step();
-
-            for bubble in &mut bubbles {
-                match bubble.phase {
-                    BubblePhase::Rising if members_have_stopped(bubble, &terminal) => {
-                        begin_pop(bubble, &mut terminal);
-                    }
-                    BubblePhase::Popping if members_have_stopped(bubble, &terminal) => {
-                        begin_return(bubble, &mut terminal, height);
-                    }
-                    BubblePhase::Returning if members_have_stopped(bubble, &terminal) => {
-                        finish_bubble(bubble, &mut terminal, height);
-                    }
-                    _ => {}
-                }
-            }
-
-            frames.push(terminal.render_frame());
-
-            if bubbles
-                .iter()
-                .all(|bubble| bubble.phase == BubblePhase::Done)
-            {
-                break;
-            }
-        }
-
-        if bubbles
+        let total_frames = bubbles
             .iter()
-            .any(|bubble| bubble.phase != BubblePhase::Done)
-        {
-            for bubble in &mut bubbles {
-                finish_bubble(bubble, &mut terminal, height);
+            .map(Bubble::completion_frame)
+            .max()
+            .unwrap_or(1);
+
+        let mut frames = Vec::with_capacity(total_frames + 1);
+
+        for frame_index in 0..=total_frames {
+            let mut canvas = Canvas::new(width, height);
+
+            for bubble in &bubbles {
+                if frame_index < bubble.start_frame {
+                    continue;
+                }
+
+                let local_frame = frame_index - bubble.start_frame;
+                let member_count = bubble.members.len();
+
+                for (member_index, &glyph_index) in bubble.members.iter().enumerate() {
+                    let glyph = &glyphs[glyph_index];
+                    let angle = bubble.angle_offset
+                        + 2.0 * PI * member_index as f64 / member_count as f64;
+
+                    let (position, symbol, color) = bubble_visual(
+                        bubble,
+                        glyph,
+                        angle,
+                        local_frame,
+                        width,
+                        height,
+                        final_colors[glyph.target.row as usize],
+                    );
+
+                    canvas.set(position, symbol, colored_style(color));
+                }
             }
-            frames.push(terminal.render_frame());
+
+            frames.push(canvas.render());
         }
 
         frames
     }
 }
 
-#[derive(Debug, Clone)]
-struct Member {
-    id: CharacterId,
-    home: Coord,
-    symbol: char,
+#[derive(Clone, Debug)]
+struct Glyph {
+    symbol: String,
+    target: Coord,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BubblePhase {
-    Pending,
-    Rising,
-    Popping,
-    Returning,
-    Done,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct Bubble {
-    members: Vec<Member>,
+    members: Vec<usize>,
+    start_frame: usize,
+    rise_frames: usize,
+    pop_frames: usize,
+    settle_frames: usize,
     radius: i32,
-    start_center: Coord,
-    target_center: Coord,
+    center_column: i32,
+    destination_row: i32,
+    angle_offset: f64,
     color: Color,
-    phase: BubblePhase,
 }
 
-fn activate_bubble(bubble: &mut Bubble, terminal: &mut Terminal) {
-    let count = bubble.members.len();
-
-    for (index, member) in bubble.members.iter().enumerate() {
-        let offset = circle_offset(bubble.radius, index, count);
-        let start = bubble.start_center + offset;
-        let destination = bubble.target_center + offset;
-
-        if let Some(character) = terminal.character_mut(member.id) {
-            character.visible = true;
-            character.set_position(start);
-            character.set_appearance(
-                member.symbol,
-                Style::default().with_foreground(bubble.color),
-            );
-
-            let mut path = Path::with_waypoints(
-                vec![Waypoint::new(start), Waypoint::new(destination)],
-                BUBBLE_SPEED,
-            );
-            path.set_easing(out_quad);
-            character.motion.activate_path(path);
-        }
+impl Bubble {
+    fn completion_frame(&self) -> usize {
+        self.start_frame + self.rise_frames + self.pop_frames + self.settle_frames
     }
 
-    bubble.phase = BubblePhase::Rising;
+    fn circle_position(&self, angle: f64, center_row: f64, expansion: f64) -> Coord {
+        let radius = self.radius as f64 + expansion;
+        Coord::new(
+            (self.center_column as f64 + angle.cos() * radius).round() as i32,
+            (center_row + angle.sin() * radius * 0.55).round() as i32,
+        )
+    }
 }
 
-fn begin_pop(bubble: &mut Bubble, terminal: &mut Terminal) {
-    let count = bubble.members.len();
-    let pop_radius = bubble.radius.saturating_add(3);
+fn bubble_visual(
+    bubble: &Bubble,
+    glyph: &Glyph,
+    angle: f64,
+    local_frame: usize,
+    width: usize,
+    height: usize,
+    final_color: Color,
+) -> (Coord, String, Color) {
+    let rise_end = bubble.rise_frames;
+    let pop_end = rise_end + bubble.pop_frames;
+    let settle_end = pop_end + bubble.settle_frames;
 
-    for (index, member) in bubble.members.iter().enumerate() {
-        let offset = circle_offset(pop_radius, index, count);
-        let destination = bubble.target_center + offset;
+    let bottom_row = height.saturating_sub(1) as f64;
 
-        if let Some(character) = terminal.character_mut(member.id) {
-            let start = character.position;
-            character.set_appearance(
-                member.symbol,
-                Style::default().with_foreground(POP_COLOR),
-            );
+    if local_frame < rise_end {
+        let progress = local_frame as f64 / bubble.rise_frames.max(1) as f64;
+        let eased = easing::out_sine(progress);
+        let center_row = bottom_row
+            + (bubble.destination_row as f64 - bottom_row) * eased;
+        let position = bubble.circle_position(angle, center_row, 0.0);
 
-            let mut path = Path::with_waypoints(
-                vec![Waypoint::new(start), Waypoint::new(destination)],
-                POP_SPEED,
-            );
-            path.set_easing(out_expo);
-            character.motion.activate_path(path);
-        }
+        return (
+            clamp_coord(position, width, height),
+            glyph.symbol.clone(),
+            bubble.color,
+        );
     }
 
-    bubble.phase = BubblePhase::Popping;
-}
+    if local_frame < pop_end {
+        let progress =
+            (local_frame - rise_end) as f64 / bubble.pop_frames.max(1) as f64;
+        let eased = easing::out_cubic(progress);
+        let position = bubble.circle_position(
+            angle,
+            bubble.destination_row as f64,
+            3.0 * eased,
+        );
+        let symbol = if progress < 0.34 {
+            "o"
+        } else if progress < 0.72 {
+            "*"
+        } else {
+            "."
+        };
 
-fn begin_return(bubble: &mut Bubble, terminal: &mut Terminal, height: usize) {
-    for member in &bubble.members {
-        if let Some(character) = terminal.character_mut(member.id) {
-            let start = character.position;
-            let color = final_color(member.home.y, height);
-
-            character.set_appearance(member.symbol, Style::default().with_foreground(color));
-
-            let mut path = Path::with_waypoints(
-                vec![Waypoint::new(start), Waypoint::new(member.home)],
-                RETURN_SPEED,
-            );
-            path.set_easing(out_expo);
-            character.motion.activate_path(path);
-        }
+        return (
+            clamp_coord(position, width, height),
+            symbol.to_owned(),
+            bubble.color.lerp(Color::new(0xff, 0xff, 0xff), eased),
+        );
     }
 
-    bubble.phase = BubblePhase::Returning;
-}
+    if local_frame < settle_end {
+        let progress =
+            (local_frame - pop_end) as f64 / bubble.settle_frames.max(1) as f64;
+        let eased = easing::out_bounce(progress);
+        let expanded = bubble.circle_position(
+            angle,
+            bubble.destination_row as f64,
+            3.0,
+        );
+        let position = interpolate_coord(expanded, glyph.target, eased);
 
-fn finish_bubble(bubble: &mut Bubble, terminal: &mut Terminal, height: usize) {
-    for member in &bubble.members {
-        if let Some(character) = terminal.character_mut(member.id) {
-            character.motion.deactivate();
-            character.set_position(member.home);
-            character.set_appearance(
-                member.symbol,
-                Style::default().with_foreground(final_color(member.home.y, height)),
-            );
-            character.visible = true;
-        }
+        return (
+            clamp_coord(position, width, height),
+            glyph.symbol.clone(),
+            Color::new(0xff, 0xff, 0xff).lerp(final_color, eased),
+        );
     }
 
-    bubble.phase = BubblePhase::Done;
+    (glyph.target, glyph.symbol.clone(), final_color)
 }
 
-fn members_have_stopped(bubble: &Bubble, terminal: &Terminal) -> bool {
-    bubble.members.iter().all(|member| {
-        terminal
-            .character(member.id)
-            .and_then(|character| character.motion.active_path())
-            .map(|path| !path.is_active())
-            .unwrap_or(true)
-    })
+fn interpolate_coord(start: Coord, end: Coord, progress: f64) -> Coord {
+    let progress = progress.clamp(0.0, 1.0);
+    let column = start.column as f64
+        + (end.column - start.column) as f64 * progress;
+    let row = start.row as f64 + (end.row - start.row) as f64 * progress;
+
+    Coord::new(column.round() as i32, row.round() as i32)
 }
 
-fn circle_offset(radius: i32, index: usize, count: usize) -> Coord {
-    if count == 0 {
-        return Coord::ZERO;
-    }
-
-    let angle = TAU * index as f64 / count as f64;
+fn clamp_coord(coord: Coord, width: usize, height: usize) -> Coord {
     Coord::new(
-        (angle.cos() * radius as f64).round() as i32,
-        (angle.sin() * radius as f64).round() as i32,
+        coord.column.clamp(0, width.saturating_sub(1) as i32),
+        coord.row.clamp(0, height.saturating_sub(1) as i32),
     )
 }
 
-fn final_color(row: i32, height: usize) -> Color {
-    let denominator = height.saturating_sub(1).max(1) as f64;
-    let progress = (row.max(0) as f64 / denominator).clamp(0.0, 1.0);
-
-    interpolate_color(FINAL_COLOR_TOP, FINAL_COLOR_BOTTOM, progress)
+fn colored_style(color: Color) -> Style {
+    Style {
+        foreground: Some(color),
+        ..Style::default()
+    }
 }
 
-fn interpolate_color(start: Color, end: Color, progress: f64) -> Color {
-    let (
-        Color::Rgb {
-            r: start_r,
-            g: start_g,
-            b: start_b,
-        },
-        Color::Rgb {
-            r: end_r,
-            g: end_g,
-            b: end_b,
-        },
-    ) = (start, end)
-    else {
-        return start;
-    };
+fn hash_input(input: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
 
-    let interpolate = |from: u8, to: u8| {
-        (f64::from(from) + (f64::from(to) - f64::from(from)) * progress)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-
-    Color::rgb(
-        interpolate(start_r, end_r),
-        interpolate(start_g, end_g),
-        interpolate(start_b, end_b),
-    )
-}
-
-fn seed_from_input(input: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
+    for &byte in input {
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 
@@ -364,21 +318,27 @@ fn seed_from_input(input: &str) -> u64 {
     }
 }
 
-fn shuffle<T>(values: &mut [T], rng: &mut SimpleRng) {
+fn shuffle(values: &mut [usize], rng: &mut SmallRng) {
     for index in (1..values.len()).rev() {
-        let other = rng.range_inclusive(0, index);
+        let other = rng.range_usize(index + 1);
         values.swap(index, other);
     }
 }
 
-#[derive(Debug, Clone)]
-struct SimpleRng {
+#[derive(Clone, Debug)]
+struct SmallRng {
     state: u64,
 }
 
-impl SimpleRng {
+impl SmallRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed }
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -390,27 +350,16 @@ impl SimpleRng {
         value
     }
 
-    fn range(&mut self, start: usize, end: usize) -> usize {
-        if end <= start {
-            return start;
-        }
-
-        start + (self.next_u64() as usize % (end - start))
+    fn next_f64(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / ((1u64 << 53) as f64);
+        ((self.next_u64() >> 11) as f64) * SCALE
     }
 
-    fn range_inclusive(&mut self, start: usize, end: usize) -> usize {
-        if end <= start {
-            return start;
+    fn range_usize(&mut self, upper_bound: usize) -> usize {
+        if upper_bound <= 1 {
+            0
+        } else {
+            (self.next_u64() % upper_bound as u64) as usize
         }
-
-        start + (self.next_u64() as usize % (end - start + 1))
-    }
-
-    fn range_i32(&mut self, start: i32, end: i32) -> i32 {
-        if end <= start {
-            return start;
-        }
-
-        start + (self.next_u64() % (end - start + 1) as u64) as i32
     }
 }

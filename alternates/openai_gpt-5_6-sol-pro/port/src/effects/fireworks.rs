@@ -1,12 +1,17 @@
-
 use std::f64::consts::TAU;
 
 use super::Effect;
-use crate::engine::character::CharacterId;
-use crate::engine::terminal::Terminal;
-use crate::utils::easing::{in_out_sine, out_expo, out_quad};
+use crate::engine::canvas::Canvas;
+use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Style};
+use crate::utils::graphics::{Color, Gradient, Style};
+
+const LAUNCH_FRAMES: usize = 14;
+const EXPLODE_FRAMES: usize = 12;
+const SETTLE_FRAMES: usize = 18;
+const FINAL_HOLD_FRAMES: usize = 8;
+const SHELL_SIZE: usize = 8;
+const SHELL_DELAY: usize = 5;
 
 pub struct Fireworks;
 
@@ -22,249 +27,472 @@ impl Default for Fireworks {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Particle {
-    id: CharacterId,
-    symbol: char,
-    home: Coord,
-    launch: Coord,
-    apex: Coord,
-    burst: Coord,
-    start_tick: usize,
-    shell_color: Color,
-}
-
 impl Effect for Fireworks {
     fn name(&self) -> &str {
         "fireworks"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        const LAUNCH_STEPS: usize = 14;
-        const BURST_STEPS: usize = 9;
-        const RETURN_STEPS: usize = 22;
-        const LAUNCH_DELAY: usize = 7;
+        let parsed = ParsedInput::new(input);
+        let final_colors = Gradient::new(
+            [
+                Color::new(255, 95, 109),
+                Color::new(255, 195, 113),
+                Color::new(111, 255, 233),
+                Color::new(112, 161, 255),
+                Color::new(210, 125, 255),
+            ],
+            parsed.height,
+        )
+        .colors();
 
-        let mut terminal = Terminal::from_text(input);
-        let width = terminal.canvas().width();
-        let height = terminal.canvas().height();
+        let mut rng = SmallRng::new(hash_input(input));
+        let mut glyphs = parsed.glyphs;
+        shuffle(&mut glyphs, &mut rng);
 
-        let characters = terminal
-            .characters()
-            .iter()
-            .filter(|character| !character.input_symbol.is_whitespace())
-            .map(|character| {
-                (
-                    character.id,
-                    character.input_symbol,
-                    character.position,
-                )
-            })
-            .collect::<Vec<_>>();
+        let palette = [
+            Color::new(255, 45, 85),
+            Color::new(255, 139, 41),
+            Color::new(255, 231, 76),
+            Color::new(62, 255, 139),
+            Color::new(48, 214, 255),
+            Color::new(83, 109, 254),
+            Color::new(191, 90, 242),
+            Color::new(255, 55, 199),
+        ];
 
-        if characters.is_empty() {
-            return vec![terminal.render_frame()];
-        }
+        let mut shells = Vec::new();
 
-        let shell_size = characters.len().saturating_add(49) / 50;
-        let shell_size = shell_size.max(1);
-        let mut particles = Vec::with_capacity(characters.len());
+        for (shell_index, chunk) in glyphs.chunks(SHELL_SIZE).enumerate() {
+            let center_column = if chunk.is_empty() {
+                parsed.width as i32 / 2
+            } else {
+                py_round(
+                    chunk.iter().map(|glyph| glyph.coord.column).sum::<i32>()
+                        as f64
+                        / chunk.len() as f64,
+                ) as i32
+            };
 
-        for (shell_index, shell) in characters.chunks(shell_size).enumerate() {
-            let shell_seed = mix_seed(shell_index as u64 + 1);
-            let apex_x = (shell_seed as usize % width) as i32;
+            let center_row = if chunk.is_empty() {
+                parsed.height as i32 / 3
+            } else {
+                py_round(
+                    chunk.iter().map(|glyph| glyph.coord.row).sum::<i32>()
+                        as f64
+                        / chunk.len() as f64,
+                ) as i32
+            };
 
-            let apex_region = ((height as f64 * 0.65).ceil() as usize)
-                .max(1)
-                .min(height);
-            let apex_y = (mix_seed(shell_seed) as usize % apex_region) as i32;
-            let launch = Coord::new(apex_x, height.saturating_sub(1) as i32);
-            let apex = Coord::new(apex_x, apex_y);
-            let shell_color = FIREWORK_COLORS[shell_index % FIREWORK_COLORS.len()];
-            let phase = unit_value(mix_seed(shell_seed ^ 0xa5a5_a5a5)) * TAU;
+            let horizontal_jitter = rng.range_i32(-2, 3);
+            let apex_column = (center_column + horizontal_jitter)
+                .clamp(0, parsed.width.saturating_sub(1) as i32);
+            let apex_row_limit = parsed.height.saturating_sub(1) as i32;
+            let apex_row = center_row
+                .min((parsed.height as i32 / 3).max(0))
+                .clamp(0, apex_row_limit);
+            let apex = Coord::new(apex_column, apex_row);
+            let launch = Coord::new(
+                apex_column,
+                parsed.height.saturating_sub(1) as i32,
+            );
 
-            let base_radius = ((width.max(height) as f64) * 0.12).round().max(1.0);
+            let color = palette[rng.range_usize(palette.len())];
+            let mut particles = Vec::with_capacity(chunk.len());
 
-            for (particle_index, &(id, symbol, home)) in shell.iter().enumerate() {
-                let angle = phase + TAU * particle_index as f64 / shell.len() as f64;
-                let radius_seed = mix_seed(shell_seed ^ particle_index as u64);
-                let radius = base_radius * (0.7 + unit_value(radius_seed) * 0.6);
-
-                let burst_x = apex.x + (angle.cos() * radius).round() as i32;
-                let burst_y = apex.y + (angle.sin() * radius * 0.55).round() as i32;
+            for (particle_index, glyph) in chunk.iter().enumerate() {
+                let base_angle =
+                    particle_index as f64 / chunk.len().max(1) as f64 * TAU;
+                let angle = base_angle + rng.range_f64(-0.28, 0.28);
+                let radius = rng.range_f64(2.0, 5.5);
                 let burst = Coord::new(
-                    burst_x.clamp(0, width.saturating_sub(1) as i32),
-                    burst_y.clamp(0, height.saturating_sub(1) as i32),
+                    apex.column + py_round(angle.cos() * radius) as i32,
+                    apex.row + py_round(angle.sin() * radius * 0.55) as i32,
                 );
 
                 particles.push(Particle {
-                    id,
-                    symbol,
-                    home,
-                    launch,
-                    apex,
+                    symbol: glyph.symbol.clone(),
+                    target: glyph.coord,
                     burst,
-                    start_tick: shell_index * LAUNCH_DELAY,
-                    shell_color,
+                    final_color: final_colors
+                        .get(glyph.coord.row.max(0) as usize)
+                        .copied()
+                        .unwrap_or(color),
                 });
             }
+
+            shells.push(Shell {
+                delay: shell_index * SHELL_DELAY,
+                launch,
+                apex,
+                color,
+                particles,
+            });
         }
 
-        for particle in &particles {
-            if let Some(character) = terminal.character_mut(particle.id) {
-                character.visible = false;
-            }
+        if shells.is_empty() {
+            return blank_firework_frames(
+                parsed.width,
+                parsed.height,
+                palette[0],
+            );
         }
 
-        let last_start = particles
-            .iter()
-            .map(|particle| particle.start_tick)
-            .max()
-            .unwrap_or(0);
-        let final_tick = last_start + LAUNCH_STEPS + BURST_STEPS + RETURN_STEPS;
-        let mut frames = Vec::with_capacity(final_tick + 1);
+        let shell_duration =
+            LAUNCH_FRAMES + EXPLODE_FRAMES + SETTLE_FRAMES;
+        let total_frames = shells
+            .last()
+            .map(|shell| shell.delay + shell_duration + FINAL_HOLD_FRAMES)
+            .unwrap_or(FINAL_HOLD_FRAMES);
 
-        for tick in 0..=final_tick {
-            for particle in &particles {
-                let Some(character) = terminal.character_mut(particle.id) else {
-                    continue;
-                };
+        let mut frames = Vec::with_capacity(total_frames);
 
-                if tick < particle.start_tick {
-                    character.visible = false;
+        for frame_index in 0..total_frames {
+            let mut canvas = Canvas::new(parsed.width, parsed.height);
+            let mut painted = false;
+
+            for shell in &shells {
+                if frame_index < shell.delay {
                     continue;
                 }
 
-                let local_tick = tick - particle.start_tick;
-                character.visible = true;
+                let local_frame = frame_index - shell.delay;
 
-                if local_tick < LAUNCH_STEPS {
-                    let progress = local_tick as f64 / LAUNCH_STEPS as f64;
-                    let position = particle.launch.lerp(particle.apex, out_quad(progress));
-                    let launch_symbol = launch_symbol(progress);
-
-                    character.set_position(position);
-                    character.set_appearance(
-                        launch_symbol,
-                        Style::default().with_foreground(particle.shell_color),
-                    );
-                } else if local_tick < LAUNCH_STEPS + BURST_STEPS {
-                    let burst_tick = local_tick - LAUNCH_STEPS;
-                    let progress = burst_tick as f64 / BURST_STEPS as f64;
-                    let position = particle.apex.lerp(particle.burst, out_expo(progress));
-
-                    character.set_position(position);
-                    character.set_appearance(
-                        particle.symbol,
-                        Style::default().with_foreground(particle.shell_color),
-                    );
-                } else if local_tick < LAUNCH_STEPS + BURST_STEPS + RETURN_STEPS {
-                    let return_tick = local_tick - LAUNCH_STEPS - BURST_STEPS;
-                    let progress = return_tick as f64 / RETURN_STEPS as f64;
-                    let position = particle
-                        .burst
-                        .lerp(particle.home, in_out_sine(progress));
-                    let color = blend_color(
-                        particle.shell_color,
-                        final_color(particle.home, height),
+                if local_frame < LAUNCH_FRAMES {
+                    let denominator = LAUNCH_FRAMES.saturating_sub(1).max(1);
+                    let progress =
+                        local_frame as f64 / denominator as f64;
+                    let progress = easing::out_quart(progress);
+                    let rocket = interpolate_coord(
+                        shell.launch,
+                        shell.apex,
                         progress,
                     );
 
-                    character.set_position(position);
-                    character.set_appearance(
-                        particle.symbol,
-                        Style::default().with_foreground(color),
+                    let trail_progress = (progress - 0.08).max(0.0);
+                    let trail = interpolate_coord(
+                        shell.launch,
+                        shell.apex,
+                        trail_progress,
                     );
-                } else {
-                    character.set_position(particle.home);
-                    character.set_appearance(
-                        particle.symbol,
-                        Style::default()
-                            .with_foreground(final_color(particle.home, height)),
+
+                    let trail_style = Style {
+                        foreground: Some(
+                            shell
+                                .color
+                                .lerp(Color::new(255, 255, 255), 0.35),
+                        ),
+                        ..Style::default()
+                    };
+                    let rocket_style = Style {
+                        foreground: Some(shell.color),
+                        bold: true,
+                        ..Style::default()
+                    };
+
+                    painted |= canvas.set(trail, "·", trail_style);
+                    painted |= canvas.set(rocket, "▄", rocket_style);
+                    continue;
+                }
+
+                let explosion_frame = local_frame - LAUNCH_FRAMES;
+
+                if explosion_frame < EXPLODE_FRAMES {
+                    let denominator =
+                        EXPLODE_FRAMES.saturating_sub(1).max(1);
+                    let progress =
+                        explosion_frame as f64 / denominator as f64;
+                    let movement = easing::out_circ(progress);
+                    let brightness =
+                        1.0 - (2.0 * progress - 1.0).abs() * 0.55;
+                    let explosion_color = shell.color.lerp(
+                        Color::new(255, 255, 255),
+                        brightness.clamp(0.0, 1.0),
                     );
+                    let style = Style {
+                        foreground: Some(explosion_color),
+                        bold: true,
+                        ..Style::default()
+                    };
+
+                    for particle in &shell.particles {
+                        let position = interpolate_coord(
+                            shell.apex,
+                            particle.burst,
+                            movement,
+                        );
+                        painted |= canvas.set(position, "*", style);
+                    }
+
+                    continue;
+                }
+
+                let settle_frame = explosion_frame - EXPLODE_FRAMES;
+
+                if settle_frame < SETTLE_FRAMES {
+                    let denominator =
+                        SETTLE_FRAMES.saturating_sub(1).max(1);
+                    let progress =
+                        settle_frame as f64 / denominator as f64;
+                    let movement = easing::in_out_cubic(progress);
+
+                    for particle in &shell.particles {
+                        let position = interpolate_coord(
+                            particle.burst,
+                            particle.target,
+                            movement,
+                        );
+                        let color =
+                            shell.color.lerp(particle.final_color, progress);
+                        let style = Style {
+                            foreground: Some(color),
+                            bold: progress < 0.55,
+                            ..Style::default()
+                        };
+                        let symbol = if progress < 0.45 {
+                            "*"
+                        } else {
+                            particle.symbol.as_str()
+                        };
+
+                        painted |= canvas.set(position, symbol, style);
+                    }
+
+                    continue;
+                }
+
+                for particle in &shell.particles {
+                    let style = Style {
+                        foreground: Some(particle.final_color),
+                        ..Style::default()
+                    };
+                    painted |=
+                        canvas.set(particle.target, &particle.symbol, style);
                 }
             }
 
-            frames.push(terminal.render_frame());
+            if !painted {
+                canvas.set(
+                    Coord::new(0, 0),
+                    " ",
+                    Style {
+                        foreground: Some(Color::new(255, 255, 255)),
+                        ..Style::default()
+                    },
+                );
+            }
+
+            frames.push(canvas.render());
         }
 
         frames
     }
 }
 
-const FIREWORK_COLORS: [Color; 6] = [
-    Color::rgb(136, 206, 235),
-    Color::rgb(255, 255, 255),
-    Color::rgb(254, 95, 85),
-    Color::rgb(240, 182, 127),
-    Color::rgb(214, 209, 177),
-    Color::rgb(199, 239, 207),
-];
-
-fn launch_symbol(progress: f64) -> char {
-    const SYMBOLS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let index = (progress.clamp(0.0, 1.0) * (SYMBOLS.len() - 1) as f64).round() as usize;
-    SYMBOLS[index]
+#[derive(Clone)]
+struct Glyph {
+    symbol: String,
+    coord: Coord,
 }
 
-fn final_color(coord: Coord, height: usize) -> Color {
-    let denominator = height.saturating_sub(1).max(1) as f64;
-    let progress = (coord.y.max(0) as f64 / denominator).clamp(0.0, 1.0);
+struct Particle {
+    symbol: String,
+    target: Coord,
+    burst: Coord,
+    final_color: Color,
+}
 
-    if progress < 0.5 {
-        blend_color(
-            Color::rgb(138, 0, 138),
-            Color::rgb(0, 209, 255),
-            progress * 2.0,
-        )
-    } else {
-        blend_color(
-            Color::rgb(0, 209, 255),
-            Color::rgb(255, 255, 255),
-            (progress - 0.5) * 2.0,
-        )
+struct Shell {
+    delay: usize,
+    launch: Coord,
+    apex: Coord,
+    color: Color,
+    particles: Vec<Particle>,
+}
+
+struct ParsedInput {
+    width: usize,
+    height: usize,
+    glyphs: Vec<Glyph>,
+}
+
+impl ParsedInput {
+    fn new(input: &str) -> Self {
+        let input = input.strip_suffix('\n').unwrap_or(input);
+        let mut lines: Vec<&str> = input.split('\n').collect();
+
+        if lines.is_empty() {
+            lines.push("");
+        }
+
+        let width = lines
+            .iter()
+            .map(|line| line.trim_end_matches('\r').chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let height = lines.len().max(1);
+        let mut glyphs = Vec::new();
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, symbol) in
+                line.trim_end_matches('\r').chars().enumerate()
+            {
+                if symbol.is_whitespace() {
+                    continue;
+                }
+
+                glyphs.push(Glyph {
+                    symbol: symbol.to_string(),
+                    coord: Coord::new(column as i32, row as i32),
+                });
+            }
+        }
+
+        Self {
+            width,
+            height,
+            glyphs,
+        }
     }
 }
 
-fn blend_color(start: Color, end: Color, progress: f64) -> Color {
+fn interpolate_coord(start: Coord, end: Coord, progress: f64) -> Coord {
     let progress = progress.clamp(0.0, 1.0);
+    let column = start.column as f64
+        + (end.column - start.column) as f64 * progress;
+    let row =
+        start.row as f64 + (end.row - start.row) as f64 * progress;
 
-    match (start, end) {
-        (
-            Color::Rgb {
-                r: start_r,
-                g: start_g,
-                b: start_b,
-            },
-            Color::Rgb {
-                r: end_r,
-                g: end_g,
-                b: end_b,
-            },
-        ) => Color::rgb(
-            blend_channel(start_r, end_r, progress),
-            blend_channel(start_g, end_g, progress),
-            blend_channel(start_b, end_b, progress),
-        ),
-        _ if progress < 0.5 => start,
-        _ => end,
+    Coord::new(py_round(column) as i32, py_round(row) as i32)
+}
+
+fn py_round(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+
+    let floor = value.floor();
+    let fraction = value - floor;
+
+    if fraction < 0.5 {
+        floor as i64
+    } else if fraction > 0.5 {
+        floor as i64 + 1
+    } else {
+        let lower = floor as i64;
+        if lower % 2 == 0 {
+            lower
+        } else {
+            lower + 1
+        }
     }
 }
 
-fn blend_channel(start: u8, end: u8, progress: f64) -> u8 {
-    (start as f64 + (end as f64 - start as f64) * progress)
-        .round()
-        .clamp(0.0, 255.0) as u8
+fn blank_firework_frames(
+    width: usize,
+    height: usize,
+    color: Color,
+) -> Vec<String> {
+    let mut frames = Vec::with_capacity(16);
+    let center = Coord::new(
+        width.saturating_sub(1) as i32 / 2,
+        height.saturating_sub(1) as i32 / 2,
+    );
+
+    for frame_index in 0..16 {
+        let mut canvas = Canvas::new(width, height);
+        let progress = frame_index as f64 / 15.0;
+        let symbol = if frame_index < 7 {
+            "▄"
+        } else if frame_index < 14 {
+            "*"
+        } else {
+            " "
+        };
+        let style = Style {
+            foreground: Some(
+                color.lerp(Color::new(255, 255, 255), progress),
+            ),
+            bold: frame_index < 14,
+            ..Style::default()
+        };
+
+        canvas.set(center, symbol, style);
+        frames.push(canvas.render());
+    }
+
+    frames
 }
 
-fn mix_seed(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+fn hash_input(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    if hash == 0 {
+        0x9e3779b97f4a7c15
+    } else {
+        hash
+    }
 }
 
-fn unit_value(value: u64) -> f64 {
-    (value >> 11) as f64 / ((1_u64 << 53) - 1) as f64
+fn shuffle<T>(values: &mut [T], rng: &mut SmallRng) {
+    for index in (1..values.len()).rev() {
+        let other = rng.range_usize(index + 1);
+        values.swap(index, other);
+    }
+}
+
+struct SmallRng {
+    state: u64,
+}
+
+impl SmallRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e3779b97f4a7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
+    }
+
+    fn unit_f64(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / ((1_u64 << 53) as f64);
+        ((self.next_u64() >> 11) as f64) * SCALE
+    }
+
+    fn range_f64(&mut self, start: f64, end: f64) -> f64 {
+        start + (end - start) * self.unit_f64()
+    }
+
+    fn range_usize(&mut self, end: usize) -> usize {
+        if end <= 1 {
+            0
+        } else {
+            (self.next_u64() % end as u64) as usize
+        }
+    }
+
+    fn range_i32(&mut self, start: i32, end: i32) -> i32 {
+        if end <= start {
+            start
+        } else {
+            start + self.range_usize((end - start) as usize) as i32
+        }
+    }
 }
