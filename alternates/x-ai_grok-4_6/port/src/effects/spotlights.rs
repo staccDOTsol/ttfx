@@ -1,10 +1,10 @@
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{self, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Spotlights search the text area, illuminating characters, then converge and expand.
 pub struct Spotlights;
 
 impl Spotlights {
@@ -13,233 +13,150 @@ impl Spotlights {
     }
 }
 
-impl Default for Spotlights {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-const STOP_HEX: [&str; 3] = ["ab48ff", "e7b2b2", "fffebd"];
-const GRADIENT_STEPS: usize = 12;
-const BEAM_WIDTH_RATIO: f64 = 2.0;
-const BEAM_FALLOFF: f64 = 0.3;
-const SEARCH_DURATION: usize = 180;
-const SPOTLIGHT_COUNT: usize = 3;
-const CONVERGE_FRAMES: usize = 40;
-const EXPAND_FRAMES: usize = 50;
-const HOLD_FRAMES: usize = 12;
-const DARK_FACTOR: f64 = 0.15;
-
-fn hex_color(hex: &str) -> Color {
-    Color::from_hex(hex).unwrap_or_else(|| Color::rgb(128, 128, 128))
-}
-
-fn ease_in_out_quad(t: f64) -> f64 {
-    if t < 0.5 {
-        2.0 * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
-    }
-}
-
-fn ease_in_out_sine(t: f64) -> f64 {
-    (-((std::f64::consts::PI * t).cos() - 1.0) / 2.0).clamp(0.0, 1.0)
-}
-
-struct Snapshot {
-    id: CharacterId,
-    symbol: String,
-    input: Coord,
-    bright: Color,
-}
-
-struct Light {
-    pos: Coord,
-    waypoints: Vec<Coord>,
-    wp_index: usize,
-    progress: f64,
-    speed: f64,
-}
-
 impl Effect for Spotlights {
     fn name(&self) -> &str {
         "spotlights"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_input(input, TerminalConfig::default());
-        if terminal.character_count() == 0 {
-            return vec![terminal.render_frame()];
-        }
-
-        let palette: Vec<Color> = STOP_HEX.iter().map(|h| hex_color(h)).collect();
-        let final_gradient = Gradient::new(&palette, GRADIENT_STEPS);
-
-        let (min_row, max_row) = {
-            let chars = terminal.get_characters();
-            let min_row = chars.iter().map(|c| c.input_coord.row).min().unwrap_or(1);
-            let max_row = chars.iter().map(|c| c.input_coord.row).max().unwrap_or(1);
-            (min_row, max_row)
-        };
-
-        let snapshots: Vec<Snapshot> = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| {
-                let progress = if max_row == min_row {
-                    0.0
-                } else {
-                    f64::from(ch.input_coord.row - min_row) / f64::from(max_row - min_row)
-                };
-                let color = final_gradient
-                    .mapped_color(progress)
-                    .unwrap_or(palette[0]);
-                Snapshot {
-                    id: ch.id,
-                    symbol: ch.input_symbol.clone(),
-                    input: ch.input_coord,
-                    bright: color,
-                }
-            })
-            .collect();
-
-        let canvas_right = terminal.canvas.right;
-        let canvas_top = terminal.canvas.top;
-        let center = terminal.canvas.center();
-        let smallest = canvas_right.min(canvas_top).max(1);
-        let illuminate_range = ((smallest as f64 / BEAM_WIDTH_RATIO).min(smallest as f64) as i32).max(1);
-        let range_f = illuminate_range as f64;
-
-        let mut lights: Vec<Light> = Vec::new();
-        for i in 0..SPOTLIGHT_COUNT {
-            let start = Coord::new(
-                1 + ((i as i32 * 17 + 3) % canvas_right.max(1)),
-                1 + ((i as i32 * 11 + 5) % canvas_top.max(1)),
-            );
-            let mut waypoints = Vec::new();
-            let mut last = start;
-            for k in 0..10 {
-                let col = 1 + (((last.column + 13 + k as i32 * 7 + i as i32 * 5) % canvas_right.max(1)).abs());
-                let row = 1 + (((last.row + 9 + k as i32 * 11 + i as i32 * 3) % canvas_top.max(1)).abs());
-                let next = Coord::new(col.max(1).min(canvas_right.max(1)), row.max(1).min(canvas_top.max(1)));
-                waypoints.push(next);
-                last = next;
-            }
-            let speed = 0.35 + 0.40 * (i as f64 / (SPOTLIGHT_COUNT.max(1) as f64));
-            lights.push(Light {
-                pos: start,
-                waypoints,
-                wp_index: 0,
-                progress: 0.0,
-                speed,
-            });
-        }
-
-        for s in &snapshots {
-            if let Some(ch) = terminal.get_character_mut(s.id) {
-                ch.motion.current_coord = s.input;
-                ch.animation
-                    .set_appearance(&s.symbol, Some(ColorPair::fg(s.bright.adjust_brightness(DARK_FACTOR))));
-                ch.is_visible = true;
-            }
-        }
-
-        let mut frames: Vec<String> = Vec::new();
-
-        for _ in 0..SEARCH_DURATION {
-            for light in &mut lights {
-                if light.waypoints.is_empty() {
-                    continue;
-                }
-                let dest = light.waypoints[light.wp_index];
-                light.progress += light.speed * 0.15;
-                if light.progress >= 1.0 {
-                    light.pos = dest;
-                    light.progress = 0.0;
-                    light.wp_index = (light.wp_index + 1) % light.waypoints.len();
-                } else {
-                    let t = ease_in_out_quad(light.progress);
-                    light.pos = geometry::lerp_coord(light.pos, dest, t);
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height.max(8));
+        if term.get_characters().is_empty() {
+            for (row, line) in lines.iter().enumerate() {
+                for (col, ch) in line.chars().enumerate() {
+                    term.add_character(ch, Coord::new(col as i32, row as i32));
                 }
             }
-            paint_illumination(
-                &mut terminal,
-                &snapshots,
-                &lights,
-                range_f,
-                illuminate_range,
-            );
-            frames.push(terminal.render_frame());
         }
 
-        let start_pos: Vec<Coord> = lights.iter().map(|l| l.pos).collect();
-        for step in 0..CONVERGE_FRAMES {
-            let t = ease_in_out_sine((step + 1) as f64 / CONVERGE_FRAMES as f64);
-            for (i, light) in lights.iter_mut().enumerate() {
-                light.pos = geometry::lerp_coord(start_pos[i], center, t);
+        let beam = Gradient::new(
+            vec![
+                Color::rgb(0x10, 0x10, 0x18),
+                Color::rgb(0xff, 0xf4, 0xa3),
+                Color::rgb(0xff, 0xff, 0xff),
+            ],
+            8,
+        )
+        .colors();
+        let idle = Color::rgb(0x2a, 0x2a, 0x38);
+
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
+        }
+
+        // virtual spotlight wanderers
+        let mut spots: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+        let n_spots = 3usize;
+        for i in 0..n_spots {
+            let a = (i as f64) * std::f64::consts::TAU / n_spots as f64;
+            spots.push((
+                width as f64 * 0.5 + (width as f64 * 0.25) * a.cos(),
+                height as f64 * 0.5 + (height as f64 * 0.25) * a.sin(),
+                0.35 + i as f64 * 0.07,
+                a,
+                4.0 + i as f64,
+            ));
+        }
+
+        let mut frames = Vec::new();
+        let total = 90usize.max(ids.len() + 20);
+        for tick in 0..total {
+            for spot in &mut spots {
+                spot.3 += 0.08 + spot.2 * 0.02;
+                let tx = width as f64 * 0.5 + (width as f64 * 0.42) * spot.3.cos();
+                let ty = height as f64 * 0.5 + (height as f64 * 0.38) * (spot.3 * 1.3).sin();
+                spot.0 += (tx - spot.0) * 0.12;
+                spot.1 += (ty - spot.1) * 0.12;
             }
-            paint_illumination(
-                &mut terminal,
-                &snapshots,
-                &lights,
-                range_f,
-                illuminate_range,
-            );
-            frames.push(terminal.render_frame());
-        }
 
-        for step in 0..EXPAND_FRAMES {
-            let t = (step + 1) as f64 / EXPAND_FRAMES as f64;
-            let expand = range_f + t * (smallest as f64);
-            paint_illumination(&mut terminal, &snapshots, &lights, expand, expand as i32);
-            frames.push(terminal.render_frame());
-        }
-
-        for s in &snapshots {
-            if let Some(ch) = terminal.get_character_mut(s.id) {
-                ch.motion.current_coord = s.input;
-                ch.animation
-                    .set_appearance(&s.symbol, Some(ColorPair::fg(s.bright)));
-                ch.is_visible = true;
+            {
+                let chars = term.get_characters_mut();
+                for ch in chars.iter_mut() {
+                    let mut lit = 0.0f64;
+                    for spot in &spots {
+                        let d = ((ch.input_coord.column as f64 - spot.0).powi(2)
+                            + (ch.input_coord.row as f64 - spot.1).powi(2))
+                        .sqrt();
+                        let fall = (1.0 - (d / spot.4).min(1.0)).max(0.0);
+                        lit = lit.max(fall);
+                    }
+                    let idx = ((lit * (beam.len().saturating_sub(1) as f64)).round() as usize)
+                        .min(beam.len().saturating_sub(1));
+                    let color = if lit < 0.08 { idle } else { beam[idx] };
+                    let scn_id = format!("s{}", tick);
+                    {
+                        let scn = ch.animation.new_scene(scn_id.clone());
+                        scn.add_frame(
+                            ch.input_symbol,
+                            1,
+                            Some(ColorPair {
+                                fg: Some(color),
+                                bg: None,
+                            }),
+                        );
+                    }
+                    ch.animation.activate_scene(&scn_id);
+                    if tick == 0 {
+                        let p = ch.motion.new_path("hold");
+                        p.speed = 0.2;
+                        p.easing = Easing::InOutSine;
+                        p.new_waypoint("h", ch.input_coord);
+                        ch.motion.activate_path("hold");
+                    }
+                }
             }
+            term.step_all();
+            let raw = term.get_formatted_output_string();
+            frames.push(colorize_frame(&raw, &term, &beam, idle, &spots));
         }
-        for _ in 0..HOLD_FRAMES {
-            frames.push(terminal.render_frame());
-        }
-
         frames
     }
 }
 
-fn paint_illumination(
-    terminal: &mut Terminal,
-    snapshots: &[Snapshot],
-    lights: &[Light],
-    range_f: f64,
-    _range_i: i32,
-) {
-    let falloff_start = range_f * (1.0 - BEAM_FALLOFF);
-    for s in snapshots {
-        let mut min_d = f64::MAX;
-        for light in lights {
-            let d = geometry::find_length_of_line(light.pos, s.input);
-            if d < min_d {
-                min_d = d;
+fn colorize_frame(
+    raw: &str,
+    term: &Terminal,
+    beam: &[Color],
+    idle: Color,
+    spots: &[(f64, f64, f64, f64, f64)],
+) -> String {
+    let mut out = String::new();
+    for (y, line) in raw.lines().enumerate() {
+        for (x, ch) in line.chars().enumerate() {
+            if ch == ' ' {
+                out.push(' ');
+                continue;
             }
+            let mut lit = 0.0f64;
+            for spot in spots {
+                let d = ((x as f64 - spot.0).powi(2) + (y as f64 - spot.1).powi(2)).sqrt();
+                let fall = (1.0 - (d / spot.4).min(1.0)).max(0.0);
+                lit = lit.max(fall);
+            }
+            let idx = ((lit * (beam.len().saturating_sub(1) as f64)).round() as usize)
+                .min(beam.len().saturating_sub(1));
+            let c = if lit < 0.08 { idle } else { beam[idx] };
+            // prefer engine visual if present
+            let vis = term.get_characters().iter().find(|ec| {
+                ec.current_coord.column == x as i32 && ec.current_coord.row == y as i32
+            });
+            let col = vis
+                .and_then(|ec| {
+                    ec.animation
+                        .current_character_visual
+                        .colors
+                        .and_then(|p| p.fg)
+                })
+                .unwrap_or(c);
+            out.push_str(&format!(
+                "\x1b[38;2;{};{};{}m{}\x1b[0m",
+                col.r, col.g, col.b, ch
+            ));
         }
-        let color = if min_d <= falloff_start {
-            s.bright
-        } else if min_d >= range_f || BEAM_FALLOFF <= 0.0 {
-            s.bright.adjust_brightness(DARK_FACTOR.max(0.2))
-        } else {
-            let factor = (1.0 - (min_d - falloff_start) / (range_f * BEAM_FALLOFF)).max(0.2);
-            s.bright.adjust_brightness(factor)
-        };
-        if let Some(ch) = terminal.get_character_mut(s.id) {
-            ch.motion.current_coord = s.input;
-            ch.animation
-                .set_appearance(&s.symbol, Some(ColorPair::fg(color)));
-            ch.is_visible = true;
-        }
+        out.push('\n');
     }
+    out
 }

@@ -1,20 +1,9 @@
-use std::collections::VecDeque;
-
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{distance, find_coords_on_line, lerp_coord, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const LAUNCHER_SPEED: f64 = 0.5;
-const CHARACTER_SPEED: f64 = 1.0;
-const VOLLEY_SIZE: f64 = 0.03;
-const LAUNCH_DELAY: i32 = 3;
-const GRADIENT_STEPS: usize = 12;
-const TOP_LAUNCHER_SYMBOL: &str = "█";
-const BOTTOM_LAUNCHER_SYMBOL: &str = "█";
-const MAX_FRAMES: usize = 20_000;
 
 pub struct Orbittingvolley;
 
@@ -24,293 +13,174 @@ impl Orbittingvolley {
     }
 }
 
-impl Default for Orbittingvolley {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Effect for Orbittingvolley {
     fn name(&self) -> &str {
         "orbittingvolley"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
-        }
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height.max(1));
 
-        let stops = [
-            Color::rgb(0x8a, 0x00, 0x8a),
-            Color::rgb(0x00, 0xd1, 0xff),
-            Color::rgb(0xff, 0xff, 0xff),
+        let top = 0i32;
+        let bottom = (height.saturating_sub(1)) as i32;
+        let left = 0i32;
+        let right = (width.saturating_sub(1)) as i32;
+
+        let stops = vec![
+            Color::from_hex("ff6600").unwrap_or(Color::rgb(255, 102, 0)),
+            Color::from_hex("ffff00").unwrap_or(Color::rgb(255, 255, 0)),
+            Color::from_hex("00ff88").unwrap_or(Color::rgb(0, 255, 136)),
+            Color::from_hex("0088ff").unwrap_or(Color::rgb(0, 136, 255)),
+            Color::from_hex("ff00aa").unwrap_or(Color::rgb(255, 0, 170)),
         ];
-        let gradient = Gradient::new(&stops, GRADIENT_STEPS);
+        let gradient = Gradient::new(stops, 24.max(term.get_characters().len().max(1)));
+        let palette = gradient.colors();
 
-        let (text_bottom, text_top) = {
-            let chars = term.get_characters();
-            let bottom = chars.iter().map(|c| c.input_coord.row).min().unwrap_or(1);
-            let top = chars.iter().map(|c| c.input_coord.row).max().unwrap_or(1);
-            (bottom, top)
-        };
+        let perimeter = [
+            Coord::new(left, top),
+            Coord::new(right, top),
+            Coord::new(right, bottom),
+            Coord::new(left, bottom),
+        ];
 
-        for ch in term.get_characters_mut() {
-            let progress = if text_top == text_bottom {
-                1.0
-            } else {
-                f64::from(ch.input_coord.row - text_bottom)
-                    / f64::from(text_top - text_bottom)
-            };
-            let color = gradient
-                .mapped_color(progress)
-                .unwrap_or(Color::rgb(0xff, 0xff, 0xff));
-            let symbol = ch.input_symbol.clone();
-            ch.animation
-                .set_appearance(&symbol, Some(ColorPair::fg(color)));
-        }
-
-        let mut order: Vec<(i32, i32, CharacterId)> = term
-            .get_characters()
-            .iter()
-            .map(|c| (c.input_coord.row, c.input_coord.column, c.id))
-            .collect();
-        order.sort_unstable();
-
-        let mut top_mag: VecDeque<CharacterId> = VecDeque::new();
-        let mut bot_mag: VecDeque<CharacterId> = VecDeque::new();
-        for (i, &(_, _, id)) in order.iter().enumerate() {
-            if i % 2 == 0 {
-                top_mag.push_back(id);
-            } else {
-                bot_mag.push_back(id);
-            }
-        }
-
-        let top_start = Coord::new(term.canvas.left, term.canvas.top);
-        let bot_start = Coord::new(term.canvas.right, term.canvas.bottom);
-        let mut top = Launcher::new(
-            top_start,
-            perimeter_path(top_start, &term.canvas),
-            top_mag,
-            launcher_visual(TOP_LAUNCHER_SYMBOL),
-        );
-        let mut bot = Launcher::new(
-            bot_start,
-            perimeter_path(bot_start, &term.canvas),
-            bot_mag,
-            launcher_visual(BOTTOM_LAUNCHER_SYMBOL),
-        );
-
-        let n = term.character_count();
-        let volley = ((VOLLEY_SIZE * n as f64) as usize).max(1);
-        let mut flying: Vec<Flyer> = Vec::new();
-        let mut delay: i32 = 0;
-        let mut frames: Vec<String> = Vec::new();
-
-        for _ in 0..MAX_FRAMES {
-            let ammo = !top.magazine.is_empty() || !bot.magazine.is_empty();
-            let in_flight = flying.iter().any(|f| !f.done);
-            let launchers_moving = !top.finished() || !bot.finished();
-            if !ammo && !in_flight && !launchers_moving {
-                break;
-            }
-
-            if delay == 0 {
-                let top_origin = top.pos();
-                let bot_origin = bot.pos();
-                launch_from(&mut top.magazine, top_origin, volley, &mut term, &mut flying);
-                launch_from(&mut bot.magazine, bot_origin, volley, &mut term, &mut flying);
-                delay = LAUNCH_DELAY;
-            } else {
-                delay -= 1;
-            }
-
-            top.step();
-            bot.step();
-
-            for flyer in &mut flying {
-                if flyer.done {
-                    continue;
-                }
-                flyer.traveled += CHARACTER_SPEED;
-                let t = if flyer.total <= 0.0 {
-                    1.0
-                } else {
-                    (flyer.traveled / flyer.total).clamp(0.0, 1.0)
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let color = palette[i % palette.len()];
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let pair = ColorPair {
+                    fg: Some(color),
+                    bg: None,
                 };
-                let pos = lerp_coord(flyer.start, flyer.end, out_sine(t));
-                if let Some(ch) = term.get_character_mut(flyer.id) {
-                    ch.motion.current_coord = pos;
+                ch.colors = Some(pair);
+                let scn = ch.animation.new_scene("volley");
+                scn.add_frame(ch.input_symbol, 1, Some(pair));
+                ch.animation.activate_scene("volley");
+
+                let launch = perimeter[i % perimeter.len()];
+                ch.motion.current_coord = launch;
+                ch.current_coord = launch;
+
+                let path = ch.motion.new_path("input_path");
+                path.speed = 0.35 + ((i % 5) as f64) * 0.08;
+                path.easing = Easing::OutQuad;
+                path.new_waypoint("home", ch.input_coord);
+            }
+            term.set_character_visibility(*id, false);
+        }
+
+        // orbiting launchers (visual markers)
+        let launcher_ids: Vec<CharacterId> = perimeter
+            .iter()
+            .map(|&p| term.add_character('*', p))
+            .collect();
+        for (li, lid) in launcher_ids.iter().enumerate() {
+            let lc = Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255));
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *lid) {
+                let pair = ColorPair {
+                    fg: Some(lc),
+                    bg: None,
+                };
+                let scn = ch.animation.new_scene("orbit");
+                scn.is_looping = true;
+                scn.add_frame('*', 2, Some(pair));
+                scn.add_frame('+', 2, Some(pair));
+                ch.animation.activate_scene("orbit");
+                let path = ch.motion.new_path("perimeter");
+                path.speed = 0.2;
+                path.easing = Easing::Linear;
+                for (wi, wp) in perimeter.iter().cycle().skip(li).take(5).enumerate() {
+                    path.new_waypoint(format!("w{wi}"), *wp);
                 }
-                if t >= 1.0 {
-                    flyer.done = true;
+                ch.motion.activate_path("perimeter");
+            }
+            term.set_character_visibility(*lid, true);
+        }
+
+        let mut frames = Vec::new();
+        let mut launched = 0usize;
+        let mut tick = 0usize;
+        let total = ids.len();
+        let max_frames = 240 + total * 4;
+
+        while tick < max_frames {
+            if launched < total && tick % 3 == 0 {
+                let id = ids[launched];
+                term.set_character_visibility(id, true);
+                if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == id) {
+                    ch.motion.activate_path("input_path");
                 }
+                launched += 1;
             }
 
-            frames.push(paint_frame(&mut term, &top, &bot));
+            term.step_all();
+            frames.push(render_ansi(&term));
+
+            if launched >= total {
+                let all_home = ids.iter().all(|id| {
+                    term.get_characters()
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map(|c| c.current_coord == c.input_coord)
+                        .unwrap_or(false)
+                });
+                if all_home && tick > total * 3 + 8 {
+                    break;
+                }
+            }
+            tick += 1;
         }
 
         if frames.is_empty() {
-            term.show_all();
-            for ch in term.get_characters_mut() {
-                ch.motion.current_coord = ch.input_coord;
-            }
-            frames.push(term.render_frame());
+            frames.push(render_ansi(&term));
         }
-
         frames
     }
 }
 
-struct Launcher {
-    path: Vec<Coord>,
-    dist: f64,
-    magazine: VecDeque<CharacterId>,
-    visual: CharacterVisual,
-}
-
-impl Launcher {
-    fn new(
-        start: Coord,
-        path: Vec<Coord>,
-        magazine: VecDeque<CharacterId>,
-        visual: CharacterVisual,
-    ) -> Self {
-        let path = if path.is_empty() { vec![start] } else { path };
-        Self {
-            path,
-            dist: 0.0,
-            magazine,
-            visual,
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<ColorPair>)>> = vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+            let sym = ch.animation.current_character_visual.symbol;
+            let colors = ch
+                .animation
+                .current_character_visual
+                .colors
+                .or(ch.colors);
+            grid[y as usize][x as usize] = (sym, colors);
         }
     }
-
-    fn max_dist(&self) -> f64 {
-        self.path.len().saturating_sub(1) as f64
-    }
-
-    fn finished(&self) -> bool {
-        self.dist >= self.max_dist()
-    }
-
-    fn pos(&self) -> Coord {
-        if self.path.is_empty() {
-            return Coord::new(1, 1);
-        }
-        let max_idx = self.path.len() - 1;
-        let idx = (self.dist.floor() as usize).min(max_idx);
-        if idx >= max_idx {
-            return self.path[max_idx];
-        }
-        let frac = self.dist - idx as f64;
-        lerp_coord(self.path[idx], self.path[idx + 1], frac)
-    }
-
-    fn step(&mut self) {
-        let max_d = self.max_dist();
-        self.dist = (self.dist + LAUNCHER_SPEED).min(max_d);
-    }
-}
-
-struct Flyer {
-    id: CharacterId,
-    start: Coord,
-    end: Coord,
-    traveled: f64,
-    total: f64,
-    done: bool,
-}
-
-fn launch_from(
-    magazine: &mut VecDeque<CharacterId>,
-    origin: Coord,
-    count: usize,
-    term: &mut Terminal,
-    flying: &mut Vec<Flyer>,
-) {
-    for _ in 0..count {
-        let Some(id) = magazine.pop_front() else {
-            break;
-        };
-        let end = term
-            .get_character(id)
-            .map(|c| c.input_coord)
-            .unwrap_or(origin);
-        term.set_character_visibility(id, true);
-        if let Some(ch) = term.get_character_mut(id) {
-            ch.motion.current_coord = origin;
-        }
-        let total = distance(origin, end);
-        flying.push(Flyer {
-            id,
-            start: origin,
-            end,
-            traveled: 0.0,
-            total,
-            done: total == 0.0,
-        });
-    }
-}
-
-fn paint_frame(term: &mut Terminal, top: &Launcher, bot: &Launcher) -> String {
-    let mut draws: Vec<(Coord, CharacterVisual)> = term
-        .get_characters()
-        .iter()
-        .filter(|ch| ch.is_visible)
-        .map(|ch| {
-            let mut visual = ch.animation.current_character_visual.clone();
-            if visual.symbol.is_empty() {
-                visual.symbol = ch.input_symbol.clone();
-                visual.refresh();
+    let mut out = String::new();
+    for row in grid {
+        for (sym, colors) in row {
+            if let Some(cp) = colors {
+                if let Some(fg) = cp.fg {
+                    out.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+                }
+                if let Some(bg) = cp.bg {
+                    out.push_str(&format!("\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b));
+                }
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else if sym != ' ' {
+                out.push_str("\x1b[38;2;200;200;200m");
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push(' ');
             }
-            (ch.current_coord(), visual)
-        })
-        .collect();
-    draws.push((top.pos(), top.visual.clone()));
-    draws.push((bot.pos(), bot.visual.clone()));
-    term.canvas.clear();
-    for (coord, visual) in draws {
-        term.canvas.put(coord, visual);
-    }
-    term.canvas.render()
-}
-
-fn launcher_visual(symbol: &str) -> CharacterVisual {
-    let mut visual = CharacterVisual::new(symbol, None);
-    visual.colors = Some(ColorPair::fg(Color::rgb(0xff, 0xff, 0xff)));
-    visual.refresh();
-    visual
-}
-
-fn perimeter_path(start: Coord, canvas: &crate::engine::canvas::Canvas) -> Vec<Coord> {
-    let corners = [
-        Coord::new(canvas.right, canvas.top),
-        Coord::new(canvas.right, canvas.bottom),
-        Coord::new(canvas.left, canvas.bottom),
-        Coord::new(canvas.left, canvas.top),
-    ];
-    let start_idx = corners.iter().position(|&c| c == start).unwrap_or(0);
-    let mut waypoints = Vec::with_capacity(5);
-    for i in 0..4 {
-        waypoints.push(corners[(start_idx + i) % 4]);
-    }
-    waypoints.push(corners[start_idx]);
-
-    let mut path = Vec::new();
-    for pair in waypoints.windows(2) {
-        let mut line = find_coords_on_line(pair[0], pair[1]);
-        if !path.is_empty() && !line.is_empty() {
-            line.remove(0);
         }
-        path.extend(line);
+        out.push('\n');
     }
-    if path.is_empty() {
-        path.push(start);
-    }
-    path
-}
-
-fn out_sine(t: f64) -> f64 {
-    (t.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin()
+    out
 }

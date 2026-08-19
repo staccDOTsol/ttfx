@@ -1,29 +1,9 @@
-//! Characters are grouped into swarms and fly around the canvas before
-//! settling into their input positions. Port of TTE `effect_swarm`.
-
 use super::Effect;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{
-    find_coord_on_bezier_curve, find_coords_in_circle, find_length_of_bezier_curve, Coord,
-};
+use crate::engine::character::CharacterId;
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-use crate::utils::round_half_even;
-
-const SWARM_SIZE_RATIO: f64 = 0.1;
-const SWARM_COORDINATION: f64 = 0.80;
-const AREA_COUNT_MIN: i32 = 2;
-const AREA_COUNT_MAX: i32 = 4;
-const FLIGHT_SPEED: f64 = 0.25;
-const FADE_HOLD: u32 = 10;
-const FADE_STEPS: usize = 10;
-const SWARM_GRAD_STEPS: usize = 7;
-const FINAL_GRAD_STEPS: usize = 12;
-const MAX_FRAMES: usize = 20_000;
-
-const FLASH: Color = Color { r: 255, g: 255, b: 255 };
-const BASE: Color = Color { r: 0x44, g: 0xaa, b: 0xee };
-const FINAL_STOP_A: Color = Color { r: 0x44, g: 0xaa, b: 0xee };
-const FINAL_STOP_B: Color = Color { r: 0x00, g: 0x00, b: 0xff };
 
 pub struct Swarm;
 
@@ -33,405 +13,212 @@ impl Swarm {
     }
 }
 
-impl Default for Swarm {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Effect for Swarm {
     fn name(&self) -> &str {
         "swarm"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        term.hide_all();
+        let width = input
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = input.lines().count().max(1);
+        let mut term = Terminal::from_input(input, width, height);
 
-        let n = term.character_count();
-        if n == 0 {
-            return vec![term.render_frame()];
+        let swarm_stops = vec![
+            Color::from_hex("e81416").unwrap_or(Color::rgb(232, 20, 22)),
+            Color::from_hex("ffa500").unwrap_or(Color::rgb(255, 165, 0)),
+            Color::from_hex("faeb36").unwrap_or(Color::rgb(250, 235, 54)),
+            Color::from_hex("79c314").unwrap_or(Color::rgb(121, 195, 20)),
+            Color::from_hex("487de7").unwrap_or(Color::rgb(72, 125, 231)),
+            Color::from_hex("4b369d").unwrap_or(Color::rgb(75, 54, 157)),
+            Color::from_hex("70369d").unwrap_or(Color::rgb(112, 54, 157)),
+        ];
+        let swarm_grad = Gradient::new(swarm_stops, 24);
+        let swarm_colors = swarm_grad.colors();
+        let final_grad = Gradient::new(
+            vec![
+                Color::from_hex("8A008A").unwrap_or(Color::rgb(138, 0, 138)),
+                Color::from_hex("00D1D1").unwrap_or(Color::rgb(0, 209, 209)),
+            ],
+            12,
+        );
+        let final_colors = final_grad.colors();
+
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return vec![term.get_formatted_output_string()];
         }
 
-        let canvas_left = term.canvas.left;
-        let canvas_right = term.canvas.right;
-        let canvas_top = term.canvas.top;
-        let canvas_bottom = term.canvas.bottom;
-        let canvas_center = term.canvas.center();
+        let cx = (width as i32) / 2;
+        let cy = (height as i32) / 2;
+        let n = ids.len();
 
-        let snaps: Vec<Snap> = term
-            .get_characters()
-            .iter()
-            .map(|ch| Snap {
-                symbol: ch.input_symbol.clone(),
-                home: ch.input_coord,
-            })
-            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let sc = swarm_colors[i % swarm_colors.len()];
+                let fc = final_colors[i % final_colors.len()];
+                let theta = (i as f64) * std::f64::consts::TAU / (n as f64).max(1.0);
+                let r = 2 + ((i as i32) % 5);
+                let start = Coord::new(
+                    cx + (r as f64 * theta.cos()).round() as i32,
+                    cy + (r as f64 * theta.sin()).round() as i32,
+                );
+                ch.motion.current_coord = start;
+                ch.current_coord = start;
 
-        let text_left = snaps.iter().map(|s| s.home.column).min().unwrap_or(canvas_left);
-        let text_right = snaps.iter().map(|s| s.home.column).max().unwrap_or(canvas_right);
-
-        let final_gradient = Gradient::new(&[FINAL_STOP_A, FINAL_STOP_B], FINAL_GRAD_STEPS);
-
-        let mut rng = Rng::from_input(input);
-        let swarm_size = round_half_even(n as f64 * SWARM_SIZE_RATIO).max(1) as usize;
-
-        let mut unswarmed: Vec<usize> = (0..n).rev().collect();
-        let mut swarms: Vec<Vec<usize>> = Vec::new();
-        while !unswarmed.is_empty() {
-            let mut swarm = Vec::new();
-            for _ in 0..swarm_size {
-                if unswarmed.is_empty() {
-                    break;
-                }
-                let pick = rng.index(unswarmed.len());
-                swarm.push(unswarmed.remove(pick));
-            }
-            swarms.push(swarm);
-        }
-
-        let mut flyers: Vec<Flyer> = snaps
-            .iter()
-            .map(|s| {
-                let final_color = map_horizontal(&final_gradient, s.home.column, text_left, text_right);
-                Flyer::placeholder(s.symbol.clone(), s.home, final_color)
-            })
-            .collect();
-
-        for swarm in &swarms {
-            let spawn = random_outside(
-                &mut rng,
-                canvas_left,
-                canvas_right,
-                canvas_top,
-                canvas_bottom,
-            );
-            let area_count = rng.inclusive(AREA_COUNT_MIN, AREA_COUNT_MAX) as usize;
-            let mut areas = Vec::with_capacity(area_count);
-            for _ in 0..area_count {
-                areas.push(random_area(
-                    &mut rng,
-                    canvas_center,
-                    canvas_right,
-                ));
-            }
-            let swarm_grad = Gradient::new(&[FLASH, BASE], SWARM_GRAD_STEPS);
-            for &idx in swarm {
-                let home = flyers[idx].home;
-                let wander = rng.unit() > SWARM_COORDINATION;
-                let mut points = Vec::new();
-                let mut controls = Vec::new();
-                if wander {
-                    for _ in 0..areas.len() {
-                        points.push(random_inside(
-                            &mut rng,
-                            canvas_left,
-                            canvas_right,
-                            canvas_top,
-                            canvas_bottom,
-                        ));
-                        controls.push(random_inside(
-                            &mut rng,
-                            canvas_left,
-                            canvas_right,
-                            canvas_top,
-                            canvas_bottom,
-                        ));
-                    }
-                } else {
-                    for &area in &areas {
-                        points.push(area);
-                        controls.push(random_inside(
-                            &mut rng,
-                            canvas_left,
-                            canvas_right,
-                            canvas_top,
-                            canvas_bottom,
-                        ));
+                {
+                    let scn = ch.animation.new_scene("swarm");
+                    scn.is_looping = true;
+                    for c in &swarm_colors {
+                        scn.add_frame(
+                            ch.input_symbol,
+                            2,
+                            Some(ColorPair {
+                                fg: Some(*c),
+                                bg: None,
+                            }),
+                        );
                     }
                 }
-                points.push(home);
-                controls.push(random_inside(
-                    &mut rng,
-                    canvas_left,
-                    canvas_right,
-                    canvas_top,
-                    canvas_bottom,
-                ));
-                flyers[idx].configure(spawn, points, controls, swarm_grad.clone());
+                {
+                    let scn = ch.animation.new_scene("final");
+                    scn.add_frame(
+                        ch.input_symbol,
+                        8,
+                        Some(ColorPair {
+                            fg: Some(fc),
+                            bg: None,
+                        }),
+                    );
+                    scn.add_frame(
+                        ch.input_symbol,
+                        1,
+                        Some(ColorPair {
+                            fg: Some(sc),
+                            bg: None,
+                        }),
+                    );
+                }
+                ch.animation.activate_scene("swarm");
+                {
+                    let p = ch.motion.new_path("cluster");
+                    p.speed = 0.35;
+                    p.easing = Easing::InOutSine;
+                    p.new_waypoint("c", Coord::new(cx, cy));
+                }
+                {
+                    let p = ch.motion.new_path("home");
+                    p.speed = 0.25;
+                    p.easing = Easing::OutCubic;
+                    p.new_waypoint("h", ch.input_coord);
+                }
+                ch.motion.activate_path("cluster");
             }
+            term.set_character_visibility(*id, true);
         }
 
         let mut frames = Vec::new();
-        let mut next_swarm = 0usize;
+        let cluster_frames = 40 + n.min(40);
+        let home_frames = 50 + n.min(60);
 
-        loop {
-            if frames.len() >= MAX_FRAMES {
-                break;
-            }
-            let any_busy = flyers
-                .iter()
-                .any(|f| matches!(f.phase, Phase::Flying | Phase::Fading));
-            if !any_busy {
-                if next_swarm >= swarms.len() {
-                    break;
-                }
-                for &idx in &swarms[next_swarm] {
-                    flyers[idx].launch();
-                }
-                next_swarm += 1;
-            }
-
-            let mut poses: Vec<(Coord, Color, bool)> = Vec::with_capacity(flyers.len());
-            for flyer in flyers.iter_mut() {
-                if flyer.phase == Phase::Waiting {
-                    poses.push((flyer.spawn, FLASH, false));
-                } else {
-                    let (pos, color) = flyer.advance();
-                    poses.push((pos, color, true));
-                }
-            }
-
-            {
-                let chars = term.get_characters_mut();
-                for (ch, (pos, color, visible)) in chars.iter_mut().zip(poses.iter()) {
-                    ch.is_visible = *visible;
-                    if *visible {
-                        ch.motion.current_coord = *pos;
-                        ch.animation
-                            .set_appearance(&ch.input_symbol, Some(ColorPair::fg(*color)));
+        for t in 0..cluster_frames {
+            if t == cluster_frames / 3 {
+                for id in &ids {
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                        let jitter = Coord::new(
+                            cx + (((id.0 as i32) % 7) - 3),
+                            cy + ((((id.0 as i32) / 3) % 5) - 2),
+                        );
+                        if let Some(p) = ch.motion.new_path("buzz").waypoints.first() {
+                            let _ = p;
+                        }
+                        let p = ch.motion.new_path(format!("buzz{t}"));
+                        p.speed = 0.5;
+                        p.easing = Easing::InOutQuad;
+                        p.new_waypoint("j", jitter);
+                        let pid = p.id.clone();
+                        ch.motion.activate_path(&pid);
                     }
                 }
             }
-            frames.push(term.render_frame());
+            term.step_all();
+            frames.push(render_ansi(&term));
         }
 
-        if frames.is_empty() {
-            term.show_all();
-            frames.push(term.render_frame());
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                ch.animation.activate_scene("final");
+                ch.motion.activate_path("home");
+            }
+            if i % 3 == 0 {
+                term.step_all();
+                frames.push(render_ansi(&term));
+            }
+        }
+
+        for _ in 0..home_frames {
+            term.step_all();
+            frames.push(render_ansi(&term));
+        }
+
+        // settle on input coords with final colors
+        for ch in term.get_characters_mut() {
+            ch.current_coord = ch.input_coord;
+            ch.motion.current_coord = ch.input_coord;
+            ch.animation.activate_scene("final");
+        }
+        for _ in 0..8 {
+            term.step_all();
+            for ch in term.get_characters_mut() {
+                ch.current_coord = ch.input_coord;
+            }
+            frames.push(render_ansi(&term));
         }
         frames
     }
 }
 
-struct Snap {
-    symbol: String,
-    home: Coord,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Waiting,
-    Flying,
-    Fading,
-    Done,
-}
-
-struct Flyer {
-    home: Coord,
-    spawn: Coord,
-    points: Vec<Coord>,
-    controls: Vec<Coord>,
-    seg: usize,
-    t: f64,
-    final_color: Color,
-    swarm_grad: Gradient,
-    fade_grad: Gradient,
-    fade_tick: u32,
-    phase: Phase,
-}
-
-impl Flyer {
-    fn placeholder(symbol: String, home: Coord, final_color: Color) -> Self {
-        let _ = symbol;
-        let swarm_grad = Gradient::new(&[FLASH, BASE], SWARM_GRAD_STEPS);
-        let fade_grad = Gradient::new(&[BASE, final_color], FADE_STEPS);
-        Self {
-            home,
-            spawn: home,
-            points: vec![home],
-            controls: vec![home],
-            seg: 0,
-            t: 0.0,
-            final_color,
-            swarm_grad,
-            fade_grad,
-            fade_tick: 0,
-            phase: Phase::Waiting,
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<ColorPair>)>> =
+        vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+            let vis = &ch.animation.current_character_visual;
+            grid[y as usize][x as usize] = (vis.symbol, vis.colors);
         }
     }
-
-    fn configure(
-        &mut self,
-        spawn: Coord,
-        points: Vec<Coord>,
-        controls: Vec<Coord>,
-        swarm_grad: Gradient,
-    ) {
-        let last_swarm = swarm_grad
-            .get(swarm_grad.len().saturating_sub(1))
-            .unwrap_or(BASE);
-        self.fade_grad = Gradient::new(&[last_swarm, self.final_color], FADE_STEPS);
-        self.spawn = spawn;
-        self.points = points;
-        self.controls = controls;
-        self.swarm_grad = swarm_grad;
-    }
-
-    fn launch(&mut self) {
-        self.phase = Phase::Flying;
-        self.seg = 0;
-        self.t = 0.0;
-        self.fade_tick = 0;
-    }
-
-    fn advance(&mut self) -> (Coord, Color) {
-        match self.phase {
-            Phase::Waiting => (self.spawn, FLASH),
-            Phase::Flying => self.advance_flight(),
-            Phase::Fading => self.advance_fade(),
-            Phase::Done => (self.home, self.final_color),
-        }
-    }
-
-    fn advance_flight(&mut self) -> (Coord, Color) {
-        if self.seg >= self.points.len() {
-            self.phase = Phase::Fading;
-            self.fade_tick = 0;
-            return self.advance_fade();
-        }
-        let start = if self.seg == 0 {
-            self.spawn
-        } else {
-            self.points[self.seg - 1]
-        };
-        let end = self.points[self.seg];
-        let control = self
-            .controls
-            .get(self.seg)
-            .copied()
-            .unwrap_or(end);
-        let len = find_length_of_bezier_curve(start, control, end);
-        if len < 0.0001 {
-            self.seg += 1;
-            self.t = 0.0;
-            return self.flight_sample(end);
-        }
-        self.t += FLIGHT_SPEED / len;
-        if self.t >= 1.0 {
-            self.seg += 1;
-            self.t = 0.0;
-            if self.seg >= self.points.len() {
-                self.phase = Phase::Fading;
-                self.fade_tick = 0;
-                return self.advance_fade();
+    let mut out = String::new();
+    for row in grid {
+        for (sym, colors) in row {
+            if let Some(cp) = colors {
+                if let Some(fg) = cp.fg {
+                    out.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+                }
+                if let Some(bg) = cp.bg {
+                    out.push_str(&format!("\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b));
+                }
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else if sym != ' ' {
+                out.push_str("\x1b[38;2;138;43;226m");
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push(' ');
             }
-            return self.flight_sample(end);
         }
-        let eased = in_out_sine(self.t);
-        let pos = find_coord_on_bezier_curve(start, control, end, eased);
-        self.flight_sample(pos)
+        out.push('\n');
     }
-
-    fn flight_sample(&self, pos: Coord) -> (Coord, Color) {
-        let segs = self.points.len().max(1) as f64;
-        let progress = ((self.seg as f64) + self.t.clamp(0.0, 1.0)) / segs;
-        let color = self
-            .swarm_grad
-            .mapped_color(progress.clamp(0.0, 1.0))
-            .unwrap_or(FLASH);
-        (pos, color)
-    }
-
-    fn advance_fade(&mut self) -> (Coord, Color) {
-        let idx = (self.fade_tick / FADE_HOLD) as usize;
-        self.fade_tick = self.fade_tick.saturating_add(1);
-        if idx >= self.fade_grad.len() {
-            self.phase = Phase::Done;
-            return (self.home, self.final_color);
-        }
-        let color = self.fade_grad.get(idx).unwrap_or(self.final_color);
-        (self.home, color)
-    }
-}
-
-fn in_out_sine(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    -((t * std::f64::consts::PI).cos() - 1.0) / 2.0
-}
-
-fn map_horizontal(grad: &Gradient, column: i32, left: i32, right: i32) -> Color {
-    if right <= left {
-        return grad.mapped_color(0.0).unwrap_or(FINAL_STOP_A);
-    }
-    let t = f64::from(column - left) / f64::from(right - left);
-    grad.mapped_color(t).unwrap_or(FINAL_STOP_A)
-}
-
-fn random_inside(rng: &mut Rng, left: i32, right: i32, top: i32, bottom: i32) -> Coord {
-    Coord::new(rng.inclusive(left, right), rng.inclusive(bottom, top))
-}
-
-fn random_outside(rng: &mut Rng, left: i32, right: i32, top: i32, bottom: i32) -> Coord {
-    match rng.inclusive(0, 3) {
-        0 => Coord::new(rng.inclusive(left, right), top + 1),
-        1 => Coord::new(rng.inclusive(left, right), bottom - 1),
-        2 => Coord::new(left - 1, rng.inclusive(bottom, top)),
-        _ => Coord::new(right + 1, rng.inclusive(bottom, top)),
-    }
-}
-
-fn random_area(rng: &mut Rng, center: Coord, canvas_right: i32) -> Coord {
-    let inner = (canvas_right / 2).min(4).max(0);
-    let outer = canvas_right.min(10).max(inner);
-    let radius = rng.inclusive(inner, outer) as f64;
-    let coords = find_coords_in_circle(center, radius);
-    if coords.is_empty() {
-        center
-    } else {
-        coords[rng.index(coords.len())]
-    }
-}
-
-struct Rng {
-    state: u64,
-}
-
-impl Rng {
-    fn from_input(input: &str) -> Self {
-        let mut seed: u64 = 0x7377_6172_6d5f_7474;
-        for b in input.bytes() {
-            seed = seed.wrapping_mul(131).wrapping_add(u64::from(b));
-        }
-        Self { state: seed | 1 }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        (x >> 32) as u32
-    }
-
-    fn unit(&mut self) -> f64 {
-        f64::from(self.next_u32()) / f64::from(u32::MAX)
-    }
-
-    fn inclusive(&mut self, lo: i32, hi: i32) -> i32 {
-        if hi <= lo {
-            return lo;
-        }
-        let span = (i64::from(hi) - i64::from(lo) + 1) as u32;
-        lo.saturating_add((self.next_u32() % span) as i32)
-    }
-
-    fn index(&mut self, len: usize) -> usize {
-        if len <= 1 {
-            0
-        } else {
-            (self.next_u32() as usize) % len
-        }
-    }
+    out
 }

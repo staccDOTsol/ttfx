@@ -1,21 +1,6 @@
-//! Burn effect — characters ignite from the bottom of each column,
-//! heat through the fire palette, wipe back down, then fade into
-//! the final vertical gradient. Mirrors terminaltexteffects `effect_burn`.
-
-use std::collections::BTreeMap;
-
 use super::Effect;
-use crate::engine::terminal::{Terminal, TerminalConfig};
+use crate::engine::terminal::Terminal;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const STARTING_HEX: &str = "837373";
-const BURN_HEX: [&str; 5] = ["ffffff", "fff75d", "fe650d", "8a003c", "510100"];
-const FINAL_HEX: [&str; 3] = ["8A003C", "00D1FF", "FFFFFF"];
-const FIRE_STEPS: usize = 10;
-const FADE_STEPS: usize = 8;
-const HEAT_HOLD: u32 = 20;
-const WIPE_HOLD: u32 = 5;
-const FADE_HOLD: u32 = 12;
 
 pub struct Burn;
 
@@ -25,10 +10,8 @@ impl Burn {
     }
 }
 
-impl Default for Burn {
-    fn default() -> Self {
-        Self::new()
-    }
+fn sgr(c: Color) -> String {
+    format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b)
 }
 
 impl Effect for Burn {
@@ -37,172 +20,101 @@ impl Effect for Burn {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_input(input, TerminalConfig::default());
-        let count = terminal.character_count();
-        if count == 0 {
-            return vec![terminal.render_frame()];
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height);
+
+        let flame = Gradient::new(
+            vec![
+                Color::rgb(0xff, 0xf7, 0xa1),
+                Color::rgb(0xff, 0xc1, 0x07),
+                Color::rgb(0xff, 0x6d, 0x00),
+                Color::rgb(0xd5, 0x00, 0x00),
+                Color::rgb(0x21, 0x21, 0x21),
+            ],
+            12,
+        );
+        let palette = flame.colors();
+        let ember = Color::rgb(0x42, 0x42, 0x42);
+
+        let ids: Vec<_> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
         }
 
-        let starting = hex(STARTING_HEX);
-        let fire_stops: Vec<Color> = BURN_HEX.iter().copied().map(hex).collect();
-        let fire = Gradient::new(&fire_stops, FIRE_STEPS);
-        let fire_spectrum: Vec<Color> = fire.spectrum().to_vec();
+        let burn_syms = ['#', '*', '+', '.', ' '];
+        let mut out = Vec::new();
+        let waves = (height + palette.len() + 4).max(16);
 
-        let final_stops: Vec<Color> = FINAL_HEX.iter().copied().map(hex).collect();
-        let final_gradient = Gradient::new(&final_stops, 12);
+        for wave in 0..waves {
+            term.step_all();
+            let mut frame = String::new();
+            let chars: Vec<_> = term
+                .get_characters()
+                .iter()
+                .map(|c| (c.id, c.input_coord, c.input_symbol, c.current_coord))
+                .collect();
 
-        let (bottom, top) = text_row_bounds(&terminal);
+            let mut grid: Vec<Vec<char>> = vec![vec![' '; width]; height];
+            let mut color_grid: Vec<Vec<Option<Color>>> = vec![vec![None; width]; height];
 
-        let final_colors: Vec<Color> = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| {
-                let progress = vertical_progress(ch.input_coord.row, bottom, top);
-                final_gradient.mapped_color(progress).unwrap_or(starting)
-            })
-            .collect();
-
-        let timelines: Vec<Vec<(Color, u32)>> = final_colors
-            .iter()
-            .map(|color| burn_timeline(&fire_spectrum, *color))
-            .collect();
-
-        terminal.show_all();
-        for index in 0..count {
-            paint(&mut terminal, index, starting);
-        }
-
-        let pending = column_pending(&terminal);
-        let mut next_pending = 0usize;
-        let mut active: Vec<ActiveBurn> = Vec::new();
-        let mut frames = Vec::new();
-
-        loop {
-            if next_pending < pending.len() {
-                let index = pending[next_pending];
-                next_pending += 1;
-                if let Some(&(color, hold)) = timelines[index].first() {
-                    paint(&mut terminal, index, color);
-                    active.push(ActiveBurn {
-                        index,
-                        stage: 0,
-                        remaining: hold,
-                    });
+            for (_id, input, symbol, _cur) in &chars {
+                let col = input.column as usize;
+                let row = input.row as usize;
+                if row >= height || col >= width {
+                    continue;
                 }
-            }
-
-            frames.push(terminal.render_frame());
-
-            let mut still = Vec::with_capacity(active.len());
-            for mut burner in active.drain(..) {
-                if burner.remaining > 0 {
-                    burner.remaining -= 1;
-                }
-                if burner.remaining == 0 {
-                    burner.stage += 1;
-                    if let Some(&(color, hold)) = timelines[burner.index].get(burner.stage) {
-                        paint(&mut terminal, burner.index, color);
-                        burner.remaining = hold;
-                        still.push(burner);
+                let progress = wave as i32 - (height as i32 - 1 - input.row);
+                if progress < 0 {
+                    grid[row][col] = *symbol;
+                    color_grid[row][col] = Some(palette[0]);
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *_id) {
+                        ch.animation.set_appearance(*symbol, Some(palette[0]));
+                        ch.colors = Some(ColorPair {
+                            fg: Some(palette[0]),
+                            bg: None,
+                        });
                     }
                 } else {
-                    still.push(burner);
+                    let idx = (progress as usize).min(palette.len().saturating_sub(1));
+                    let color = if idx + 1 >= palette.len() {
+                        ember
+                    } else {
+                        palette[idx]
+                    };
+                    let si = (progress as usize).min(burn_syms.len() - 1);
+                    let sym = if si + 1 >= burn_syms.len() {
+                        ' '
+                    } else {
+                        burn_syms[si]
+                    };
+                    grid[row][col] = if sym == ' ' { ' ' } else { if si == 0 { *symbol } else { sym } };
+                    color_grid[row][col] = Some(color);
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *_id) {
+                        ch.animation.set_appearance(grid[row][col], Some(color));
+                        ch.colors = Some(ColorPair {
+                            fg: Some(color),
+                            bg: None,
+                        });
+                    }
                 }
             }
-            active = still;
 
-            if next_pending >= pending.len() && active.is_empty() {
-                break;
+            for y in 0..height {
+                for x in 0..width {
+                    if let Some(c) = color_grid[y][x] {
+                        frame.push_str(&sgr(c));
+                        frame.push(grid[y][x]);
+                        frame.push_str("\x1b[0m");
+                    } else {
+                        frame.push(' ');
+                    }
+                }
+                frame.push('\n');
             }
+            out.push(frame);
         }
-
-        frames
+        out
     }
-}
-
-struct ActiveBurn {
-    index: usize,
-    stage: usize,
-    remaining: u32,
-}
-
-fn hex(value: &str) -> Color {
-    Color::from_hex(value).unwrap_or(Color::rgb(255, 255, 255))
-}
-
-fn paint(terminal: &mut Terminal, index: usize, color: Color) {
-    let symbol = terminal
-        .get_characters()
-        .get(index)
-        .map(|ch| ch.input_symbol.clone())
-        .unwrap_or_else(|| " ".to_string());
-    if let Some(ch) = terminal.get_characters_mut().get_mut(index) {
-        ch.animation
-            .set_appearance(&symbol, Some(ColorPair::fg(color)));
-    }
-}
-
-fn text_row_bounds(terminal: &Terminal) -> (i32, i32) {
-    let mut bottom = i32::MAX;
-    let mut top = i32::MIN;
-    for ch in terminal.get_characters() {
-        bottom = bottom.min(ch.input_coord.row);
-        top = top.max(ch.input_coord.row);
-    }
-    if bottom > top {
-        (0, 0)
-    } else {
-        (bottom, top)
-    }
-}
-
-fn vertical_progress(row: i32, bottom: i32, top: i32) -> f64 {
-    let span = top - bottom;
-    if span == 0 {
-        0.0
-    } else {
-        f64::from(row - bottom) / f64::from(span)
-    }
-}
-
-fn column_pending(terminal: &Terminal) -> Vec<usize> {
-    let mut columns: BTreeMap<i32, Vec<(i32, usize)>> = BTreeMap::new();
-    for (index, ch) in terminal.get_characters().iter().enumerate() {
-        columns
-            .entry(ch.input_coord.column)
-            .or_default()
-            .push((ch.input_coord.row, index));
-    }
-    let mut pending = Vec::new();
-    for mut group in columns.into_values() {
-        // COLUMN_LEFT_TO_RIGHT is top-first, then the effect reverses each
-        // column so ignition starts at the bottom (lowest row) and climbs.
-        group.sort_by_key(|(row, _)| *row);
-        pending.extend(group.into_iter().map(|(_, index)| index));
-    }
-    pending
-}
-
-fn burn_timeline(fire: &[Color], final_color: Color) -> Vec<(Color, u32)> {
-    let mut timeline = Vec::new();
-    if fire.is_empty() {
-        timeline.push((final_color, FADE_HOLD));
-        return timeline;
-    }
-    for &color in fire.iter().rev() {
-        timeline.push((color, HEAT_HOLD));
-    }
-    for &color in fire {
-        timeline.push((color, WIPE_HOLD));
-    }
-    let last_fire = *fire.last().unwrap_or(&final_color);
-    let fade = Gradient::new(&[last_fire, final_color], FADE_STEPS);
-    if fade.is_empty() {
-        timeline.push((final_color, FADE_HOLD));
-    } else {
-        for &color in fade.spectrum() {
-            timeline.push((color, FADE_HOLD));
-        }
-    }
-    timeline
 }

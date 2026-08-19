@@ -1,49 +1,21 @@
-//! Highlight effect — sweep a beam across the text and leave matches lit.
-//!
-//! Port of `terminaltexteffects/effects/effect_highlight.py`.
-//!
-//! Default config (empty pattern) treats every character as a match:
-//! all characters start visible in a muted tone, a gold beam travels
-//! left-to-right one column per frame, and each character flashes the
-//! highlight color before settling on the match color.
-
-use std::collections::HashMap;
-
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::graphics::{Color, ColorPair};
+use crate::engine::terminal::Terminal;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Color of the beam that highlights the text (`--highlight-color ffcb6b`).
-const HIGHLIGHT_COLOR: Color = Color {
-    r: 0xff,
-    g: 0xcb,
-    b: 0x6b,
-};
-
-/// Color of matched characters after the beam has passed (`--match-color 89ddff`).
-const MATCH_COLOR: Color = Color {
-    r: 0x89,
-    g: 0xdd,
-    b: 0xff,
-};
-
-/// Muted tone used before the beam reaches a character.
-const UNREAD_COLOR: Color = Color {
-    r: 0x6c,
-    g: 0x70,
-    b: 0x86,
-};
-
-/// Frames each character stays on the highlight color (Python scene duration).
-const HIGHLIGHT_FRAMES: usize = 5;
-
-/// Search the input and highlight every character with a sweeping beam.
-pub struct Highlight;
+pub struct Highlight {
+    highlight_color: Color,
+    final_color: Color,
+    sweep_steps: usize,
+}
 
 impl Highlight {
     pub fn new() -> Self {
-        Self
+        Self {
+            highlight_color: Color::from_hex("ffff00").unwrap_or(Color::rgb(255, 255, 0)),
+            final_color: Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+            sweep_steps: 8,
+        }
     }
 }
 
@@ -59,106 +31,117 @@ impl Effect for Highlight {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
+        let width = input
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = input.lines().count().max(1);
+        let mut term = Terminal::from_input(input, width, height);
+
+        let highlight_grad = Gradient::new(
+            vec![
+                Color::rgb(40, 40, 40),
+                self.highlight_color,
+                self.final_color,
+            ],
+            self.sweep_steps,
+        );
+        let grad_colors = highlight_grad.colors();
+
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
         }
 
-        term.show_all();
-        paint_all(&mut term, UNREAD_COLOR);
+        for ch in term.get_characters_mut() {
+            let scn = ch.animation.new_scene("highlight");
+            for c in &grad_colors {
+                scn.add_frame(
+                    ch.input_symbol,
+                    2,
+                    Some(ColorPair {
+                        fg: Some(*c),
+                        bg: None,
+                    }),
+                );
+            }
+            scn.add_frame(
+                ch.input_symbol,
+                4,
+                Some(ColorPair {
+                    fg: Some(self.final_color),
+                    bg: None,
+                }),
+            );
+        }
 
         let mut frames = Vec::new();
-        frames.push(term.render_frame());
-
-        // Column groups, left-to-right; within a column, top-to-bottom
-        // (Python sort key is `(column, -row)`).
-        let mut placed: Vec<(i32, i32, CharacterId)> = term
-            .get_characters()
-            .iter()
-            .map(|ch| (ch.input_coord.column, ch.input_coord.row, ch.id))
-            .collect();
-        placed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-
-        let mut groups: Vec<Vec<CharacterId>> = Vec::new();
-        for (column, _row, id) in placed {
-            match groups.last_mut() {
-                Some(group) if last_column_of(&term, group) == Some(column) => {
-                    group.push(id);
-                }
-                _ => groups.push(vec![id]),
-            }
+        let n = ids.len();
+        if n == 0 {
+            return vec![term.get_formatted_output_string()];
         }
 
-        // Remaining highlight frames per character. `0` means settled on match.
-        let mut remaining: HashMap<CharacterId, usize> = HashMap::new();
-        let mut group_idx = 0usize;
+        let mut activated = vec![false; n];
+        let mut lead: i32 = -2;
+        let total_ticks = (n as i32) + (grad_colors.len() as i32 * 3) + 6;
 
-        loop {
-            let activating = group_idx < groups.len();
-            let beam_live = remaining.values().any(|&left| left > 0);
-            if !activating && !beam_live {
-                break;
-            }
-
-            if activating {
-                for &id in &groups[group_idx] {
-                    remaining.insert(id, HIGHLIGHT_FRAMES);
-                }
-                group_idx += 1;
-            }
-
-            for ch in term.get_characters_mut() {
-                let color = match remaining.get(&ch.id).copied() {
-                    Some(left) if left > 0 => HIGHLIGHT_COLOR,
-                    Some(_) => MATCH_COLOR,
-                    None => continue,
-                };
-                let symbol = ch.input_symbol.clone();
-                ch.animation
-                    .set_appearance(&symbol, Some(ColorPair::fg(color)));
-            }
-            frames.push(term.render_frame());
-
-            for left in remaining.values_mut() {
-                if *left > 0 {
-                    *left -= 1;
+        for _ in 0..total_ticks {
+            lead += 1;
+            for (i, id) in ids.iter().enumerate() {
+                if (i as i32) <= lead && !activated[i] {
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                        ch.animation.activate_scene("highlight");
+                    }
+                    activated[i] = true;
                 }
             }
+            term.step_all();
+            frames.push(render_ansi(&term));
         }
-
-        // Ensure the settled match color is on screen for the last column.
-        paint_ids(&mut term, remaining.keys().copied(), MATCH_COLOR);
-        frames.push(term.render_frame());
-
         frames
     }
 }
 
-fn last_column_of(term: &Terminal, group: &[CharacterId]) -> Option<i32> {
-    group
-        .last()
-        .copied()
-        .and_then(|id| term.get_character(id).map(|ch| ch.input_coord.column))
-}
-
-fn paint_all(term: &mut Terminal, color: Color) {
-    for ch in term.get_characters_mut() {
-        let symbol = ch.input_symbol.clone();
-        ch.animation
-            .set_appearance(&symbol, Some(ColorPair::fg(color)));
-    }
-}
-
-fn paint_ids<I>(term: &mut Terminal, ids: I, color: Color)
-where
-    I: IntoIterator<Item = CharacterId>,
-{
-    let mark: HashMap<CharacterId, ()> = ids.into_iter().map(|id| (id, ())).collect();
-    for ch in term.get_characters_mut() {
-        if mark.contains_key(&ch.id) {
-            let symbol = ch.input_symbol.clone();
-            ch.animation
-                .set_appearance(&symbol, Some(ColorPair::fg(color)));
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<ColorPair>)>> =
+        vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 {
+            let ux = x as usize;
+            let uy = y as usize;
+            if ux < w && uy < h {
+                let vis = &ch.animation.current_character_visual;
+                let colors = vis.colors.or(ch.colors);
+                grid[uy][ux] = (vis.symbol, colors);
+            }
         }
     }
+    let mut out = String::new();
+    for row in grid {
+        for (sym, colors) in row {
+            if let Some(cp) = colors {
+                if let Some(fg) = cp.fg {
+                    out.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+                }
+                if let Some(bg) = cp.bg {
+                    out.push_str(&format!("\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b));
+                }
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push(sym);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }

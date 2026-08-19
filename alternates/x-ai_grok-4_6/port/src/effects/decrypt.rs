@@ -1,156 +1,18 @@
-//! Movie-style decryption effect.
-//!
-//! Characters are typed onto the canvas as ciphertext glyphs, then cycle
-//! through encrypted symbols (fast, then slow) before settling on the
-//! original plaintext with a color gradient.
-
 use super::Effect;
-use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
+use crate::engine::character::{CharacterId, EffectCharacter};
+use crate::engine::terminal::Terminal;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const TYPING_SPEED: usize = 1;
-const FAST_FRAMES: usize = 20;
-const FAST_DURATION: u32 = 2;
-const SLOW_FRAMES: usize = 30;
-const SLOW_DURATION_MIN: u32 = 2;
-const SLOW_DURATION_MAX: u32 = 10;
-const CIPHER_GRADIENT_STEPS: usize = 10;
-const FINAL_GRADIENT_STEPS: usize = 12;
-const DISCOVERED_STEPS: usize = 10;
-const DISCOVERED_DURATION: u32 = 8;
-const MAX_FRAMES: usize = 200_000;
-
-const CIPHERTEXT_COLORS: [Color; 2] = [
-    Color { r: 0x00, g: 0xd1, b: 0xff },
-    Color { r: 0x00, g: 0x92, b: 0xcb },
-];
-const PLAINTEXT_COLORS: [Color; 2] = [
-    Color { r: 0xed, g: 0xb2, b: 0x00 },
-    Color { r: 0x95, g: 0x71, b: 0x00 },
-];
-const FINAL_GRADIENT_STOPS: [Color; 3] = [
-    Color { r: 0x8a, g: 0x00, b: 0x8a },
-    Color { r: 0x00, g: 0xd1, b: 0xff },
-    Color { r: 0xff, g: 0xff, b: 0xff },
+const CIPHER: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    'A', 'B', 'C', 'D', 'E', 'F', '@', '#', '$', '%', '&', '*', '+', '=', '?',
 ];
 
-struct Rng {
-    state: u64,
-}
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed | 1 }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    fn gen_index(&mut self, len: usize) -> usize {
-        if len == 0 {
-            0
-        } else {
-            (self.next_u64() as usize) % len
-        }
-    }
-
-    fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[self.gen_index(items.len())]
-    }
-
-    /// Inclusive range, matching Python `random.randint(lo, hi)`.
-    fn randint(&mut self, lo: u32, hi: u32) -> u32 {
-        if hi <= lo {
-            lo
-        } else {
-            lo + (self.next_u64() as u32) % (hi - lo + 1)
-        }
-    }
-}
-
-fn seed_from(input: &str) -> u64 {
-    let mut h = 0xD3C2_9700_DEC2_4077u64;
-    for &b in input.as_bytes() {
-        h = h.wrapping_mul(0x0100_0000_01B3).wrapping_add(u64::from(b));
-    }
-    h
-}
-
-fn encrypted_symbols() -> Vec<String> {
-    let mut symbols = Vec::with_capacity((127 - 32) + (352 - 231));
-    for n in 32..127u32 {
-        if let Some(ch) = char::from_u32(n) {
-            symbols.push(ch.to_string());
-        }
-    }
-    for n in 231..352u32 {
-        if let Some(ch) = char::from_u32(n) {
-            symbols.push(ch.to_string());
-        }
-    }
-    symbols
-}
-
-struct AnimKey {
-    symbol: String,
-    color: Color,
-    duration: u32,
-}
-
-struct CharAnim {
-    id: CharacterId,
-    keys: Vec<AnimKey>,
-    idx: usize,
-    shown: u32,
-    active: bool,
-}
-
-fn set_appearance(term: &mut Terminal, id: CharacterId, symbol: &str, color: Color) {
-    if let Some(ch) = term.get_character_mut(id) {
-        ch.animation
-            .set_appearance(symbol, Some(ColorPair::fg(color)));
-    }
-}
-
-fn apply_key(term: &mut Terminal, id: CharacterId, key: &AnimKey) {
-    set_appearance(term, id, &key.symbol, key.color);
-}
-
-fn vertical_progress(row: i32, text_bottom: i32, text_top: i32) -> f64 {
-    if text_top == text_bottom {
-        0.0
-    } else {
-        f64::from(row - text_bottom) / f64::from(text_top - text_bottom)
-    }
-}
-
-fn pick_color(rng: &mut Rng, colors: &[Color], fallback: Color) -> Color {
-    if colors.is_empty() {
-        fallback
-    } else {
-        *rng.choice(colors)
-    }
-}
-
-/// Movie-style decryption effect.
 pub struct Decrypt;
 
 impl Decrypt {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for Decrypt {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -160,159 +22,145 @@ impl Effect for Decrypt {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        term.hide_all();
+        let lines: Vec<&str> = if input.is_empty() {
+            vec![""]
+        } else {
+            input.lines().collect()
+        };
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
 
-        let symbols = encrypted_symbols();
-        if symbols.is_empty() {
-            return vec![term.render_frame()];
+        let mut term = Terminal::from_input(input, width, height);
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return vec![String::new()];
         }
 
-        let mut rng = Rng::new(seed_from(input));
-        let cipher_gradient = Gradient::new(&CIPHERTEXT_COLORS, CIPHER_GRADIENT_STEPS);
-        let cipher_spectrum: Vec<Color> = cipher_gradient.spectrum().to_vec();
-        let final_gradient = Gradient::new(&FINAL_GRADIENT_STOPS, FINAL_GRADIENT_STEPS);
+        let cipher_stops = vec![
+            Color::from_hex("00ff00").unwrap_or(Color::rgb(0, 255, 0)),
+            Color::from_hex("88ff88").unwrap_or(Color::rgb(136, 255, 136)),
+            Color::from_hex("003300").unwrap_or(Color::rgb(0, 51, 0)),
+        ];
+        let cipher_grad = Gradient::new(cipher_stops, 12);
+        let cipher_colors = cipher_grad.colors();
 
-        let infos: Vec<(CharacterId, String, i32)> = term
-            .get_characters()
-            .iter()
-            .map(|ch| (ch.id, ch.input_symbol.clone(), ch.input_coord.row))
-            .collect();
+        let final_stops = vec![
+            Color::from_hex("00aa00").unwrap_or(Color::rgb(0, 170, 0)),
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+        ];
+        let final_grad = Gradient::new(final_stops, 8);
+        let final_colors = final_grad.colors();
 
-        if infos.is_empty() {
-            return vec![term.render_frame()];
-        }
-
-        let text_bottom = infos.iter().map(|(_, _, row)| *row).min().unwrap_or(1);
-        let text_top = infos.iter().map(|(_, _, row)| *row).max().unwrap_or(1);
-
-        let mut anims: Vec<CharAnim> = Vec::with_capacity(infos.len());
-        for (id, input_symbol, row) in &infos {
-            let progress = vertical_progress(*row, text_bottom, text_top);
-            let final_color = final_gradient
-                .mapped_color(progress)
-                .unwrap_or(FINAL_GRADIENT_STOPS[FINAL_GRADIENT_STOPS.len() - 1]);
-
-            let mut keys = Vec::new();
-
-            for _ in 0..FAST_FRAMES {
-                keys.push(AnimKey {
-                    symbol: rng.choice(&symbols).clone(),
-                    color: pick_color(&mut rng, &cipher_spectrum, CIPHERTEXT_COLORS[0]),
-                    duration: FAST_DURATION,
-                });
+        for ch in term.get_characters_mut() {
+            let id_n = ch.id.0 as usize;
+            let mut scramble = ch.animation.new_scene("scramble");
+            scramble.is_looping = true;
+            for k in 0..16 {
+                let sym = CIPHER[(id_n + k * 7) % CIPHER.len()];
+                let col = cipher_colors[(id_n + k) % cipher_colors.len()];
+                scramble.add_frame(
+                    sym,
+                    1,
+                    Some(ColorPair {
+                        fg: Some(col),
+                        bg: None,
+                    }),
+                );
             }
-
-            for _ in 0..SLOW_FRAMES {
-                keys.push(AnimKey {
-                    symbol: rng.choice(&symbols).clone(),
-                    color: pick_color(&mut rng, &cipher_spectrum, CIPHERTEXT_COLORS[0]),
-                    duration: rng.randint(SLOW_DURATION_MIN, SLOW_DURATION_MAX),
-                });
-            }
-
-            let discovered = Gradient::new(
-                &[PLAINTEXT_COLORS[0], PLAINTEXT_COLORS[1], final_color],
-                DISCOVERED_STEPS,
-            );
-            if discovered.is_empty() {
-                keys.push(AnimKey {
-                    symbol: input_symbol.clone(),
-                    color: final_color,
-                    duration: DISCOVERED_DURATION,
-                });
-            } else {
-                for color in discovered.spectrum() {
-                    keys.push(AnimKey {
-                        symbol: input_symbol.clone(),
-                        color: *color,
-                        duration: DISCOVERED_DURATION,
-                    });
-                }
-            }
-
-            anims.push(CharAnim {
-                id: *id,
-                keys,
-                idx: 0,
-                shown: 0,
-                active: false,
-            });
-        }
-
-        let mut pending: Vec<CharacterId> = infos.iter().map(|(id, _, _)| *id).collect();
-        let mut decrypting = false;
-        let mut frames = Vec::new();
-
-        loop {
-            if !decrypting {
-                if pending.is_empty() {
-                    decrypting = true;
-                    for anim in &mut anims {
-                        if anim.keys.is_empty() {
-                            anim.active = false;
-                            continue;
-                        }
-                        anim.active = true;
-                        anim.idx = 0;
-                        anim.shown = 0;
-                        apply_key(&mut term, anim.id, &anim.keys[0]);
-                    }
+            let mut settle = ch.animation.new_scene("settle");
+            for (k, col) in final_colors.iter().enumerate() {
+                let sym = if k + 1 == final_colors.len() {
+                    ch.input_symbol
                 } else {
-                    for _ in 0..TYPING_SPEED {
-                        let Some(id) = pending.first().copied() else {
-                            break;
-                        };
-                        pending.remove(0);
-                        term.set_character_visibility(id, true);
-                        let symbol = rng.choice(&symbols);
-                        let color = pick_color(&mut rng, &CIPHERTEXT_COLORS, CIPHERTEXT_COLORS[0]);
-                        set_appearance(&mut term, id, symbol, color);
-                    }
-                }
+                    CIPHER[(id_n + k * 3) % CIPHER.len()]
+                };
+                settle.add_frame(
+                    sym,
+                    2,
+                    Some(ColorPair {
+                        fg: Some(*col),
+                        bg: None,
+                    }),
+                );
             }
-
-            if decrypting {
-                let mut updates: Vec<(CharacterId, usize)> = Vec::new();
-                for anim in &mut anims {
-                    if !anim.active {
-                        continue;
-                    }
-                    anim.shown = anim.shown.saturating_add(1);
-                    let duration = anim
-                        .keys
-                        .get(anim.idx)
-                        .map(|key| key.duration)
-                        .unwrap_or(1);
-                    if anim.shown >= duration {
-                        anim.idx += 1;
-                        anim.shown = 0;
-                        if anim.idx >= anim.keys.len() {
-                            anim.active = false;
-                        } else {
-                            updates.push((anim.id, anim.idx));
-                        }
-                    }
-                }
-                for (id, idx) in updates {
-                    if let Some(anim) = anims.iter().find(|anim| anim.id == id) {
-                        if let Some(key) = anim.keys.get(idx) {
-                            apply_key(&mut term, id, key);
-                        }
-                    }
-                }
-            }
-
-            frames.push(term.render_frame());
-
-            if decrypting && anims.iter().all(|anim| !anim.active) {
-                break;
-            }
-            if frames.len() >= MAX_FRAMES {
-                break;
-            }
+            ch.animation.activate_scene("scramble");
+            ch.is_visible = true;
         }
 
-        frames
+        let n = ids.len();
+        let scramble_frames = 18 + (n / 4).min(40);
+        let reveal_stagger = 2usize;
+
+        let mut out = Vec::new();
+        for f in 0..scramble_frames {
+            term.step_all();
+            out.push(render_ansi(&term));
+            let _ = f;
+        }
+
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                ch.animation.activate_scene("settle");
+            }
+            for _ in 0..reveal_stagger {
+                term.step_all();
+                out.push(render_ansi(&term));
+            }
+            let _ = i;
+        }
+
+        for _ in 0..12 {
+            term.step_all();
+            out.push(render_ansi(&term));
+        }
+
+        if out.is_empty() {
+            out.push(render_ansi(&term));
+        }
+        out
     }
 }
+
+fn sgr(c: Color) -> String {
+    format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b)
+}
+
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x < 0 || y < 0 {
+            continue;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if x >= w || y >= h {
+            continue;
+        }
+        let vis = &ch.animation.current_character_visual;
+        let fg = vis.colors.and_then(|p| p.fg).or_else(|| ch.colors.and_then(|p| p.fg));
+        grid[y][x] = (vis.symbol, fg);
+    }
+    let mut s = String::new();
+    for row in grid {
+        for (sym, fg) in row {
+            if let Some(c) = fg {
+                s.push_str(&sgr(c));
+                s.push(sym);
+                s.push_str("\x1b[0m");
+            } else {
+                s.push(sym);
+            }
+        }
+        s.push('\n');
+    }
+    s
+}
+
+#[allow(dead_code)]
+fn _keep_character_ty(_: &EffectCharacter) {}

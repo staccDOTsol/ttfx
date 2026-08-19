@@ -1,26 +1,14 @@
-use std::collections::{HashMap, HashSet};
-
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{self, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// A laser etches characters onto the terminal, then they cool to their
-/// final color. The beam is traced from the canvas top-right corner along
-/// a nearest-neighbour tour of the input glyphs (Python `laseretch`).
 pub struct Laseretch;
 
 impl Laseretch {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for Laseretch {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -30,304 +18,208 @@ impl Effect for Laseretch {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
-        }
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height);
 
-        term.hide_all();
+        let etch_stops = vec![
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+            Color::from_hex("ffd700").unwrap_or(Color::rgb(255, 215, 0)),
+            Color::from_hex("ff4500").unwrap_or(Color::rgb(255, 69, 0)),
+            Color::from_hex("8b0000").unwrap_or(Color::rgb(139, 0, 0)),
+        ];
+        let laser_stops = vec![
+            Color::from_hex("00ffff").unwrap_or(Color::rgb(0, 255, 255)),
+            Color::from_hex("0088ff").unwrap_or(Color::rgb(0, 136, 255)),
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+        ];
+        let spark_stops = vec![
+            Color::from_hex("ffff00").unwrap_or(Color::rgb(255, 255, 0)),
+            Color::from_hex("ff8800").unwrap_or(Color::rgb(255, 136, 0)),
+            Color::from_hex("ff0000").unwrap_or(Color::rgb(255, 0, 0)),
+        ];
+        let etch_colors = Gradient::new(etch_stops, 8).colors();
+        let laser_colors = Gradient::new(laser_stops, 6).colors();
+        let spark_colors = Gradient::new(spark_stops, 5).colors();
 
-        let infos: Vec<EtchChar> = term
-            .get_characters()
-            .iter()
-            .map(|ch| EtchChar {
-                id: ch.id,
-                coord: ch.input_coord,
-                symbol: ch.input_symbol.clone(),
-                fg: ch.input_fg,
-                bg: ch.input_bg,
-            })
-            .collect();
-
-        let min_col = infos.iter().map(|c| c.coord.column).min().unwrap_or(1);
-        let max_col = infos.iter().map(|c| c.coord.column).max().unwrap_or(1);
-        let min_row = infos.iter().map(|c| c.coord.row).min().unwrap_or(1);
-        let max_row = infos.iter().map(|c| c.coord.row).max().unwrap_or(1);
-
-        let laser = hex("e63e31");
-        let cool = Gradient::new(&[laser, hex("ff9d00"), hex("6e6e6e"), hex("feffff")], 4);
-        let final_grad = Gradient::new(&[hex("8a8a8a"), hex("ffffff")], 12);
-        let cool_len = cool.len().max(1);
-        let cool_total = cool_len * COOL_HOLD;
-
-        let finals: Vec<Color> = infos
-            .iter()
-            .map(|info| {
-                info.fg.unwrap_or_else(|| {
-                    vertical_color(info.coord, min_col, max_col, min_row, max_row, &final_grad)
-                        .unwrap_or(hex("ffffff"))
-                })
-            })
-            .collect();
-
-        let etchable: Vec<usize> = infos
-            .iter()
-            .enumerate()
-            .filter(|(_, info)| is_etchable(info))
-            .map(|(i, _)| i)
-            .collect();
-
-        if etchable.is_empty() {
-            apply_finals(&mut term, &infos, &finals);
-            term.show_all();
-            return vec![term.render_frame()];
-        }
-
-        let emitter = Coord {
-            column: term.canvas.right,
-            row: term.canvas.top,
-        };
-        let order = nearest_neighbor(&infos, &etchable, emitter);
-
-        let mut path: Vec<Coord> = Vec::new();
-        let mut cursor = emitter;
-        for &idx in &order {
-            let dest = infos[idx].coord;
-            let mut line = geometry::find_coords_on_line(cursor, dest);
-            if !path.is_empty() && !line.is_empty() {
-                line.remove(0);
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let scn = ch.animation.new_scene("etch");
+                for col in &etch_colors {
+                    scn.add_frame(
+                        ch.input_symbol,
+                        2,
+                        Some(ColorPair {
+                            fg: Some(*col),
+                            bg: None,
+                        }),
+                    );
+                }
+                let last = *etch_colors.last().unwrap_or(&Color::rgb(255, 215, 0));
+                scn.add_frame(
+                    ch.input_symbol,
+                    8,
+                    Some(ColorPair {
+                        fg: Some(last),
+                        bg: None,
+                    }),
+                );
             }
-            path.extend(line);
-            cursor = dest;
-        }
-        if path.is_empty() {
-            path.push(emitter);
         }
 
-        let mut at_coord: HashMap<Coord, usize> = HashMap::new();
-        for &idx in &etchable {
-            at_coord.insert(infos[idx].coord, idx);
+        // diagonal laser beam overlay
+        let mut beam_ids: Vec<CharacterId> = Vec::new();
+        {
+            let mut row = 0i32;
+            let mut col = 0i32;
+            while row < height as i32 && col < width as i32 {
+                let id = term.add_character('/', Coord::new(col, row));
+                if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == id) {
+                    ch.layer_placeholder();
+                    let scn = ch.animation.new_scene("laser");
+                    scn.is_looping = true;
+                    for colr in &laser_colors {
+                        scn.add_frame(
+                            '*',
+                            1,
+                            Some(ColorPair {
+                                fg: Some(*colr),
+                                bg: None,
+                            }),
+                        );
+                    }
+                    ch.animation.activate_scene("laser");
+                }
+                term.set_character_visibility(id, true);
+                beam_ids.push(id);
+                row += 1;
+                col += 1;
+            }
         }
 
-        let mut age: Vec<Option<usize>> = vec![None; infos.len()];
-        let mut path_i = 0usize;
-        let mut laser_pos = emitter;
-        let mut retract: Vec<Coord> = Vec::new();
-        let mut retract_i = 0usize;
-        let mut retract_ready = false;
-        let mut hold = 0usize;
+        // sparks pool
+        let mut spark_ids: Vec<CharacterId> = Vec::new();
+        for i in 0..12 {
+            let id = term.add_character('.', Coord::new((i * 3) as i32 % width as i32, 0));
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == id) {
+                let scn = ch.animation.new_scene("spark");
+                for colr in &spark_colors {
+                    scn.add_frame(
+                        '*',
+                        1,
+                        Some(ColorPair {
+                            fg: Some(*colr),
+                            bg: None,
+                        }),
+                    );
+                }
+                ch.animation.activate_scene("spark");
+            }
+            spark_ids.push(id);
+        }
+
         let mut frames: Vec<String> = Vec::new();
-
-        loop {
-            if frames.len() >= MAX_FRAMES {
-                break;
+        let n = ids.len();
+        for i in 0..n {
+            term.set_character_visibility(ids[i], true);
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == ids[i]) {
+                ch.animation.activate_scene("etch");
             }
-
-            let path_done = path_i >= path.len();
-            if path_done && !retract_ready {
-                let mut back = geometry::find_coords_on_line(laser_pos, emitter);
-                if !back.is_empty() {
-                    back.remove(0);
-                }
-                retract = back;
-                retract_ready = true;
-            }
-            let retract_done = retract_ready && retract_i >= retract.len();
-            let cooled = all_cooled(&age, cool_total);
-
-            if path_done && retract_done && cooled && hold >= HOLD_FRAMES {
-                break;
-            }
-
-            if !path_done {
-                for _ in 0..LASER_STEP {
-                    if path_i >= path.len() {
-                        break;
+            // move sparks near last etched char
+            if let Some(etch) = term.get_characters().iter().find(|c| c.id == ids[i]) {
+                let base = etch.input_coord;
+                for (si, sid) in spark_ids.iter().enumerate() {
+                    if let Some(sp) = term.get_characters_mut().iter_mut().find(|c| c.id == *sid) {
+                        sp.motion.current_coord = Coord::new(
+                            base.column + ((si as i32) % 5) - 2,
+                            base.row + ((si as i32) / 5) - 1,
+                        );
+                        sp.current_coord = sp.motion.current_coord;
                     }
-                    laser_pos = path[path_i];
-                    if let Some(&idx) = at_coord.get(&laser_pos) {
-                        if age[idx].is_none() {
-                            age[idx] = Some(0);
-                            term.set_character_visibility(infos[idx].id, true);
-                        }
-                    }
-                    path_i += 1;
+                    term.set_character_visibility(*sid, true);
                 }
-            } else if !retract_done {
-                for _ in 0..LASER_STEP {
-                    if retract_i >= retract.len() {
-                        break;
-                    }
-                    laser_pos = retract[retract_i];
-                    retract_i += 1;
-                }
-            } else if cooled {
-                hold += 1;
             }
-
-            for i in 0..infos.len() {
-                let Some(a) = age[i] else {
-                    continue;
-                };
-                let color = if a >= cool_total {
-                    finals[i]
-                } else {
-                    cool.get(a / COOL_HOLD).unwrap_or(laser)
-                };
-                let pair = ColorPair::new(Some(color), infos[i].bg);
-                if let Some(ch) = term.get_character_mut(infos[i].id) {
-                    ch.animation
-                        .set_appearance(&infos[i].symbol, Some(pair));
-                }
-                age[i] = Some(a.saturating_add(1));
-            }
-
-            term.tick();
-
-            let draw_beam = !path_done || !retract_done;
-            if draw_beam {
-                let beam = geometry::find_coords_on_line(emitter, laser_pos);
-                frames.push(render_with_beam(&mut term, &beam, Some(laser_pos)));
-            } else {
-                frames.push(term.render_frame());
-            }
+            term.step_all();
+            frames.push(render_ansi(&term));
         }
 
-        if !cooled_or_shown(&age, &etchable) {
-            for &idx in &etchable {
-                if age[idx].is_none() {
-                    term.set_character_visibility(infos[idx].id, true);
-                }
-                let pair = ColorPair::new(Some(finals[idx]), infos[idx].bg);
-                if let Some(ch) = term.get_character_mut(infos[idx].id) {
-                    ch.animation
-                        .set_appearance(&infos[idx].symbol, Some(pair));
-                }
-            }
-            frames.push(term.render_frame());
+        // hold etched text while laser fades
+        for _ in 0..12 {
+            term.step_all();
+            frames.push(render_ansi(&term));
         }
-
+        for bid in beam_ids {
+            term.set_character_visibility(bid, false);
+        }
+        for sid in spark_ids {
+            term.set_character_visibility(sid, false);
+        }
+        for _ in 0..8 {
+            term.step_all();
+            frames.push(render_ansi(&term));
+        }
         if frames.is_empty() {
-            apply_finals(&mut term, &infos, &finals);
-            for &idx in &etchable {
-                term.set_character_visibility(infos[idx].id, true);
-            }
-            frames.push(term.render_frame());
+            frames.push(render_ansi(&term));
         }
-
         frames
     }
 }
 
-const LASER_STEP: usize = 3;
-const COOL_HOLD: usize = 2;
-const HOLD_FRAMES: usize = 8;
-const MAX_FRAMES: usize = 10_000;
-
-struct EtchChar {
-    id: CharacterId,
-    coord: Coord,
-    symbol: String,
-    fg: Option<Color>,
-    bg: Option<Color>,
+trait LayerPh {
+    fn layer_placeholder(&mut self) {}
 }
 
-fn hex(s: &str) -> Color {
-    Color::from_hex(s).unwrap_or(Color::rgb(255, 255, 255))
+impl LayerPh for crate::engine::character::EffectCharacter {}
+
+fn sgr(c: Color) -> String {
+    format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b)
 }
 
-fn is_etchable(info: &EtchChar) -> bool {
-    info.symbol != " " || info.fg.is_some() || info.bg.is_some()
-}
-
-fn all_cooled(age: &[Option<usize>], cool_total: usize) -> bool {
-    age.iter().all(|a| match *a {
-        Some(v) => v >= cool_total,
-        None => true,
-    })
-}
-
-fn cooled_or_shown(age: &[Option<usize>], etchable: &[usize]) -> bool {
-    etchable.iter().all(|&i| age[i].is_some())
-}
-
-fn vertical_color(
-    coord: Coord,
-    _min_col: i32,
-    _max_col: i32,
-    min_row: i32,
-    max_row: i32,
-    gradient: &Gradient,
-) -> Option<Color> {
-    let span = (max_row - min_row).max(1) as f64;
-    let progress = (max_row - coord.row) as f64 / span;
-    gradient.mapped_color(progress)
-}
-
-fn nearest_neighbor(infos: &[EtchChar], etchable: &[usize], start: Coord) -> Vec<usize> {
-    let mut remaining = etchable.to_vec();
-    let mut order = Vec::with_capacity(remaining.len());
-    let mut current = start;
-    while !remaining.is_empty() {
-        let mut best = 0usize;
-        let mut best_d = i64::MAX;
-        for (ri, &idx) in remaining.iter().enumerate() {
-            let c = infos[idx].coord;
-            let dc = i64::from(c.column) - i64::from(current.column);
-            let dr = i64::from(c.row) - i64::from(current.row);
-            let d = dc * dc + dr * dr;
-            if d < best_d {
-                best_d = d;
-                best = ri;
-            }
-        }
-        let idx = remaining.remove(best);
-        current = infos[idx].coord;
-        order.push(idx);
-    }
-    order
-}
-
-fn apply_finals(term: &mut Terminal, infos: &[EtchChar], finals: &[Color]) {
-    for (info, color) in infos.iter().zip(finals.iter()) {
-        let pair = ColorPair::new(Some(*color), info.bg);
-        if let Some(ch) = term.get_character_mut(info.id) {
-            ch.animation.set_appearance(&info.symbol, Some(pair));
-        }
-    }
-}
-
-fn render_with_beam(term: &mut Terminal, beam: &[Coord], head: Option<Coord>) -> String {
-    let cells: Vec<(Coord, CharacterVisual)> = term
-        .get_characters()
-        .iter()
-        .filter(|ch| ch.is_visible)
-        .map(|ch| {
-            let mut visual = ch.animation.current_character_visual.clone();
-            if visual.symbol.is_empty() {
-                visual.symbol = ch.input_symbol.clone();
-                visual.refresh();
-            }
-            (ch.current_coord(), visual)
-        })
-        .collect();
-
-    let occupied: HashSet<Coord> = cells.iter().map(|(c, _)| *c).collect();
-
-    term.canvas.clear();
-    for (coord, visual) in cells {
-        term.canvas.put(coord, visual);
-    }
-    for &coord in beam {
-        if occupied.contains(&coord) || !term.canvas.contains(coord) {
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
             continue;
         }
-        term.canvas.put(coord, CharacterVisual::new("·", None));
-    }
-    if let Some(h) = head {
-        if !occupied.contains(&h) && term.canvas.contains(h) {
-            term.canvas.put(h, CharacterVisual::new("*", None));
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x < 0 || y < 0 {
+            continue;
         }
+        let ux = x as usize;
+        let uy = y as usize;
+        if ux >= w || uy >= h {
+            continue;
+        }
+        let sym = ch.animation.current_character_visual.symbol;
+        let col = ch
+            .animation
+            .current_character_visual
+            .colors
+            .and_then(|p| p.fg)
+            .or_else(|| ch.colors.and_then(|p| p.fg));
+        grid[uy][ux] = (sym, col);
     }
-    term.canvas.render()
+    let mut out = String::new();
+    for row in grid {
+        for (sym, col) in row {
+            if let Some(c) = col {
+                out.push_str(&sgr(c));
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else if sym != ' ' && sym != '\0' {
+                out.push_str("\x1b[38;2;255;215;0m");
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push('\n');
+    }
+    out
 }

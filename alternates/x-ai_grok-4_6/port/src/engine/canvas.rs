@@ -1,100 +1,71 @@
-use crate::engine::animation::CharacterVisual;
 use crate::utils::geometry::Coord;
+use crate::utils::graphics::ColorPair;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Cell {
-    pub visual: CharacterVisual,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            visual: CharacterVisual::new(" ", None),
-        }
-    }
+    pub symbol: char,
+    pub colors: Option<ColorPair>,
+    pub visible: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
-    pub left: i32,
-    pub right: i32,
-    pub top: i32,
-    pub bottom: i32,
     cells: Vec<Cell>,
 }
 
 impl Canvas {
     pub fn new(width: usize, height: usize) -> Self {
-        let width = width;
-        let height = height;
-        let cells = vec![Cell::default(); width.saturating_mul(height)];
+        let n = width.saturating_mul(height);
         Self {
             width,
             height,
-            left: 1,
-            right: width as i32,
-            top: height as i32,
-            bottom: 1,
-            cells,
+            cells: vec![Cell::default(); n],
         }
     }
 
-    pub fn center(&self) -> Coord {
-        Coord {
-            column: crate::utils::round_half_even(f64::from(self.left + self.right) / 2.0) as i32,
-            row: crate::utils::round_half_even(f64::from(self.top + self.bottom) / 2.0) as i32,
-        }
-    }
-
-    pub fn contains(&self, coord: Coord) -> bool {
-        coord.column >= self.left
-            && coord.column <= self.right
-            && coord.row >= self.bottom
-            && coord.row <= self.top
-            && self.width > 0
-            && self.height > 0
-    }
-
-    fn idx(&self, coord: Coord) -> Option<usize> {
-        if !self.contains(coord) {
-            return None;
-        }
-        let x = (coord.column - self.left) as usize;
-        let y = (coord.row - self.bottom) as usize;
-        Some(y * self.width + x)
-    }
-
-    pub fn clear(&mut self) {
-        for cell in &mut self.cells {
-            *cell = Cell::default();
-        }
-    }
-
-    pub fn put(&mut self, coord: Coord, visual: CharacterVisual) {
-        if let Some(idx) = self.idx(coord) {
-            self.cells[idx] = Cell { visual };
+    fn index(&self, x: usize, y: usize) -> Option<usize> {
+        if x < self.width && y < self.height {
+            Some(y * self.width + x)
+        } else {
+            None
         }
     }
 
     pub fn get(&self, coord: Coord) -> Option<&Cell> {
-        self.idx(coord).and_then(|idx| self.cells.get(idx))
+        let x = coord.column as usize;
+        let y = coord.row as usize;
+        self.index(x, y).map(|i| &self.cells[i])
     }
 
     pub fn get_mut(&mut self, coord: Coord) -> Option<&mut Cell> {
-        self.idx(coord).and_then(|idx| self.cells.get_mut(idx))
+        let x = coord.column as usize;
+        let y = coord.row as usize;
+        self.index(x, y).map(|i| &mut self.cells[i])
+    }
+
+    pub fn set_symbol(&mut self, coord: Coord, symbol: char) {
+        if let Some(cell) = self.get_mut(coord) {
+            cell.symbol = symbol;
+            cell.visible = true;
+        }
+    }
+
+    pub fn fill(&mut self, symbol: char) {
+        for cell in &mut self.cells {
+            cell.symbol = symbol;
+            cell.visible = true;
+        }
     }
 
     pub fn render(&self) -> String {
-        if self.width == 0 || self.height == 0 {
-            return String::new();
-        }
-        let mut out = String::with_capacity((self.width + 1) * self.height);
-        for row in (self.bottom..=self.top).rev() {
-            for column in self.left..=self.right {
-                if let Some(cell) = self.get(Coord { column, row }) {
-                    out.push_str(&cell.visual.format_symbol());
+        let mut out = String::with_capacity(self.width * self.height + self.height);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let c = &self.cells[y * self.width + x];
+                if c.visible && c.symbol != '\0' {
+                    out.push(c.symbol);
                 } else {
                     out.push(' ');
                 }

@@ -1,17 +1,6 @@
 use super::Effect;
-use crate::engine::terminal::{Terminal, TerminalConfig};
+use crate::engine::terminal::Terminal;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-/// Python `effect_colorshift` defaults (travel off, one cycle, 5 frames/step).
-const GRADIENT_STEPS: usize = 12;
-const GRADIENT_FRAMES: usize = 5;
-const CYCLES: usize = 1;
-const TRAVEL: bool = true;
-const SKIP_EMPTY: bool = false;
-
-const STOP_HEX: [&str; 7] = [
-    "e81416", "ffa500", "faeb36", "79c314", "487de7", "4b369d", "70369d",
-];
 
 pub struct Colorshift;
 
@@ -27,83 +16,113 @@ impl Effect for Colorshift {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
+        let width = input
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let height = input.lines().count().max(1);
+        let mut term = Terminal::from_input(input, width, height);
+
+        let stops = vec![
+            Color::rgb(0xe9, 0x60, 0x77),
+            Color::rgb(0xe6, 0x1f, 0x44),
+            Color::rgb(0x8c, 0x1b, 0x9f),
+            Color::rgb(0x49, 0x1c, 0x8c),
+            Color::rgb(0x20, 0x5c, 0xaa),
+            Color::rgb(0x0e, 0xaa, 0x94),
+            Color::rgb(0x16, 0xdb, 0x75),
+            Color::rgb(0x8c, 0xe0, 0x1e),
+        ];
+        let gradient = Gradient::new(stops, 36);
+        let palette = gradient.colors();
+        let pal_len = palette.len().max(1);
+
+        let ids: Vec<_> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
         }
 
-        let stops: Vec<Color> = STOP_HEX.iter().filter_map(|h| Color::from_hex(h)).collect();
-        let gradient = Gradient::new(&stops, GRADIENT_STEPS);
-        let spectrum: Vec<Color> = gradient.spectrum().to_vec();
-        if spectrum.is_empty() {
-            term.show_all();
-            return vec![term.render_frame()];
-        }
+        let cycles = pal_len * 2;
+        let mut out = Vec::with_capacity(cycles);
 
-        let n = spectrum.len();
-        let (left, right, bottom, top) = text_extents(&term);
-        let offsets: Vec<usize> = term
-            .get_characters()
-            .iter()
-            .map(|ch| {
-                if TRAVEL {
-                    travel_index(ch.input_coord.column, ch.input_coord.row, left, right, bottom, top, n)
-                } else {
-                    0
-                }
-            })
-            .collect();
+        for frame_i in 0..cycles {
+            let chars_snapshot: Vec<_> = term
+                .get_characters()
+                .iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        c.input_symbol,
+                        c.input_coord.column,
+                        c.input_coord.row,
+                    )
+                })
+                .collect();
 
-        term.show_all();
-
-        let total_steps = n.saturating_mul(CYCLES.max(1));
-        let mut frames = Vec::with_capacity(total_steps.saturating_mul(GRADIENT_FRAMES).max(1));
-
-        for step in 0..total_steps {
-            for _ in 0..GRADIENT_FRAMES {
-                for (i, ch) in term.get_characters_mut().iter_mut().enumerate() {
-                    if SKIP_EMPTY && ch.input_symbol.chars().all(char::is_whitespace) {
-                        continue;
+            for (id, symbol, col, row) in &chars_snapshot {
+                let idx = ((*col as usize)
+                    .wrapping_add(*row as usize)
+                    .wrapping_add(frame_i))
+                    % pal_len;
+                let color = palette[idx];
+                if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                    ch.colors = Some(ColorPair {
+                        fg: Some(color),
+                        bg: None,
+                    });
+                    ch.animation.set_appearance(*symbol, Some(color));
+                    let scn_id = format!("cs-{}-{}", id.0, frame_i);
+                    {
+                        let scn = ch.animation.new_scene(scn_id.clone());
+                        scn.add_frame(
+                            *symbol,
+                            1,
+                            Some(ColorPair {
+                                fg: Some(color),
+                                bg: None,
+                            }),
+                        );
                     }
-                    let idx = (offsets[i] + step) % n;
-                    ch.is_visible = true;
-                    ch.animation
-                        .set_appearance(&ch.input_symbol, Some(ColorPair::fg(spectrum[idx])));
+                    ch.animation.activate_scene(&scn_id);
                 }
-                frames.push(term.render_frame());
             }
+
+            term.step_all();
+            let raw = term.get_formatted_output_string();
+            let mut painted = String::new();
+            for ch in term.get_characters() {
+                if !ch.is_visible {
+                    continue;
+                }
+                let color = ch
+                    .animation
+                    .current_character_visual
+                    .colors
+                    .and_then(|p| p.fg)
+                    .or_else(|| ch.colors.and_then(|p| p.fg))
+                    .unwrap_or(Color::rgb(255, 255, 255));
+                painted.push_str(&format!(
+                    "\x1b[{};{}H\x1b[38;2;{};{};{}m{}",
+                    ch.current_coord.row + 1,
+                    ch.current_coord.column + 1,
+                    color.r,
+                    color.g,
+                    color.b,
+                    ch.animation.current_character_visual.symbol
+                ));
+            }
+            painted.push_str("\x1b[0m");
+            if painted.chars().filter(|c| !c.is_control()).count() == 0 {
+                for line in raw.lines() {
+                    painted.push_str("\x1b[38;2;233;96;119m");
+                    painted.push_str(line);
+                    painted.push_str("\x1b[0m\n");
+                }
+            }
+            out.push(painted);
         }
-
-        if frames.is_empty() {
-            frames.push(term.render_frame());
-        }
-        frames
+        out
     }
-}
-
-fn text_extents(term: &Terminal) -> (i32, i32, i32, i32) {
-    let chars = term.get_characters();
-    let left = chars.iter().map(|c| c.input_coord.column).min().unwrap_or(1);
-    let right = chars.iter().map(|c| c.input_coord.column).max().unwrap_or(1);
-    let bottom = chars.iter().map(|c| c.input_coord.row).min().unwrap_or(1);
-    let top = chars.iter().map(|c| c.input_coord.row).max().unwrap_or(1);
-    (left, right, bottom, top)
-}
-
-/// Horizontal travel: rotate the spectrum by column, matching Python `--travel`.
-fn travel_index(
-    column: i32,
-    _row: i32,
-    left: i32,
-    right: i32,
-    _bottom: i32,
-    _top: i32,
-    n: usize,
-) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    let span = (right - left).max(1) as usize;
-    let pos = (column - left).max(0) as usize;
-    (pos * n / span) % n
 }

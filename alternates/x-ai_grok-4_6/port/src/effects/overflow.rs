@@ -1,19 +1,8 @@
-//! Overflow effect: input rows scroll the canvas out of order, then settle.
-
-use std::collections::{BTreeMap, HashMap};
-
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
+use crate::engine::terminal::Terminal;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const OVERFLOW_SPEED: usize = 3;
-const OVERFLOW_CYCLES_LO: i32 = 2;
-const OVERFLOW_CYCLES_HI: i32 = 4;
-const COLOR_HOLD: usize = 16;
-const FINAL_HOLD_FRAMES: usize = 8;
-const MAX_FRAMES: usize = 12_000;
 
 pub struct Overflow;
 
@@ -23,10 +12,12 @@ impl Overflow {
     }
 }
 
-impl Default for Overflow {
-    fn default() -> Self {
-        Self::new()
-    }
+fn sgr(c: Color) -> String {
+    format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b)
+}
+
+fn reset() -> &'static str {
+    "\x1b[0m"
 }
 
 impl Effect for Overflow {
@@ -35,214 +26,166 @@ impl Effect for Overflow {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
+        let lines: Vec<&str> = if input.is_empty() {
+            vec![""]
+        } else {
+            input.lines().collect()
+        };
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+
+        let mut term = Terminal::from_input(input, width, height);
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
         }
 
-        let mut rng = Rng::new(fnv1a(input));
-        let canvas_bottom = term.canvas.bottom;
-        let canvas_top = term.canvas.top.max(canvas_bottom);
+        let gradient = Gradient::new(
+            vec![
+                Color::from_hex("8A008A").unwrap_or(Color::rgb(138, 0, 138)),
+                Color::from_hex("00D1FF").unwrap_or(Color::rgb(0, 209, 255)),
+                Color::from_hex("FFFFFF").unwrap_or(Color::rgb(255, 255, 255)),
+            ],
+            12,
+        );
+        let palette = gradient.colors();
+        if palette.is_empty() {
+            return vec![input.to_string()];
+        }
 
-        let overflow_gradient = Gradient::new(&[hex("f2ebc0"), hex("8dbfb3"), hex("f2ebc0")], 5);
-        let overflow_spectrum: Vec<Color> = overflow_gradient.spectrum().to_vec();
-        let final_gradient = Gradient::new(&[hex("8A008A"), hex("00D1FF"), hex("FFFFFF")], 12);
+        // Paint initial scenes so engine visuals carry ColorPairs.
+        {
+            let chars = term.get_characters_mut();
+            for ch in chars.iter_mut() {
+                let idx = ((ch.input_coord.column + ch.input_coord.row).unsigned_abs() as usize)
+                    % palette.len();
+                let scn = ch.animation.new_scene("overflow");
+                scn.add_frame(
+                    ch.input_symbol,
+                    2,
+                    Some(ColorPair {
+                        fg: Some(palette[idx]),
+                        bg: None,
+                    }),
+                );
+                ch.animation.activate_scene("overflow");
+                let path = ch.motion.new_path("drop");
+                path.speed = 0.35;
+                path.new_waypoint(
+                    "bottom",
+                    Coord::new(ch.input_coord.column, ch.input_coord.row + height as i32),
+                );
+            }
+        }
 
-        let (min_row, max_row) = term
-            .get_characters()
-            .iter()
-            .fold((i32::MAX, i32::MIN), |(lo, hi), ch| {
-                (lo.min(ch.input_coord.row), hi.max(ch.input_coord.row))
-            });
-        let row_span = f64::from((max_row - min_row).max(1));
+        let mut out = Vec::new();
+        let cycles = 3usize;
+        let steps_per = (height as i32 + 4).max(8) as usize;
 
-        let mut final_color: HashMap<CharacterId, Color> = HashMap::new();
-        let mut grouped: BTreeMap<i32, Vec<CharacterId>> = BTreeMap::new();
+        for cycle in 0..cycles {
+            // Reset coords to input, activate drop
+            {
+                let chars = term.get_characters_mut();
+                for ch in chars.iter_mut() {
+                    ch.current_coord = ch.input_coord;
+                    ch.motion.current_coord = ch.input_coord;
+                    ch.motion.activate_path("drop");
+                    let idx = ((ch.input_coord.column + ch.input_coord.row + cycle as i32)
+                        .unsigned_abs() as usize)
+                        % palette.len();
+                    if let Some(scn) = ch.animation.query_scene("overflow") {
+                        let _ = scn;
+                    }
+                    ch.animation.set_appearance(ch.input_symbol, Some(palette[idx]));
+                    ch.animation.activate_scene("overflow");
+                }
+            }
+
+            for step in 0..steps_per {
+                term.step_all();
+                // Build a styled frame: wrap each visible glyph with SGR from gradient
+                let mut grid: Vec<Vec<Option<(char, Color)>>> =
+                    vec![vec![None; width]; height];
+                for ch in term.get_characters() {
+                    if !ch.is_visible {
+                        continue;
+                    }
+                    let col = ch.current_coord.column;
+                    let row = ch.current_coord.row;
+                    if col < 0 || row < 0 {
+                        continue;
+                    }
+                    let c = col as usize;
+                    let r = row as usize;
+                    if c >= width || r >= height {
+                        continue;
+                    }
+                    let idx = ((ch.input_coord.column
+                        + ch.input_coord.row
+                        + cycle as i32
+                        + step as i32)
+                        .unsigned_abs() as usize)
+                        % palette.len();
+                    let color = ch
+                        .animation
+                        .current_character_visual
+                        .colors
+                        .and_then(|p| p.fg)
+                        .unwrap_or(palette[idx]);
+                    grid[r][c] = Some((ch.animation.current_character_visual.symbol, color));
+                }
+                let mut frame = String::new();
+                for r in 0..height {
+                    for c in 0..width {
+                        match grid[r][c] {
+                            Some((sym, color)) => {
+                                frame.push_str(&sgr(color));
+                                frame.push(sym);
+                                frame.push_str(reset());
+                            }
+                            None => frame.push(' '),
+                        }
+                    }
+                    frame.push('\n');
+                }
+                out.push(frame);
+            }
+        }
+
+        // Final settle: characters back at input coords, last gradient color
+        {
+            let last = *palette.last().unwrap();
+            let chars = term.get_characters_mut();
+            for ch in chars.iter_mut() {
+                ch.current_coord = ch.input_coord;
+                ch.motion.current_coord = ch.input_coord;
+                ch.animation.set_appearance(ch.input_symbol, Some(last));
+            }
+        }
+        let mut grid: Vec<Vec<Option<(char, Color)>>> = vec![vec![None; width]; height];
+        let last = *palette.last().unwrap();
         for ch in term.get_characters() {
-            let progress = f64::from(ch.input_coord.row - min_row) / row_span;
-            let color = final_gradient.mapped_color(progress).unwrap_or_else(|| hex("FFFFFF"));
-            final_color.insert(ch.id, color);
-            grouped.entry(ch.input_coord.row).or_default().push(ch.id);
-        }
-
-        // ROW_TOP_TO_BOTTOM, then shuffled like upstream.
-        let mut pending: Vec<RowAnim> = grouped
-            .into_iter()
-            .rev()
-            .map(|(final_row, ids)| {
-                let cycles = rng.randint(OVERFLOW_CYCLES_LO, OVERFLOW_CYCLES_HI);
-                RowAnim {
-                    ids,
-                    current: rng.randint(canvas_bottom, canvas_top),
-                    target: rng.randint(canvas_bottom, canvas_top),
-                    final_row,
-                    cycles_left: cycles,
-                    settled: false,
-                }
-            })
-            .collect();
-        rng.shuffle(&mut pending);
-
-        let first_color = overflow_spectrum.first().copied().unwrap_or_else(|| hex("f2ebc0"));
-        let starts: HashMap<CharacterId, i32> = pending
-            .iter()
-            .flat_map(|row| row.ids.iter().copied().map(|id| (id, row.current)))
-            .collect();
-        for ch in term.get_characters_mut() {
-            if let Some(&row) = starts.get(&ch.id) {
-                ch.motion.current_coord = Coord {
-                    column: ch.input_coord.column,
-                    row,
-                };
+            let c = ch.input_coord.column as usize;
+            let r = ch.input_coord.row as usize;
+            if c < width && r < height {
+                grid[r][c] = Some((ch.input_symbol, last));
             }
-            let symbol = ch.input_symbol.clone();
-            ch.animation
-                .set_appearance(&symbol, Some(ColorPair::fg(first_color)));
-            ch.is_visible = true;
         }
-
-        let mut active: Vec<RowAnim> = Vec::new();
-        let mut frames: Vec<String> = Vec::new();
-        let mut color_tick = 0usize;
-
-        loop {
-            while !pending.is_empty() && active.len() < OVERFLOW_SPEED {
-                active.push(pending.remove(0));
-            }
-
-            for row in &mut active {
-                if row.settled {
-                    continue;
-                }
-                if row.current == row.target {
-                    if row.cycles_left > 0 {
-                        row.cycles_left -= 1;
-                        row.target = rng.randint(canvas_bottom, canvas_top);
-                    } else if row.target != row.final_row {
-                        row.target = row.final_row;
-                    } else {
-                        row.settled = true;
+        let mut frame = String::new();
+        for r in 0..height {
+            for c in 0..width {
+                match grid[r][c] {
+                    Some((sym, color)) => {
+                        frame.push_str(&sgr(color));
+                        frame.push(sym);
+                        frame.push_str(reset());
                     }
-                }
-                if !row.settled && row.current != row.target {
-                    if row.current < row.target {
-                        row.current += 1;
-                    } else {
-                        row.current -= 1;
-                    }
+                    None => frame.push(' '),
                 }
             }
-
-            let mut pos: HashMap<CharacterId, (i32, bool)> = HashMap::new();
-            for row in active.iter().chain(pending.iter()) {
-                for &id in &row.ids {
-                    pos.insert(id, (row.current, row.settled));
-                }
-            }
-
-            let ov_color = if overflow_spectrum.is_empty() {
-                hex("f2ebc0")
-            } else {
-                overflow_spectrum[(color_tick / COLOR_HOLD) % overflow_spectrum.len()]
-            };
-
-            for ch in term.get_characters_mut() {
-                if let Some(&(row, settled)) = pos.get(&ch.id) {
-                    ch.motion.current_coord = Coord {
-                        column: ch.input_coord.column,
-                        row,
-                    };
-                    let color = if settled {
-                        final_color.get(&ch.id).copied().unwrap_or(ov_color)
-                    } else {
-                        ov_color
-                    };
-                    let symbol = ch.input_symbol.clone();
-                    ch.animation
-                        .set_appearance(&symbol, Some(ColorPair::fg(color)));
-                }
-                ch.is_visible = true;
-            }
-
-            term.tick();
-            frames.push(term.render_frame());
-            color_tick = color_tick.saturating_add(1);
-            active.retain(|row| !row.settled);
-
-            if (pending.is_empty() && active.is_empty()) || frames.len() >= MAX_FRAMES {
-                break;
-            }
+            frame.push('\n');
         }
-
-        for ch in term.get_characters_mut() {
-            ch.motion.current_coord = ch.input_coord;
-            let color = final_color.get(&ch.id).copied().unwrap_or_else(|| hex("FFFFFF"));
-            let symbol = ch.input_symbol.clone();
-            ch.animation
-                .set_appearance(&symbol, Some(ColorPair::fg(color)));
-            ch.is_visible = true;
-        }
-        term.tick();
-        let last = term.render_frame();
-        for _ in 0..FINAL_HOLD_FRAMES {
-            frames.push(last.clone());
-        }
-        if frames.is_empty() {
-            frames.push(last);
-        }
-        frames
+        out.push(frame);
+        out
     }
-}
-
-fn hex(s: &str) -> Color {
-    Color::from_hex(s).unwrap_or(Color { r: 255, g: 255, b: 255 })
-}
-
-fn fnv1a(s: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        self.0
-    }
-
-    fn randint(&mut self, lo: i32, hi: i32) -> i32 {
-        if hi <= lo {
-            return lo;
-        }
-        let span = (i64::from(hi) - i64::from(lo) + 1) as u64;
-        lo + (self.next() % span) as i32
-    }
-
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
-        }
-        for i in (1..items.len()).rev() {
-            let j = (self.next() as usize) % (i + 1);
-            items.swap(i, j);
-        }
-    }
-}
-
-struct RowAnim {
-    ids: Vec<CharacterId>,
-    current: i32,
-    target: i32,
-    final_row: i32,
-    cycles_left: i32,
-    settled: bool,
 }

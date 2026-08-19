@@ -1,17 +1,9 @@
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{distance, lerp_coord, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const EXPLOSION_SPEED: f64 = 0.75;
-const REASSEMBLY_SPEED: f64 = 0.75;
-const RUMBLE_FRAMES: i32 = 50;
-const RUMBLE_COLOR_HOLD: u32 = 10;
-const FINAL_COLOR_HOLD: u32 = 5;
-const RUMBLE_GRADIENT_STEPS: usize = 25;
-const FINAL_GRADIENT_STEPS: usize = 12;
-const MAX_FRAMES: usize = 4000;
 
 pub struct Unstable;
 
@@ -27,307 +19,167 @@ impl Effect for Unstable {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::from_input(input, TerminalConfig::default());
-        terminal.show_all();
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height.max(1) + 2);
 
-        if terminal.character_count() == 0 {
-            return vec![terminal.render_frame()];
-        }
-
-        let left = terminal.canvas.left;
-        let right = terminal.canvas.right;
-        let top = terminal.canvas.top;
-        let bottom = terminal.canvas.bottom;
-
-        let unstable = hex_color("ff9200", 255, 146, 0);
-        let stops = [
-            hex_color("8A008A", 138, 0, 138),
-            hex_color("00D1FF", 0, 209, 255),
-            hex_color("FFFFFF", 255, 255, 255),
+        let rumble_stops = vec![
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+            Color::from_hex("ff0000").unwrap_or(Color::rgb(255, 0, 0)),
+            Color::from_hex("ffff00").unwrap_or(Color::rgb(255, 255, 0)),
         ];
-        let final_gradient = Gradient::new(&stops, FINAL_GRADIENT_STEPS);
+        let rumble_grad = Gradient::new(rumble_stops, 8).colors();
+        let final_stops = vec![
+            Color::from_hex("8A008A").unwrap_or(Color::rgb(138, 0, 138)),
+            Color::from_hex("00D1FF").unwrap_or(Color::rgb(0, 209, 255)),
+            Color::from_hex("FFFFFF").unwrap_or(Color::rgb(255, 255, 255)),
+        ];
+        let final_grad = Gradient::new(final_stops, 12).colors();
 
-        let text_left = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord.column)
-            .min()
-            .unwrap_or(left);
-        let text_right = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord.column)
-            .max()
-            .unwrap_or(right);
-        let text_top = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord.row)
-            .max()
-            .unwrap_or(top);
-        let text_bottom = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord.row)
-            .min()
-            .unwrap_or(bottom);
-        let _ = (text_left, text_right);
-        let row_span = f64::from((text_top - text_bottom).max(1));
-
-        let mut rng = SimpleRng::new(0x00C0_FFEE_u64);
-        let mut pool: Vec<Coord> = terminal
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord)
-            .collect();
-        for i in (1..pool.len()).rev() {
-            let j = rng.index(i + 1);
-            pool.swap(i, j);
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return vec![sgr_frame(" ", Color::rgb(255, 0, 0))];
         }
 
-        let mut actors: Vec<Actor> = terminal
-            .get_characters()
-            .iter()
-            .enumerate()
-            .map(|(idx, ch)| {
-                let jumbled = pool[idx];
-                let blast = match rng.index(4) {
-                    0 => Coord::new(left, rng.inclusive(bottom, top)),
-                    1 => Coord::new(right, rng.inclusive(bottom, top)),
-                    2 => Coord::new(rng.inclusive(left, right), bottom),
-                    _ => Coord::new(rng.inclusive(left, right), top),
-                };
-                let progress = f64::from(text_top - ch.input_coord.row) / row_span;
-                let final_color = final_gradient.mapped_color(progress).unwrap_or(unstable);
-                Actor {
-                    id: ch.id,
-                    symbol: ch.input_symbol.clone(),
-                    home: ch.input_coord,
-                    jumbled,
-                    blast,
-                    bg: ch.input_bg,
-                    rumble_spectrum: Gradient::new(&[final_color, unstable], RUMBLE_GRADIENT_STEPS)
-                        .spectrum()
-                        .to_vec(),
-                    final_spectrum: Gradient::new(&[unstable, final_color], FINAL_GRADIENT_STEPS)
-                        .spectrum()
-                        .to_vec(),
-                    traveled: 0.0,
-                    return_tick: 0,
-                    stage: Stage::Hold,
-                }
-            })
-            .collect();
+        let n = ids.len();
+        let mut origins: Vec<Coord> = Vec::new();
+        let mut symbols: Vec<char> = Vec::new();
+        for ch in term.get_characters() {
+            origins.push(ch.input_coord);
+            symbols.push(ch.input_symbol);
+        }
 
-        for actor in &actors {
-            paint(
-                &mut terminal,
-                actor,
-                actor.jumbled,
-                spectrum_color(&actor.rumble_spectrum, 0, RUMBLE_COLOR_HOLD),
-            );
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let rumble = ch.animation.new_scene("rumble");
+                rumble.is_looping = true;
+                for c in &rumble_grad {
+                    rumble.add_frame(
+                        ch.input_symbol,
+                        2,
+                        Some(ColorPair {
+                            fg: Some(*c),
+                            bg: None,
+                        }),
+                    );
+                }
+                let home = ch.animation.new_scene("home");
+                let fc = final_grad[i % final_grad.len()];
+                home.add_frame(
+                    ch.input_symbol,
+                    1,
+                    Some(ColorPair {
+                        fg: Some(fc),
+                        bg: None,
+                    }),
+                );
+                ch.animation.activate_scene("rumble");
+            }
+            term.set_character_visibility(*id, true);
         }
 
         let mut frames = Vec::new();
-        let mut rumble_left = RUMBLE_FRAMES;
-        let mut anim_tick = 0u32;
+        // rumble in place
+        for _ in 0..18 {
+            term.step_all();
+            frames.push(render_ansi(&term));
+        }
 
-        for _ in 0..MAX_FRAMES {
-            if rumble_left > 0 {
-                for actor in &actors {
-                    if let Some(ch) = terminal.get_character_mut(actor.id) {
-                        ch.motion.current_coord.column += rng.inclusive(-1, 1);
-                        ch.motion.current_coord.row += rng.inclusive(-1, 1);
-                        ch.animation.set_appearance(
-                            &actor.symbol,
-                            Some(ColorPair::new(
-                                Some(spectrum_color(
-                                    &actor.rumble_spectrum,
-                                    anim_tick,
-                                    RUMBLE_COLOR_HOLD,
-                                )),
-                                actor.bg,
-                            )),
-                        );
-                    }
-                }
-                rumble_left -= 1;
-                anim_tick = anim_tick.saturating_add(1);
-                frames.push(terminal.render_frame());
-                continue;
+        // explode toward canvas edges
+        for (i, id) in ids.iter().enumerate() {
+            let dest = match i % 4 {
+                0 => Coord::new(0, origins[i].row),
+                1 => Coord::new((width as i32).saturating_sub(1), origins[i].row),
+                2 => Coord::new(origins[i].column, 0),
+                _ => Coord::new(origins[i].column, (height as i32).saturating_sub(1)),
+            };
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let p = ch.motion.new_path("explosion");
+                p.speed = 0.35;
+                p.easing = Easing::OutCubic;
+                p.new_waypoint("edge", dest);
+                ch.motion.activate_path("explosion");
             }
+        }
+        for _ in 0..28 {
+            term.step_all();
+            frames.push(render_ansi(&term));
+        }
 
-            let mut all_rest = true;
-            for actor in &mut actors {
-                match actor.stage {
-                    Stage::Hold => {
-                        actor.stage = Stage::Out;
-                        actor.traveled = 0.0;
-                        if let Some(ch) = terminal.get_character_mut(actor.id) {
-                            ch.motion.current_coord = actor.jumbled;
-                        }
-                        step_out(actor, &mut terminal, anim_tick);
-                        all_rest = false;
-                    }
-                    Stage::Out => {
-                        step_out(actor, &mut terminal, anim_tick);
-                        all_rest = false;
-                    }
-                    Stage::Back => {
-                        step_back(actor, &mut terminal);
-                        if actor.stage != Stage::Rest {
-                            all_rest = false;
-                        }
-                    }
-                    Stage::Rest => {}
-                }
+        // reassemble
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let p = ch.motion.new_path("reassembly");
+                p.speed = 0.25;
+                p.easing = Easing::InOutQuad;
+                p.new_waypoint("home", origins[i]);
+                ch.motion.activate_path("reassembly");
+                ch.animation.activate_scene("home");
             }
-            anim_tick = anim_tick.saturating_add(1);
-            frames.push(terminal.render_frame());
-            if all_rest {
-                break;
-            }
+        }
+        for _ in 0..36 {
+            term.step_all();
+            frames.push(render_ansi(&term));
+        }
+
+        // hold final
+        for _ in 0..8 {
+            frames.push(render_ansi(&term));
         }
 
         if frames.is_empty() {
-            frames.push(terminal.render_frame());
+            frames.push(sgr_frame(&symbols.iter().collect::<String>(), Color::rgb(0, 209, 255)));
         }
         frames
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    Hold,
-    Out,
-    Back,
-    Rest,
-}
-
-struct Actor {
-    id: CharacterId,
-    symbol: String,
-    home: Coord,
-    jumbled: Coord,
-    blast: Coord,
-    bg: Option<Color>,
-    rumble_spectrum: Vec<Color>,
-    final_spectrum: Vec<Color>,
-    traveled: f64,
-    return_tick: u32,
-    stage: Stage,
-}
-
-fn step_out(actor: &mut Actor, terminal: &mut Terminal, anim_tick: u32) {
-    let len = distance(actor.jumbled, actor.blast);
-    actor.traveled += EXPLOSION_SPEED;
-    let done = len <= 0.0 || actor.traveled >= len;
-    let t = if len <= 0.0 {
-        1.0
-    } else {
-        (actor.traveled / len).clamp(0.0, 1.0)
-    };
-    let coord = lerp_coord(actor.jumbled, actor.blast, out_expo(t));
-    paint(
-        terminal,
-        actor,
-        coord,
-        spectrum_color(&actor.rumble_spectrum, anim_tick, RUMBLE_COLOR_HOLD),
-    );
-    if done {
-        actor.stage = Stage::Back;
-        actor.traveled = 0.0;
-        actor.return_tick = 0;
-    }
-}
-
-fn step_back(actor: &mut Actor, terminal: &mut Terminal) {
-    let len = distance(actor.blast, actor.home);
-    actor.traveled += REASSEMBLY_SPEED;
-    let move_done = len <= 0.0 || actor.traveled >= len;
-    let t = if len <= 0.0 {
-        1.0
-    } else {
-        (actor.traveled / len).clamp(0.0, 1.0)
-    };
-    let coord = lerp_coord(actor.blast, actor.home, out_expo(t));
-    paint(
-        terminal,
-        actor,
-        coord,
-        spectrum_color(&actor.final_spectrum, actor.return_tick, FINAL_COLOR_HOLD),
-    );
-    let color_frames = (actor.final_spectrum.len() as u32).saturating_mul(FINAL_COLOR_HOLD).max(1);
-    actor.return_tick = actor.return_tick.saturating_add(1);
-    if move_done && actor.return_tick >= color_frames {
-        actor.stage = Stage::Rest;
-        paint(
-            terminal,
-            actor,
-            actor.home,
-            spectrum_color(&actor.final_spectrum, u32::MAX, FINAL_COLOR_HOLD),
-        );
-    }
-}
-
-fn paint(terminal: &mut Terminal, actor: &Actor, coord: Coord, fg: Color) {
-    if let Some(ch) = terminal.get_character_mut(actor.id) {
-        ch.motion.current_coord = coord;
-        ch.animation
-            .set_appearance(&actor.symbol, Some(ColorPair::new(Some(fg), actor.bg)));
-    }
-}
-
-fn spectrum_color(spectrum: &[Color], tick: u32, hold: u32) -> Color {
-    if spectrum.is_empty() {
-        return Color::rgb(255, 255, 255);
-    }
-    let idx = (tick / hold.max(1)) as usize;
-    spectrum[idx.min(spectrum.len() - 1)]
-}
-
-fn out_expo(t: f64) -> f64 {
-    if t >= 1.0 {
-        1.0
-    } else if t <= 0.0 {
-        0.0
-    } else {
-        1.0 - 2f64.powf(-10.0 * t)
-    }
-}
-
-fn hex_color(hex: &str, r: u8, g: u8, b: u8) -> Color {
-    Color::from_hex(hex).unwrap_or(Color::rgb(r, g, b))
-}
-
-struct SimpleRng(u64);
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 32) as u32
-    }
-
-    fn inclusive(&mut self, lo: i32, hi: i32) -> i32 {
-        if hi <= lo {
-            return lo;
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width.max(1);
+    let h = term.canvas.height.max(1);
+    let mut grid = vec![vec![' '; w]; h];
+    let mut cols = vec![vec![None; w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
         }
-        let span = (i64::from(hi) - i64::from(lo) + 1) as u32;
-        lo.saturating_add((self.next() % span) as i32)
-    }
-
-    fn index(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next() as usize) % n
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 {
+            let ux = x as usize;
+            let uy = y as usize;
+            if ux < w && uy < h {
+                grid[uy][ux] = ch.animation.current_character_visual.symbol;
+                cols[uy][ux] = ch
+                    .animation
+                    .current_character_visual
+                    .colors
+                    .and_then(|p| p.fg)
+                    .or(ch.colors.and_then(|p| p.fg));
+            }
         }
     }
+    let mut out = String::new();
+    for y in 0..h {
+        for x in 0..w {
+            let c = grid[y][x];
+            if let Some(col) = cols[y][x] {
+                out.push_str(&format!(
+                    "\x1b[38;2;{};{};{}m{}\x1b[0m",
+                    col.r, col.g, col.b, c
+                ));
+            } else if c != ' ' {
+                out.push_str(&format!("\x1b[38;2;255;80;80m{c}\x1b[0m"));
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn sgr_frame(s: &str, c: Color) -> String {
+    format!("\x1b[38;2;{};{};{}m{s}\x1b[0m\n", c.r, c.g, c.b)
 }

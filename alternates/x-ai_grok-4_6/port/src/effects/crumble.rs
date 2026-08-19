@@ -1,21 +1,9 @@
-use std::collections::HashMap;
-
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::motion::Motion;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{find_coord_on_bezier_curve, lerp_coord, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const HIGHLIGHT: Color = Color { r: 255, g: 255, b: 255 };
-const DUST: Color = Color { r: 0, g: 0, b: 0 };
-const FLASH_FRAMES: u32 = 12;
-const WEAKEN_FRAMES: u32 = 16;
-const INTRO_HOLD: usize = 8;
-const DUST_HOLD: usize = 6;
-const END_HOLD: usize = 8;
-const ACTIVATE_PER_FRAME: usize = 3;
-const MAX_FRAMES: usize = 20_000;
 
 pub struct Crumble;
 
@@ -31,302 +19,174 @@ impl Effect for Crumble {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        let bottom = term.canvas.bottom;
-        let top = term.canvas.top;
-        let center = term.canvas.center();
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height.max(4));
 
-        let infos = collect_infos(&term);
-        if infos.is_empty() {
-            term.show_all();
-            return vec![term.render_frame()];
+        let weaken_stops = vec![
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+            Color::from_hex("444444").unwrap_or(Color::rgb(68, 68, 68)),
+            Color::from_hex("888888").unwrap_or(Color::rgb(136, 136, 136)),
+        ];
+        let weaken_grad = Gradient::new(weaken_stops, 8);
+        let weaken_colors = weaken_grad.colors();
+
+        let restore_stops = vec![
+            Color::from_hex("888888").unwrap_or(Color::rgb(136, 136, 136)),
+            Color::from_hex("00d7ff").unwrap_or(Color::rgb(0, 215, 255)),
+            Color::from_hex("ffffff").unwrap_or(Color::rgb(255, 255, 255)),
+        ];
+        let restore_grad = Gradient::new(restore_stops, 6);
+        let restore_colors = restore_grad.colors();
+
+        let bottom = term.canvas.height.saturating_sub(1) as i32;
+        let top = 0i32;
+        let center_col = (term.canvas.width as i32) / 2;
+        let center_row = (term.canvas.height as i32) / 2;
+
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            term.set_character_visibility(*id, true);
         }
 
-        term.show_all();
-        for info in &infos {
-            paint(&mut term, info, info.input, info.final_color);
-        }
-
-        let mut phases: HashMap<CharacterId, Phase> = infos
-            .iter()
-            .map(|info| (info.id, Phase::Idle))
-            .collect();
-        let mut frames: Vec<String> = Vec::new();
-
-        for _ in 0..INTRO_HOLD {
-            frames.push(term.render_frame());
-        }
-
-        while frames.len() < MAX_FRAMES {
-            activate_unsupported(&infos, &mut phases);
-            apply_all(&mut term, &infos, &phases, bottom, top, center);
-            frames.push(term.render_frame());
-            step_all(&infos, &mut phases, bottom);
-            if phases.values().all(|phase| matches!(phase, Phase::Fallen)) {
-                break;
+        for ch in term.get_characters_mut() {
+            let weaken = ch.animation.new_scene("weaken");
+            for (i, col) in weaken_colors.iter().enumerate() {
+                weaken.add_frame(
+                    ch.input_symbol,
+                    if i == 0 { 3 } else { 2 },
+                    Some(ColorPair {
+                        fg: Some(*col),
+                        bg: None,
+                    }),
+                );
             }
+            let bounce = ch.animation.new_scene("bounce");
+            for col in &restore_colors {
+                bounce.add_frame(
+                    ch.input_symbol,
+                    2,
+                    Some(ColorPair {
+                        fg: Some(*col),
+                        bg: None,
+                    }),
+                );
+            }
+            bounce.add_frame(
+                ch.input_symbol,
+                4,
+                Some(ColorPair {
+                    fg: Some(Color::rgb(255, 255, 255)),
+                    bg: None,
+                }),
+            );
+
+            let fall = ch.motion.new_path("fall");
+            fall.speed = 0.35 + ((ch.id.0 as f64) * 0.017) % 0.45;
+            fall.easing = Easing::OutCubic;
+            let _ = fall.new_waypoint("bot", Coord::new(ch.input_coord.column, bottom));
+
+            let lift = ch.motion.new_path("top");
+            lift.speed = 0.55;
+            lift.easing = Easing::OutSine;
+            let _ = lift.new_waypoint(
+                "mid",
+                Coord::new(center_col, center_row),
+            );
+            let _ = lift.new_waypoint("apex", Coord::new(ch.input_coord.column, top));
+
+            let home = ch.motion.new_path("home");
+            home.speed = 0.4;
+            home.easing = Easing::InOutQuad;
+            let _ = home.new_waypoint("in", ch.input_coord);
+
+            ch.animation.activate_scene("weaken");
         }
 
-        for _ in 0..DUST_HOLD {
-            if frames.len() >= MAX_FRAMES {
-                break;
-            }
-            apply_all(&mut term, &infos, &phases, bottom, top, center);
-            frames.push(term.render_frame());
-        }
+        let n = ids.len();
+        let mut frames = Vec::new();
+        let total = (n as i32 * 3 + 80).max(90) as usize;
 
-        for info in &infos {
-            phases.insert(info.id, Phase::Fly { frame: 0 });
-        }
-        while frames.len() < MAX_FRAMES {
-            apply_all(&mut term, &infos, &phases, bottom, top, center);
-            frames.push(term.render_frame());
-            step_all(&infos, &mut phases, bottom);
-            if phases.values().all(|phase| matches!(phase, Phase::Flown)) {
-                break;
+        for tick in 0..total {
+            if tick % 3 == 0 {
+                let start = (tick / 3).min(n.saturating_sub(1));
+                if start < n {
+                    let id = ids[start];
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == id) {
+                        if ch.motion.active_path.is_none() {
+                            ch.motion.activate_path("fall");
+                            ch.animation.activate_scene("weaken");
+                        }
+                    }
+                }
             }
-        }
 
-        for info in &infos {
-            phases.insert(info.id, Phase::Return { frame: 0 });
-        }
-        while frames.len() < MAX_FRAMES {
-            apply_all(&mut term, &infos, &phases, bottom, top, center);
-            frames.push(term.render_frame());
-            step_all(&infos, &mut phases, bottom);
-            if phases.values().all(|phase| matches!(phase, Phase::Done)) {
-                break;
+            for ch in term.get_characters_mut() {
+                if ch.motion.active_path.as_deref() == Some("fall") {
+                    if let Some(p) = ch.motion.query_path("fall") {
+                        if (ch.motion.current_coord.row - bottom).abs() <= 0 || p.speed < 0.0 {
+                            // path progress is internal; bounce when near bottom
+                        }
+                    }
+                    if ch.motion.current_coord.row >= bottom.saturating_sub(0)
+                        && tick > 8
+                    {
+                        ch.animation.activate_scene("bounce");
+                        ch.motion.activate_path("top");
+                    }
+                } else if ch.motion.active_path.as_deref() == Some("top") {
+                    if ch.motion.current_coord.row <= top + 1 && tick > 16 {
+                        ch.motion.activate_path("home");
+                    }
+                }
             }
-        }
 
-        for _ in 0..END_HOLD {
-            if frames.len() >= MAX_FRAMES {
-                break;
+            term.step_all();
+
+            let mut grid = vec![vec![(' ', None::<Color>); width]; height.max(term.canvas.height)];
+            let gh = grid.len();
+            let gw = width;
+            for ch in term.get_characters() {
+                if !ch.is_visible {
+                    continue;
+                }
+                let x = ch.current_coord.column;
+                let y = ch.current_coord.row;
+                if x >= 0 && y >= 0 && (x as usize) < gw && (y as usize) < gh {
+                    let col = ch
+                        .animation
+                        .current_character_visual
+                        .colors
+                        .and_then(|p| p.fg)
+                        .or_else(|| {
+                            ch.colors.and_then(|p| p.fg)
+                        });
+                    grid[y as usize][x as usize] = (ch.animation.current_character_visual.symbol, col);
+                }
             }
-            apply_all(&mut term, &infos, &phases, bottom, top, center);
-            frames.push(term.render_frame());
+
+            let mut out = String::new();
+            for row in &grid {
+                for (sym, col) in row {
+                    if let Some(c) = col {
+                        out.push_str(&format!(
+                            "\x1b[38;2;{};{};{}m{}\x1b[0m",
+                            c.r, c.g, c.b, sym
+                        ));
+                    } else if *sym != ' ' {
+                        out.push_str("\x1b[38;2;180;180;180m");
+                        out.push(*sym);
+                        out.push_str("\x1b[0m");
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                out.push('\n');
+            }
+            frames.push(out);
         }
 
         frames
     }
-}
-
-#[derive(Clone, Copy)]
-enum Phase {
-    Idle,
-    Flash { frame: u32 },
-    Weaken { frame: u32 },
-    Fall { frame: u32 },
-    Fallen,
-    Fly { frame: u32 },
-    Flown,
-    Return { frame: u32 },
-    Done,
-}
-
-struct CharInfo {
-    id: CharacterId,
-    symbol: String,
-    input: Coord,
-    above: Option<CharacterId>,
-    final_color: Color,
-}
-
-fn collect_infos(term: &Terminal) -> Vec<CharInfo> {
-    let chars = term.get_characters();
-    let min_row = chars.iter().map(|ch| ch.input_coord.row).min().unwrap_or(1);
-    let max_row = chars.iter().map(|ch| ch.input_coord.row).max().unwrap_or(1);
-    let stops = [
-        Color::from_hex("bb97ff").unwrap_or(Color::rgb(187, 151, 255)),
-        Color::from_hex("8c82fc").unwrap_or(Color::rgb(140, 130, 252)),
-        Color::from_hex("675af6").unwrap_or(Color::rgb(103, 90, 246)),
-    ];
-    let gradient = Gradient::new(&stops, 12);
-    let span = f64::from((max_row - min_row).max(1));
-    chars
-        .iter()
-        .map(|ch| {
-            let progress = f64::from(ch.input_coord.row - min_row) / span;
-            let final_color = gradient.mapped_color(progress).unwrap_or(stops[0]);
-            CharInfo {
-                id: ch.id,
-                symbol: ch.input_symbol.clone(),
-                input: ch.input_coord,
-                above: ch.neighbors.above,
-                final_color,
-            }
-        })
-        .collect()
-}
-
-fn activate_unsupported(infos: &[CharInfo], phases: &mut HashMap<CharacterId, Phase>) {
-    let mut candidates: Vec<(i32, i32, CharacterId)> = Vec::new();
-    for info in infos {
-        if !matches!(phases.get(&info.id), Some(Phase::Idle)) {
-            continue;
-        }
-        let unsupported = match info.above {
-            None => true,
-            Some(above) => matches!(
-                phases.get(&above),
-                Some(Phase::Fall { .. } | Phase::Fallen | Phase::Fly { .. } | Phase::Flown | Phase::Return { .. } | Phase::Done)
-            ),
-        };
-        if unsupported {
-            candidates.push((-info.input.row, info.input.column, info.id));
-        }
-    }
-    candidates.sort_unstable();
-    for (_, _, id) in candidates.into_iter().take(ACTIVATE_PER_FRAME) {
-        phases.insert(id, Phase::Flash { frame: 0 });
-    }
-}
-
-fn step_all(infos: &[CharInfo], phases: &mut HashMap<CharacterId, Phase>, bottom: i32) {
-    for info in infos {
-        let Some(phase) = phases.get_mut(&info.id) else {
-            continue;
-        };
-        match phase {
-            Phase::Idle | Phase::Fallen | Phase::Flown | Phase::Done => {}
-            Phase::Flash { frame } => {
-                *frame += 1;
-                if *frame >= FLASH_FRAMES {
-                    *phase = Phase::Weaken { frame: 0 };
-                }
-            }
-            Phase::Weaken { frame } => {
-                *frame += 1;
-                if *frame >= WEAKEN_FRAMES {
-                    *phase = Phase::Fall { frame: 0 };
-                }
-            }
-            Phase::Fall { frame } => {
-                *frame += 1;
-                if *frame >= fall_duration(info.input.row, bottom) {
-                    *phase = Phase::Fallen;
-                }
-            }
-            Phase::Fly { frame } => {
-                *frame += 1;
-                if *frame >= fly_duration(info.input.row, bottom) {
-                    *phase = Phase::Flown;
-                }
-            }
-            Phase::Return { frame } => {
-                *frame += 1;
-                if *frame >= return_duration(info.input.row, bottom) {
-                    *phase = Phase::Done;
-                }
-            }
-        }
-    }
-}
-
-fn apply_all(
-    term: &mut Terminal,
-    infos: &[CharInfo],
-    phases: &HashMap<CharacterId, Phase>,
-    bottom: i32,
-    top: i32,
-    center: Coord,
-) {
-    for info in infos {
-        let phase = phases.get(&info.id).copied().unwrap_or(Phase::Idle);
-        let (coord, color) = visual_for(info, phase, bottom, top, center);
-        paint(term, info, coord, color);
-    }
-}
-
-fn visual_for(info: &CharInfo, phase: Phase, bottom: i32, top: i32, center: Coord) -> (Coord, Color) {
-    match phase {
-        Phase::Idle => (info.input, info.final_color),
-        Phase::Flash { frame } => {
-            let gradient = Gradient::new(&[info.final_color, HIGHLIGHT], 6);
-            let color = gradient
-                .mapped_color(progress(frame, FLASH_FRAMES))
-                .unwrap_or(HIGHLIGHT);
-            (info.input, color)
-        }
-        Phase::Weaken { frame } => {
-            let gradient = Gradient::new(&[HIGHLIGHT, DUST], 6);
-            let color = gradient
-                .mapped_color(progress(frame, WEAKEN_FRAMES))
-                .unwrap_or(DUST);
-            (info.input, color)
-        }
-        Phase::Fall { frame } => {
-            let dest = Coord::new(info.input.column, bottom);
-            let t = out_bounce(progress(frame, fall_duration(info.input.row, bottom)));
-            (lerp_coord(info.input, dest, t), DUST)
-        }
-        Phase::Fallen => (Coord::new(info.input.column, bottom), DUST),
-        Phase::Fly { frame } => {
-            let start = Coord::new(info.input.column, bottom);
-            let dest = Coord::new(info.input.column, top);
-            let t = out_quint(progress(frame, fly_duration(info.input.row, bottom)));
-            (find_coord_on_bezier_curve(start, center, dest, t), DUST)
-        }
-        Phase::Flown => (Coord::new(info.input.column, top), DUST),
-        Phase::Return { frame } => {
-            let start = Coord::new(info.input.column, top);
-            let t = out_quint(progress(frame, return_duration(info.input.row, bottom)));
-            let gradient = Gradient::new(&[DUST, info.final_color], 6);
-            let color = gradient.mapped_color(t).unwrap_or(info.final_color);
-            (lerp_coord(start, info.input, t), color)
-        }
-        Phase::Done => (info.input, info.final_color),
-    }
-}
-
-fn paint(term: &mut Terminal, info: &CharInfo, coord: Coord, color: Color) {
-    if let Some(ch) = term.get_character_mut(info.id) {
-        ch.motion = Motion::new(coord);
-        ch.is_visible = true;
-        ch.animation
-            .set_appearance(&info.symbol, Some(ColorPair::fg(color)));
-    }
-}
-
-fn fall_duration(from_row: i32, bottom: i32) -> u32 {
-    (from_row - bottom).unsigned_abs().max(1).saturating_mul(3).clamp(18, 48)
-}
-
-fn fly_duration(from_row: i32, bottom: i32) -> u32 {
-    (from_row - bottom).unsigned_abs().max(1).saturating_mul(2).clamp(16, 36)
-}
-
-fn return_duration(from_row: i32, bottom: i32) -> u32 {
-    (from_row - bottom).unsigned_abs().max(1).saturating_mul(2).clamp(18, 40)
-}
-
-fn progress(frame: u32, total: u32) -> f64 {
-    if total <= 1 {
-        1.0
-    } else {
-        (f64::from(frame) / f64::from(total - 1)).clamp(0.0, 1.0)
-    }
-}
-
-fn out_bounce(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    let n1 = 7.5625;
-    let d1 = 2.75;
-    if t < 1.0 / d1 {
-        n1 * t * t
-    } else if t < 2.0 / d1 {
-        let t = t - 1.5 / d1;
-        n1 * t * t + 0.75
-    } else if t < 2.5 / d1 {
-        let t = t - 2.25 / d1;
-        n1 * t * t + 0.9375
-    } else {
-        let t = t - 2.625 / d1;
-        n1 * t * t + 0.984375
-    }
-}
-
-fn out_quint(t: f64) -> f64 {
-    let u = 1.0 - t.clamp(0.0, 1.0);
-    1.0 - u * u * u * u * u
 }

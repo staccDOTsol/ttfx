@@ -1,18 +1,9 @@
 use super::Effect;
 use crate::engine::character::CharacterId;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{find_length_of_line, lerp_coord, Coord};
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const RAIN_HEX: [&str; 8] = [
-    "00315C", "004C8F", "0075DB", "3F91D9", "78B9F2", "9AC8F5", "B8D8F8", "E3EFFC",
-];
-const FINAL_HEX: [&str; 2] = ["00315C", "E3EFFC"];
-const MOVEMENT_SPEED: f64 = 0.15;
-const FINAL_GRADIENT_STEPS: usize = 12;
-const FINAL_GRADIENT_FRAMES: usize = 5;
-const RAINDROP_GRADIENT_STEPS: usize = 8;
-const MAX_FRAMES: usize = 20_000;
 
 pub struct Rain;
 
@@ -28,231 +19,152 @@ impl Effect for Rain {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        term.hide_all();
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
-        }
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height);
 
-        let canvas_top = term.canvas.top;
-        let rain_palette: Vec<Color> = RAIN_HEX.iter().copied().map(hex_color).collect();
-        let final_stops: Vec<Color> = FINAL_HEX.iter().copied().map(hex_color).collect();
-        let final_gradient = Gradient::new(&final_stops, FINAL_GRADIENT_STEPS);
-        let mut rng = Rng::new(0x5241_494E_3031);
+        let rain_stops = vec![
+            Color::from_hex("00315C").unwrap_or(Color::rgb(0, 49, 92)),
+            Color::from_hex("03ABFC").unwrap_or(Color::rgb(3, 171, 252)),
+        ];
+        let rain_grad = Gradient::new(rain_stops, 8);
+        let rain_colors = rain_grad.colors();
 
-        let mut drops: Vec<Drop> = Vec::new();
-        {
-            let characters = term.get_characters();
-            let text_left = characters
-                .iter()
-                .map(|c| c.input_coord.column)
-                .min()
-                .unwrap_or(1);
-            let text_right = characters
-                .iter()
-                .map(|c| c.input_coord.column)
-                .max()
-                .unwrap_or(1);
-            let text_bottom = characters
-                .iter()
-                .map(|c| c.input_coord.row)
-                .min()
-                .unwrap_or(1);
-            let text_top = characters
-                .iter()
-                .map(|c| c.input_coord.row)
-                .max()
-                .unwrap_or(1);
-            let col_denom = f64::from((text_right - text_left).max(1));
-            let row_denom = f64::from((text_top - text_bottom).max(1));
+        let final_stops = vec![
+            Color::from_hex("8A008A").unwrap_or(Color::rgb(138, 0, 138)),
+            Color::from_hex("00D1FF").unwrap_or(Color::rgb(0, 209, 255)),
+            Color::from_hex("FFFFFF").unwrap_or(Color::rgb(255, 255, 255)),
+        ];
+        let final_grad = Gradient::new(final_stops, 12);
+        let final_colors = final_grad.colors();
 
-            for ch in characters {
-                let progress = ((f64::from(ch.input_coord.column - text_left) / col_denom)
-                    + (f64::from(ch.input_coord.row - text_bottom) / row_denom))
-                    / 2.0;
-                let final_color = final_gradient
-                    .mapped_color(progress)
-                    .unwrap_or(rain_palette[0]);
-                let rain_color = rain_palette[rng.randint(0, rain_palette.len() - 1)];
-                let start = Coord::new(ch.input_coord.column, canvas_top);
-                let target = ch.input_coord;
-                let fade = {
-                    let spectrum =
-                        Gradient::new(&[rain_color, final_color], RAINDROP_GRADIENT_STEPS);
-                    let colors = spectrum.spectrum().to_vec();
-                    if colors.is_empty() {
-                        vec![final_color]
-                    } else {
-                        colors
-                    }
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        let n = ids.len().max(1);
+
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let rain_c = rain_colors[i % rain_colors.len()];
+                let fin_c = {
+                    let span = (width.max(1) + height.max(1)) as i32;
+                    let t = ((ch.input_coord.column + ch.input_coord.row).max(0) as usize)
+                        % final_colors.len().max(1);
+                    let _ = span;
+                    final_colors[t]
                 };
-                drops.push(Drop {
-                    id: ch.id,
-                    start,
-                    target,
-                    speed: MOVEMENT_SPEED * rng.randint(1, 3) as f64,
-                    traveled: 0.0,
-                    total: find_length_of_line(start, target),
-                    rain_color,
-                    final_color,
-                    fade,
-                    phase: Phase::Pending,
-                });
+                let start = Coord::new(ch.input_coord.column, -(i as i32 % 8) - 1);
+                ch.motion.current_coord = start;
+                ch.current_coord = start;
+                {
+                    let scn = ch.animation.new_scene("raindrop");
+                    scn.add_frame(ch.input_symbol, 1, Some(ColorPair { fg: Some(rain_c), bg: None }));
+                }
+                {
+                    let scn = ch.animation.new_scene("final");
+                    scn.add_frame(ch.input_symbol, 1, Some(ColorPair { fg: Some(fin_c), bg: None }));
+                }
+                ch.animation.activate_scene("raindrop");
+                let path = ch.motion.new_path("fall");
+                path.speed = 0.35 + ((i as f64 * 0.17) % 0.45);
+                path.easing = Easing::InQuad;
+                path.new_waypoint("home", ch.input_coord);
+                ch.motion.activate_path("fall");
             }
         }
 
-        for drop in &drops {
-            apply(term.get_character_mut(drop.id), drop.start, drop.rain_color);
-        }
+        let mut pending: Vec<CharacterId> = ids.clone();
+        pending.sort_by_key(|id| {
+            term.get_characters()
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| (c.input_coord.column, c.input_coord.row))
+                .unwrap_or((0, 0))
+        });
 
-        let mut groups: std::collections::BTreeMap<i32, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (idx, drop) in drops.iter().enumerate() {
-            groups.entry(drop.target.row).or_default().push(idx);
-        }
-        let mut rows: Vec<Vec<usize>> = groups.into_iter().map(|(_, row)| row).collect();
-
+        let mut active: Vec<CharacterId> = Vec::new();
         let mut frames = Vec::new();
-        loop {
-            if let Some(mut row) = rows.pop() {
-                let release = rng.randint(1, 3);
-                for _ in 0..release {
-                    if row.is_empty() {
-                        break;
-                    }
-                    let pick = rng.randint(0, row.len() - 1);
-                    let idx = row.remove(pick);
-                    term.set_character_visibility(drops[idx].id, true);
-                    drops[idx].phase = if drops[idx].total <= 0.0 {
-                        Phase::Fading(0)
-                    } else {
-                        Phase::Falling
-                    };
-                }
-                if !row.is_empty() {
-                    rows.push(row);
+        let mut tick = 0usize;
+        let max_frames = 400 + n * 2;
+
+        while tick < max_frames {
+            if !pending.is_empty() && tick % 2 == 0 {
+                let batch = ((n / 12).max(1)).min(pending.len());
+                for _ in 0..batch {
+                    let id = pending.remove(0);
+                    term.set_character_visibility(id, true);
+                    active.push(id);
                 }
             }
 
-            for drop in &mut drops {
-                match drop.phase {
-                    Phase::Falling => {
-                        drop.traveled += drop.speed;
-                        let t = if drop.total <= 0.0 {
-                            1.0
-                        } else {
-                            (drop.traveled / drop.total).clamp(0.0, 1.0)
-                        };
-                        let eased = t * t * t * t;
-                        let coord = lerp_coord(drop.start, drop.target, eased);
-                        apply(term.get_character_mut(drop.id), coord, drop.rain_color);
-                        if t >= 1.0 {
-                            drop.phase = Phase::Fading(0);
-                            apply(
-                                term.get_character_mut(drop.id),
-                                drop.target,
-                                drop.fade.first().copied().unwrap_or(drop.final_color),
-                            );
-                        }
-                    }
-                    Phase::Fading(frame) => {
-                        let idx = frame / FINAL_GRADIENT_FRAMES;
-                        if idx >= drop.fade.len() {
-                            drop.phase = Phase::Done;
-                            apply(
-                                term.get_character_mut(drop.id),
-                                drop.target,
-                                drop.final_color,
-                            );
-                        } else {
-                            apply(
-                                term.get_character_mut(drop.id),
-                                drop.target,
-                                drop.fade[idx],
-                            );
-                            drop.phase = Phase::Fading(frame + 1);
-                        }
-                    }
-                    Phase::Pending | Phase::Done => {}
-                }
-            }
+            term.step_all();
 
-            term.tick();
-            frames.push(term.render_frame());
-
-            let finished = rows.is_empty()
-                && drops
+            let mut still = Vec::new();
+            for id in active.drain(..) {
+                let done = term
+                    .get_characters()
                     .iter()
-                    .all(|d| matches!(d.phase, Phase::Done | Phase::Pending));
-            if finished || frames.len() >= MAX_FRAMES {
+                    .find(|c| c.id == id)
+                    .map(|c| c.current_coord == c.input_coord)
+                    .unwrap_or(true);
+                if done {
+                    if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == id) {
+                        ch.animation.activate_scene("final");
+                        ch.animation.step_animation();
+                    }
+                } else {
+                    still.push(id);
+                }
+            }
+            active = still;
+
+            frames.push(render_ansi(&term));
+            tick += 1;
+            if pending.is_empty() && active.is_empty() {
+                frames.push(render_ansi(&term));
                 break;
             }
         }
-
         if frames.is_empty() {
-            frames.push(term.render_frame());
+            frames.push(render_ansi(&term));
         }
         frames
     }
 }
 
-fn hex_color(hex: &str) -> Color {
-    Color::from_hex(hex).unwrap_or(Color::rgb(0, 49, 92))
-}
-
-fn apply(ch: Option<&mut crate::engine::character::EffectCharacter>, coord: Coord, color: Color) {
-    if let Some(ch) = ch {
-        ch.motion.current_coord = coord;
-        let symbol = ch.input_symbol.clone();
-        ch.animation
-            .set_appearance(&symbol, Some(ColorPair::fg(color)));
-    }
-}
-
-enum Phase {
-    Pending,
-    Falling,
-    Fading(usize),
-    Done,
-}
-
-struct Drop {
-    id: CharacterId,
-    start: Coord,
-    target: Coord,
-    speed: f64,
-    traveled: f64,
-    total: f64,
-    rain_color: Color,
-    final_color: Color,
-    fade: Vec<Color>,
-    phase: Phase,
-}
-
-struct Rng {
-    state: u64,
-}
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed | 1,
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+            let fg = ch
+                .animation
+                .current_character_visual
+                .colors
+                .and_then(|p| p.fg)
+                .or_else(|| ch.colors.and_then(|p| p.fg));
+            grid[y as usize][x as usize] = (ch.animation.current_character_visual.symbol, fg);
         }
     }
-
-    fn next_u32(&mut self) -> u32 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x as u32
-    }
-
-    fn randint(&mut self, lo: usize, hi: usize) -> usize {
-        if hi <= lo {
-            return lo;
+    let mut out = String::new();
+    for row in grid {
+        for (sym, fg) in row {
+            if let Some(c) = fg {
+                out.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[0m", c.r, c.g, c.b, sym));
+            } else if sym != ' ' {
+                out.push_str("\x1b[38;2;3;171;252m");
+                out.push(sym);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push(' ');
+            }
         }
-        lo + (self.next_u32() as usize % (hi - lo + 1))
+        out.push('\n');
     }
+    out
 }

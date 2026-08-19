@@ -1,20 +1,9 @@
 use super::Effect;
-use crate::engine::{Terminal, TerminalConfig};
-use crate::utils::geometry::{distance, lerp_coord, Coord};
+use crate::engine::character::CharacterId;
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
-
-const MOVEMENT_SPEED: f64 = 0.3;
-const GRADIENT_STEPS: usize = 12;
-
-fn in_out_quart(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        8.0 * t * t * t * t
-    } else {
-        let u = -2.0 * t + 2.0;
-        1.0 - (u * u * u * u) / 2.0
-    }
-}
 
 pub struct Expand;
 
@@ -30,89 +19,111 @@ impl Effect for Expand {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
-        }
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height);
 
-        let center = term.canvas.center();
-        let input_coords: Vec<Coord> = term
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord)
-            .collect();
-
-        let min_row = input_coords
-            .iter()
-            .map(|c| c.row)
-            .min()
-            .unwrap_or(center.row);
-        let max_row = input_coords
-            .iter()
-            .map(|c| c.row)
-            .max()
-            .unwrap_or(center.row);
-        let row_span = f64::from((max_row - min_row).max(1));
+        let center = Coord {
+            column: (width as i32) / 2,
+            row: (height as i32) / 2,
+        };
 
         let gradient = Gradient::new(
-            &[
-                Color::rgb(0x8A, 0x00, 0x8A),
-                Color::rgb(0x00, 0xD1, 0xFF),
-                Color::rgb(0xFF, 0xFF, 0xFF),
+            vec![
+                Color::from_hex("8A008A").unwrap_or(Color::rgb(138, 0, 138)),
+                Color::from_hex("00D1FF").unwrap_or(Color::rgb(0, 209, 255)),
+                Color::from_hex("FFFFFF").unwrap_or(Color::rgb(255, 255, 255)),
             ],
-            GRADIENT_STEPS,
+            12,
         );
+        let palette = gradient.colors();
 
-        for ch in term.get_characters_mut() {
-            let progress = f64::from(ch.input_coord.row - min_row) / row_span;
-            let color = gradient
-                .mapped_color(progress)
-                .unwrap_or_else(|| Color::rgb(0xFF, 0xFF, 0xFF));
-            let symbol = ch.input_symbol.clone();
-            ch.animation
-                .set_appearance(&symbol, Some(ColorPair::fg(color)));
-            ch.motion.current_coord = center;
-            ch.is_visible = true;
-        }
-
-        let mut elapsed = vec![0usize; input_coords.len()];
-        let totals: Vec<usize> = input_coords
-            .iter()
-            .map(|&dest| {
-                let d = distance(center, dest);
-                if d == 0.0 {
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
+        for id in &ids {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let dist = ch.input_coord.distance(center);
+                let idx = if palette.is_empty() {
                     0
                 } else {
-                    (d / MOVEMENT_SPEED).ceil() as usize
-                }
-            })
-            .collect();
+                    ((dist * 0.35) as usize) % palette.len()
+                };
+                let color = palette.get(idx).copied().unwrap_or(Color::rgb(0, 209, 255));
+                let scn = ch.animation.new_scene("expand");
+                scn.add_frame(
+                    ch.input_symbol,
+                    1,
+                    Some(ColorPair {
+                        fg: Some(color),
+                        bg: None,
+                    }),
+                );
+                ch.animation.activate_scene("expand");
+                ch.motion.current_coord = center;
+                ch.current_coord = center;
+                let path = ch.motion.new_path("home");
+                path.speed = 0.35;
+                path.easing = Easing::OutCubic;
+                path.new_waypoint("dest", ch.input_coord);
+                ch.motion.activate_path("home");
+            }
+            term.set_character_visibility(*id, true);
+        }
 
-        let mut frames = Vec::new();
-        loop {
-            let mut moved = false;
-            {
-                let chars = term.get_characters_mut();
-                for (i, ch) in chars.iter_mut().enumerate() {
-                    if elapsed[i] < totals[i] {
-                        elapsed[i] += 1;
-                        let t = elapsed[i] as f64 / totals[i] as f64;
-                        ch.motion.current_coord =
-                            lerp_coord(center, input_coords[i], in_out_quart(t));
-                        moved = true;
-                    } else {
-                        ch.motion.current_coord = input_coords[i];
-                    }
-                }
-            }
-            if !moved && !frames.is_empty() {
-                break;
-            }
-            frames.push(term.render_frame());
-            if !moved {
+        let mut out = Vec::new();
+        for _ in 0..90 {
+            term.step_all();
+            out.push(render_ansi(&term, width, height));
+            let settled = term.get_characters().iter().all(|c| {
+                c.current_coord.column == c.input_coord.column
+                    && c.current_coord.row == c.input_coord.row
+            });
+            if settled && out.len() > 8 {
                 break;
             }
         }
-        frames
+        if out.is_empty() {
+            out.push(render_ansi(&term, width, height));
+        }
+        out
     }
+}
+
+fn render_ansi(term: &Terminal, width: usize, height: usize) -> String {
+    let mut grid: Vec<Vec<(char, Option<ColorPair>)>> =
+        vec![vec![(' ', None); width]; height];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
+        }
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
+            let vis = &ch.animation.current_character_visual;
+            grid[y as usize][x as usize] = (vis.symbol, vis.colors);
+        }
+    }
+    let mut s = String::new();
+    for row in grid {
+        for (sym, colors) in row {
+            if let Some(pair) = colors {
+                if let Some(fg) = pair.fg {
+                    s.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+                }
+                if let Some(bg) = pair.bg {
+                    s.push_str(&format!("\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b));
+                }
+                s.push(sym);
+                s.push_str("\x1b[0m");
+            } else if sym != ' ' {
+                s.push_str("\x1b[38;2;0;209;255m");
+                s.push(sym);
+                s.push_str("\x1b[0m");
+            } else {
+                s.push(' ');
+            }
+        }
+        s.push('\n');
+    }
+    s
 }

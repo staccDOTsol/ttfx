@@ -1,28 +1,15 @@
-//! Scattered effect — characters fly into place from random canvas positions.
-
 use super::Effect;
-use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::geometry::{find_length_of_line, lerp_coord, Coord};
+use crate::engine::character::CharacterId;
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::Easing;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Default movement speed from the Python `ScatteredConfig`.
-const MOVEMENT_SPEED: f64 = 0.3;
-/// Default `--final-gradient-steps` from the Python config.
-const GRADIENT_STEPS: usize = 12;
-const MAX_FRAMES: usize = 10_000;
-
-/// Move the characters into position from random starting locations.
 pub struct Scattered;
 
 impl Scattered {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for Scattered {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -32,134 +19,117 @@ impl Effect for Scattered {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut term = Terminal::from_input(input, TerminalConfig::default());
-        if term.character_count() == 0 {
-            return vec![term.render_frame()];
-        }
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1);
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
+        let mut term = Terminal::from_input(input, width, height);
 
-        let ends: Vec<Coord> = term
-            .get_characters()
-            .iter()
-            .map(|ch| ch.input_coord)
-            .collect();
-
-        let text_bottom = ends.iter().map(|c| c.row).min().unwrap_or(1);
-        let text_top = ends.iter().map(|c| c.row).max().unwrap_or(1);
-        let row_span = text_top - text_bottom;
-
-        // Python defaults: --final-gradient-stops 8A008A 00D1FF FFFFFF
         let gradient = Gradient::new(
-            &[
-                Color::rgb(0x8A, 0x00, 0x8A),
-                Color::rgb(0x00, 0xD1, 0xFF),
-                Color::rgb(0xFF, 0xFF, 0xFF),
+            vec![
+                Color::from_hex("88c0d0").unwrap_or(Color::rgb(0x88, 0xc0, 0xd0)),
+                Color::from_hex("81a1c1").unwrap_or(Color::rgb(0x81, 0xa1, 0xc1)),
+                Color::from_hex("5e81ac").unwrap_or(Color::rgb(0x5e, 0x81, 0xac)),
             ],
-            GRADIENT_STEPS,
+            8,
         );
+        let palette = gradient.colors();
+        let n_colors = palette.len().max(1);
 
-        let left = term.canvas.left;
-        let right = term.canvas.right;
-        let bottom = term.canvas.bottom;
-        let top = term.canvas.top;
+        let mut rng = 0xC0FFEE_u64;
+        let mut next_rand = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng
+        };
 
-        let mut rng = Lcg::new(fnv1a64(input));
-        let mut starts = Vec::with_capacity(ends.len());
-        let mut distances = Vec::with_capacity(ends.len());
+        let w = width as i32;
+        let h = height as i32;
+        let ids: Vec<CharacterId> = term.get_characters().iter().map(|c| c.id).collect();
 
-        for (ch, &end) in term.get_characters_mut().iter_mut().zip(ends.iter()) {
-            let start = Coord::new(rng.inclusive(left, right), rng.inclusive(bottom, top));
-            ch.motion.current_coord = start;
-            ch.is_visible = true;
-
-            // Vertical mapping: first stop at text_bottom, last stop at text_top.
-            let progress = if row_span == 0 {
-                1.0
-            } else {
-                f64::from(end.row - text_bottom) / f64::from(row_span)
-            };
-            if let Some(color) = gradient.mapped_color(progress) {
-                ch.animation
-                    .set_appearance(&ch.input_symbol, Some(ColorPair::fg(color)));
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(ch) = term.get_characters_mut().iter_mut().find(|c| c.id == *id) {
+                let rx = (next_rand() as i32).rem_euclid(w.max(1));
+                let ry = (next_rand() as i32).rem_euclid(h.max(1));
+                let start = Coord::new(rx, ry);
+                ch.motion.current_coord = start;
+                ch.current_coord = start;
+                let color = palette[i % n_colors];
+                let scn = ch.animation.new_scene("scatter");
+                scn.add_frame(
+                    ch.input_symbol,
+                    1,
+                    Some(ColorPair {
+                        fg: Some(color),
+                        bg: None,
+                    }),
+                );
+                ch.animation.activate_scene("scatter");
+                ch.animation.set_appearance(ch.input_symbol, Some(color));
+                let home = ch.input_coord;
+                let path = ch.motion.new_path("home");
+                path.speed = 0.35;
+                path.easing = Easing::OutQuad;
+                path.new_waypoint("dest", home);
+                ch.motion.activate_path("home");
             }
-
-            distances.push(find_length_of_line(start, end));
-            starts.push(start);
+            term.set_character_visibility(*id, true);
         }
 
-        let n = ends.len();
-        let mut traveled = vec![0.0_f64; n];
         let mut frames = Vec::new();
-
-        loop {
-            let mut active = false;
-            {
-                let chars = term.get_characters_mut();
-                for i in 0..n {
-                    if traveled[i] < distances[i] {
-                        traveled[i] += MOVEMENT_SPEED;
-                        active = true;
-                    }
-                    let t = if distances[i] <= 0.0 {
-                        1.0
-                    } else {
-                        in_out_back((traveled[i] / distances[i]).clamp(0.0, 1.0))
-                    };
-                    chars[i].motion.current_coord = lerp_coord(starts[i], ends[i], t);
-                }
-            }
-            if !active && !frames.is_empty() {
-                break;
-            }
-            frames.push(term.render_frame());
-            if !active || frames.len() >= MAX_FRAMES {
+        let max_frames = 240usize;
+        for _ in 0..max_frames {
+            frames.push(render_ansi(&term));
+            let settled = term.get_characters().iter().all(|c| {
+                c.current_coord.column == c.input_coord.column
+                    && c.current_coord.row == c.input_coord.row
+            });
+            term.step_all();
+            if settled {
                 break;
             }
         }
-
+        frames.push(render_ansi(&term));
+        if frames.is_empty() {
+            frames.push(render_ansi(&term));
+        }
         frames
     }
 }
 
-/// Python `easing.in_out_back` (standard back-ease with overshoot).
-fn in_out_back(t: f64) -> f64 {
-    const C1: f64 = 1.70158;
-    const C2: f64 = C1 * 1.525;
-    if t < 0.5 {
-        let x = 2.0 * t;
-        (x * x * ((C2 + 1.0) * x - C2)) / 2.0
-    } else {
-        let x = 2.0 * t - 2.0;
-        (x * x * ((C2 + 1.0) * x + C2) + 2.0) / 2.0
-    }
-}
-
-fn fnv1a64(input: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
-
-struct Lcg(u64);
-
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (self.0 >> 32) as u32
-    }
-
-    /// Inclusive integer range, matching `random.randint(lo, hi)`.
-    fn inclusive(&mut self, lo: i32, hi: i32) -> i32 {
-        if hi <= lo {
-            return lo;
+fn render_ansi(term: &Terminal) -> String {
+    let w = term.canvas.width;
+    let h = term.canvas.height;
+    let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+    for ch in term.get_characters() {
+        if !ch.is_visible {
+            continue;
         }
-        let span = (i64::from(hi) - i64::from(lo) + 1) as u32;
-        lo.saturating_add((self.next_u32() % span) as i32)
+        let x = ch.current_coord.column;
+        let y = ch.current_coord.row;
+        if x < 0 || y < 0 {
+            continue;
+        }
+        let ux = x as usize;
+        let uy = y as usize;
+        if ux < w && uy < h {
+            let color = ch
+                .animation
+                .current_character_visual
+                .colors
+                .and_then(|p| p.fg)
+                .or_else(|| ch.colors.and_then(|p| p.fg));
+            grid[uy][ux] = (ch.animation.current_character_visual.symbol, color);
+        }
     }
+    let mut out = String::new();
+    for row in grid {
+        for (sym, col) in row {
+            if let Some(c) = col {
+                out.push_str(&format!("\x1b[38;2;{};{};{}m{}\x1b[0m", c.r, c.g, c.b, sym));
+            } else {
+                out.push(sym);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
