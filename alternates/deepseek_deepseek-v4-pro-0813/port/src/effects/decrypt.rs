@@ -1,52 +1,19 @@
-
 use super::Effect;
-use crate::engine::canvas::Cell;
-use crate::engine::character::EffectCharacter;
-use crate::engine::terminal::Terminal;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::engine::{EffectCharacter, Terminal};
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// A simple deterministic PRNG for reproducible reveal ordering.
-struct Rng(u64);
+const LEAD_IN: usize = 8;
+const LEAD_OUT: usize = 12;
+const ENCRYPTED_SYMBOLS: [char; 16] = [
+    '!', '@', '#', '$', '%', '&', '?', '*', '+', '=', '~', '^', '/', '|', '<', '>',
+];
 
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        // LCG parameters from Numerical Recipes
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn next_range(&mut self, low: usize, high: usize) -> usize {
-        assert!(low < high, "empty range");
-        let span = (high - low) as f32;
-        let val = self.next_f32() * span + low as f32;
-        val.floor() as usize
-    }
-}
-
-pub struct Decrypt {
-    /// Total number of frames in the decryption animation.
-    total_frames: usize,
-    /// Seed for deterministic PRNG. Change to make effect differ between runs if desired.
-    seed: u64,
-}
+pub struct Decrypt;
 
 impl Decrypt {
     pub fn new() -> Self {
-        Self {
-            total_frames: 30,
-            seed: 0xDEAD_BEEF_CAFE_F00D,
-        }
+        Decrypt
     }
 }
 
@@ -56,76 +23,86 @@ impl Effect for Decrypt {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        // Determine terminal dimensions from input.
+        let input = if input.is_empty() { " " } else { input };
         let lines: Vec<&str> = input.lines().collect();
-        let height = if lines.is_empty() {
-            1
-        } else {
-            lines.len() as u16
-        };
         let width = lines
             .iter()
-            .map(|l| l.chars().count() as u16)
+            .map(|l| l.chars().count())
             .max()
             .unwrap_or(1)
-            .max(1);
+            .max(1)
+            .min(u16::MAX as usize) as u16;
+        let height = (lines.len().min(u16::MAX as usize) as u16).max(1);
 
-        let mut terminal = Terminal::from_input(input, width, height);
+        let mut terminal = Terminal::new(width, height);
 
-        // Map each character to a reveal frame index.
-        let total_chars = terminal.characters.len();
-        let mut reveal_order: Vec<usize> = (0..total_chars).collect();
-        let mut rng = Rng::new(self.seed);
+        let gradient = Gradient::new(vec![
+            (0.0, Color::new(0, 90, 0)),
+            (0.5, Color::new(0, 220, 0)),
+            (1.0, Color::new(160, 255, 160)),
+        ]);
 
-        // Shuffle reveal order using Fisher-Yates with our PRNG.
-        for i in (1..total_chars).rev() {
-            let j = rng.next_range(0, i + 1);
-            reveal_order.swap(i, j);
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let idx = row * width as usize + col;
+                let mut character = EffectCharacter::new(
+                    idx as u32,
+                    Coord::new(col as i32, row as i32),
+                    ENCRYPTED_SYMBOLS[idx % ENCRYPTED_SYMBOLS.len()],
+                );
+                character.input_symbol = ch;
+                let t = col as f64 / width.max(1) as f64;
+                character.color_pair = ColorPair::new(gradient.color_at(t), Color::BLACK);
+                terminal.add_character(character);
+            }
         }
 
-        // For each character, assign a reveal frame index based on its position in shuffled order.
-        // The first character reveals at frame 0, the last at frame total_frames-1.
-        let mut reveal_frames: Vec<usize> = vec![0; total_chars];
-        for (idx, &char_idx) in reveal_order.iter().enumerate() {
-            // Linear mapping: idx 0 -> 0, idx total_chars-1 -> total_frames-1
-            let frame = (idx * (self.total_frames - 1)) / (total_chars - 1);
-            reveal_frames[char_idx] = frame;
-        }
+        let total_chars = terminal.get_characters().len();
+        let total_frames = total_chars + LEAD_IN + LEAD_OUT;
+        let mut frames = Vec::with_capacity(total_frames);
 
-        let mut frames = Vec::with_capacity(self.total_frames + 1);
+        for frame_idx in 0..total_frames {
+            let reveal_front = if frame_idx < LEAD_IN {
+                None
+            } else {
+                Some(frame_idx - LEAD_IN)
+            };
 
-        // Random symbol set for "ciphertext" appearance.
-        let cipher_symbols: Vec<char> = "!@#$%^&*()_+-=<>?/\\|~[]{};:,.`'\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-            .chars()
-            .collect();
-
-        // Generate frames.
-        for frame_idx in 0..=self.total_frames {
-            for (char_idx, character) in terminal.characters.iter_mut().enumerate() {
-                let symbol = if reveal_frames[char_idx] <= frame_idx {
-                    character.input_symbol.clone()
-                } else {
-                    // Use deterministic random choice based on char index + frame to avoid flicker.
-                    let mut char_rng = Rng::new(self.seed ^ (char_idx as u64) ^ (frame_idx as u64));
-                    let pick = char_rng.next_range(0, cipher_symbols.len());
-                    cipher_symbols[pick].to_string()
-                };
-
-                // Update character output symbol.
-                character.output_symbol = symbol.clone();
-
-                // Update canvas cell.
-                let pos = character.position;
-                let x = pos.x as u16;
-                let y = pos.y as u16;
-                let style = character.style;
-                terminal
-                    .canvas
-                    .set_cell(x, y, Cell::new(symbol, style));
+            {
+                let characters = terminal.get_characters_mut();
+                for (i, character) in characters.iter_mut().enumerate() {
+                    match reveal_front {
+                        None => {
+                            // Pre-reveal scramble: everything cycles through encrypted symbols.
+                            character.symbol =
+                                ENCRYPTED_SYMBOLS[(i + frame_idx) % ENCRYPTED_SYMBOLS.len()];
+                            character.color_pair =
+                                ColorPair::new(Color::new(0, 90, 0), Color::BLACK);
+                        }
+                        Some(front) => {
+                            if i < front {
+                                character.symbol = character.input_symbol;
+                                let t = i as f64 / (total_chars.max(1)) as f64;
+                                character.color_pair =
+                                    ColorPair::new(gradient.color_at(t), Color::BLACK);
+                            } else if i == front {
+                                // Highlight the character currently being decrypted.
+                                character.symbol = '*';
+                                character.color_pair =
+                                    ColorPair::new(Color::WHITE, Color::BLACK);
+                            } else {
+                                // Still obscured by a cycling encrypted symbol.
+                                character.symbol =
+                                    ENCRYPTED_SYMBOLS[(i + frame_idx) % ENCRYPTED_SYMBOLS.len()];
+                                character.color_pair =
+                                    ColorPair::new(Color::new(0, 90, 0), Color::BLACK);
+                            }
+                        }
+                    }
+                }
             }
 
-            // Render this frame.
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames

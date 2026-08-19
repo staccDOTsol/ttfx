@@ -3,3 +3,9 @@ pub mod canvas;
 pub mod character;
 pub mod motion;
 pub mod terminal;
+
+pub use animation::{Animation, CharacterVisual, Frame, Scene};
+pub use canvas::Canvas;
+pub use character::EffectCharacter;
+pub use motion::{Motion, Path, Segment, Waypoint};
+pub use terminal::Terminal;

@@ -1,138 +1,16 @@
-use super::Effect;
-use crate::engine::canvas::Cell;
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing::{self, EasingFn};
+use crate::utils::easing::{CubicOut, Easing};
 use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-pub struct Slide {
-    grouping: &'static str,
-    merge: bool,
-    reverse_direction: bool,
-    movement_easing: EasingFn,
-}
+use super::Effect;
+
+pub struct Slide;
 
 impl Slide {
     pub fn new() -> Self {
-        Self {
-            grouping: "row",
-            merge: false,
-            reverse_direction: false,
-            movement_easing: easing::ease_out_quad,
-        }
-    }
-
-    fn build_moves(&self, terminal: &Terminal) -> Vec<CharacterMove> {
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-
-        if self.grouping == "column" {
-            for x in 0..terminal.canvas.width {
-                let mut group: Vec<usize> = Vec::new();
-                for (idx, ch) in terminal.characters.iter().enumerate() {
-                    if ch.position.x as u16 == x {
-                        group.push(idx);
-                    }
-                }
-                if !group.is_empty() {
-                    group.sort_by_key(|&i| terminal.characters[i].position.y as i32);
-                    groups.push(group);
-                }
-            }
-        } else {
-            for y in 0..terminal.canvas.height {
-                let mut group: Vec<usize> = Vec::new();
-                for (idx, ch) in terminal.characters.iter().enumerate() {
-                    if ch.position.y as u16 == y {
-                        group.push(idx);
-                    }
-                }
-                if !group.is_empty() {
-                    group.sort_by_key(|&i| terminal.characters[i].position.x as i32);
-                    groups.push(group);
-                }
-            }
-        }
-
-        let mut moves = Vec::new();
-
-        for (group_index, group) in groups.iter().enumerate() {
-            let mut group = group.clone();
-
-            if self.grouping == "column" {
-                let mut from_bottom = false;
-
-                if self.merge && group_index % 2 == 0 {
-                    from_bottom = true;
-                } else {
-                    group.reverse();
-                }
-
-                if self.reverse_direction && !self.merge {
-                    group.reverse();
-                }
-
-                let min_y = group
-                    .iter()
-                    .map(|&i| terminal.characters[i].position.y)
-                    .fold(f32::MAX, f32::min);
-                let max_y = group
-                    .iter()
-                    .map(|&i| terminal.characters[i].position.y)
-                    .fold(f32::MIN, f32::max);
-
-                let offset = if from_bottom {
-                    terminal.canvas.height as f32 - min_y
-                } else {
-                    -(max_y + 1.0)
-                };
-
-                for &idx in &group {
-                    let end = terminal.characters[idx].position;
-                    moves.push(CharacterMove {
-                        char_index: idx,
-                        start: Coord::new(end.x, end.y + offset),
-                        end,
-                    });
-                }
-            } else {
-                let mut from_right = false;
-
-                if self.merge && group_index % 2 == 0 {
-                    from_right = true;
-                } else {
-                    group.reverse();
-                }
-
-                if self.reverse_direction && !self.merge {
-                    group.reverse();
-                }
-
-                let min_x = group
-                    .iter()
-                    .map(|&i| terminal.characters[i].position.x)
-                    .fold(f32::MAX, f32::min);
-                let max_x = group
-                    .iter()
-                    .map(|&i| terminal.characters[i].position.x)
-                    .fold(f32::MIN, f32::max);
-
-                let offset = if from_right {
-                    terminal.canvas.width as f32 - min_x
-                } else {
-                    -(max_x + 1.0)
-                };
-
-                for &idx in &group {
-                    let end = terminal.characters[idx].position;
-                    moves.push(CharacterMove {
-                        char_index: idx,
-                        start: Coord::new(end.x + offset, end.y),
-                        end,
-                    });
-                }
-            }
-        }
-
-        moves
+        Slide
     }
 }
 
@@ -142,51 +20,76 @@ impl Effect for Slide {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let terminal = Terminal::from_input(input, width, height);
-        let moves = self.build_moves(&terminal);
+        // Determine canvas dimensions from the input text.
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len() as u16;
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
 
-        if moves.is_empty() {
-            return vec![terminal.write_frame()];
+        if height == 0 || width == 0 {
+            return Vec::new();
         }
 
-        let total_frames = 20usize;
-        let mut frames = Vec::with_capacity(total_frames + 1);
+        let mut terminal = Terminal::new(width, height);
 
-        for step in 0..=total_frames {
-            let t = (self.movement_easing)(step as f32 / total_frames as f32);
-            let mut canvas = terminal.canvas.clone();
-            canvas.clear();
+        // Create a blue-to-cyan gradient for character foreground colors.
+        let gradient = Gradient::new(vec![
+            (0.0, Color::BLUE),
+            (1.0, Color::new(0, 255, 255)), // cyan
+        ]);
 
-            for character_move in &moves {
-                let current = character_move.start.lerp(character_move.end, t);
-                let x = current.x.round() as i32;
-                let y = current.y.round() as i32;
+        // Collect final coordinates for each character in insertion order.
+        let mut final_coords: Vec<Coord> = Vec::new();
 
-                if x >= 0 && y >= 0 {
-                    let x = x as u16;
-                    let y = y as u16;
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let final_coord = Coord::new(col as i32, row as i32);
+                final_coords.push(final_coord);
 
-                    if x < canvas.width && y < canvas.height {
-                        let character = &terminal.characters[character_move.char_index];
-                        canvas.set_cell(
-                            x,
-                            y,
-                            Cell::new(character.output_symbol.clone(), character.style),
-                        );
-                    }
+                // Start offscreen to the left, keeping the same row.
+                let start_coord = Coord::new(-(col as i32 + 1), row as i32);
+
+                let id = terminal.characters.len() as u32;
+                let character = EffectCharacter::new(id, start_coord, ch);
+
+                // Apply gradient color, black background, bold, visible.
+                let t = col as f64 / width.max(1) as f64;
+                let fg = gradient.color_at(t);
+                let bg = Color::BLACK;
+
+                terminal.add_character(character);
+                if let Some(c) = terminal.get_character_mut(id) {
+                    c.color_pair = ColorPair::new(fg, bg);
+                    c.bold = true;
+                    c.visible = true;
                 }
             }
+        }
 
-            frames.push(canvas.render_frame());
+        let steps = 30;
+        let mut frames = Vec::with_capacity(steps);
+        let easing = CubicOut;
+
+        for i in 0..steps {
+            let t = i as f64 / (steps - 1) as f64;
+            let eased_t = easing.ease(t);
+
+            // Update every character's position.
+            for (idx, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                let final_coord = final_coords[idx];
+                let start_coord = Coord::new(-(final_coord.x as i32 + 1), final_coord.y);
+                character.position = Coord::new(
+                    start_coord.x + ((final_coord.x - start_coord.x) as f64 * eased_t).round() as i32,
+                    start_coord.y + ((final_coord.y - start_coord.y) as f64 * eased_t).round() as i32,
+                );
+            }
+
+            frames.push(terminal.render_frame());
         }
 
         frames
     }
-}
-
-struct CharacterMove {
-    char_index: usize,
-    start: Coord,
-    end: Coord,
 }

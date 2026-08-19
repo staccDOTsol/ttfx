@@ -1,14 +1,16 @@
 use super::Effect;
-use crate::engine::canvas::{Canvas, Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
-use crate::utils::graphics::{Color, Gradient};
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-pub struct Overflow;
+pub struct Overflow {
+    frame_count: usize,
+}
 
 impl Overflow {
     pub fn new() -> Self {
-        Self
+        Self { frame_count: 40 }
     }
 }
 
@@ -18,49 +20,88 @@ impl Effect for Overflow {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let terminal = Terminal::from_input(input, width, height);
-        let characters = terminal.characters.clone();
+        let lines: Vec<&str> = input.lines().collect();
+        let line_count = lines.len().max(1);
+        let max_line_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1).max(1);
 
-        if characters.is_empty() {
-            return vec![terminal.write_frame()];
+        let padding = 4usize;
+        let width = (max_line_len + padding * 2).clamp(1, 120) as u16;
+        let height = (line_count + padding * 2).clamp(1, 40) as u16;
+
+        let mut terminal = Terminal::new(width, height);
+
+        let start_x_offset = ((width as usize).saturating_sub(max_line_len) / 2) as i32;
+        let start_y_offset = ((height as usize).saturating_sub(line_count) / 2) as i32;
+
+        let mut starts = Vec::new();
+        let mut targets = Vec::new();
+        let mut id: u32 = 0;
+
+        let center = Coord::new((width / 2) as i32, (height / 2) as i32);
+
+        for (row_idx, line) in lines.iter().enumerate() {
+            for (col_idx, ch) in line.chars().enumerate() {
+                let start = Coord::new(
+                    start_x_offset + col_idx as i32,
+                    start_y_offset + row_idx as i32,
+                );
+                let mut character = EffectCharacter::new(id, start, ch);
+                character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+                terminal.add_character(character);
+                starts.push(start);
+
+                let dir_x = (start.x - center.x) as f64;
+                let dir_y = (start.y - center.y) as f64;
+                let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+                let (dx, dy) = if len < 0.001 {
+                    (1.0_f64, 1.0_f64)
+                } else {
+                    (dir_x / len, dir_y / len)
+                };
+                let dist = (width.max(height)) as f64 * 1.5;
+                let target = Coord::new(
+                    (start.x as f64 + dx * dist).round() as i32,
+                    (start.y as f64 + dy * dist).round() as i32,
+                );
+                targets.push(target);
+                id += 1;
+            }
         }
 
-        let total_frames = (height as usize * 4).max(30).min(90);
-        let mut frames = Vec::with_capacity(total_frames);
+        if terminal.get_characters().is_empty() {
+            let start = Coord::new((width / 2) as i32, (height / 2) as i32);
+            let mut character = EffectCharacter::new(id, start, ' ');
+            character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+            terminal.add_character(character);
+            starts.push(start);
+            targets.push(start);
+        }
 
-        // A simple spill gradient: the character colours shift as they settle.
-        let gradient = Gradient::new()
-            .add_stop(0.0, Color::CYAN)
-            .add_stop(0.55, Color::MAGENTA)
-            .add_stop(1.0, Color::YELLOW);
+        let mut frames = Vec::new();
+        let gradient = Gradient::new(vec![
+            (0.0, Color::new(255, 255, 255)),
+            (0.25, Color::new(0, 255, 255)),
+            (0.5, Color::new(255, 0, 255)),
+            (0.75, Color::new(255, 165, 0)),
+            (1.0, Color::new(255, 0, 0)),
+        ]);
 
-        for frame_idx in 0..total_frames {
-            let mut canvas = Canvas::new(width, height);
-            let progress = frame_idx as f32 / (total_frames - 1) as f32;
+        for frame_idx in 0..self.frame_count {
+            let p = frame_idx as f64 / (self.frame_count - 1).max(1) as f64;
+            let eased = 1.0 - (1.0 - p).powi(3); // ease-out cubic
+            let color = gradient.color_at(eased);
 
-            for character in &characters {
-                let x = character.position.x;
-                let final_y = character.position.y;
-
-                // Spill from the top edge to the character's input row, with a
-                // slight left-to-right stagger so the overflow reads as a wave.
-                let width_for_delay = width.max(1) as f32;
-                let delay = (x / width_for_delay) * 0.25;
-                let local_t = ((progress - delay) / (1.0 - delay)).clamp(0.0, 1.0);
-                let eased_t = easing::ease_out_bounce(local_t);
-                let y = eased_t * final_y;
-
-                let color = gradient.color_at(local_t);
-                let style = CellStyle::new(color, Color::BLACK);
-                canvas.set_cell(
-                    x.round() as u16,
-                    y.round() as u16,
-                    Cell::new(character.input_symbol.clone(), style),
-                );
+            for (i, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                if let Some(&start) = starts.get(i) {
+                    let target = targets[i];
+                    let x = start.x as f64 + (target.x - start.x) as f64 * eased;
+                    let y = start.y as f64 + (target.y - start.y) as f64 * eased;
+                    character.position = Coord::new(x.round() as i32, y.round() as i32);
+                    character.color_pair = ColorPair::new(color, Color::BLACK);
+                }
             }
 
-            frames.push(canvas.render_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames

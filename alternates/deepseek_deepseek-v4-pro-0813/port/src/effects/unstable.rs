@@ -1,16 +1,17 @@
-use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
-use crate::engine::terminal::Terminal;
-use crate::utils::easing;
-use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Gradient};
+use std::f64::consts::PI;
 
-#[derive(Debug, Clone, Copy)]
+use super::Effect;
+use crate::engine::character::EffectCharacter;
+use crate::engine::terminal::Terminal;
+use crate::utils::easing::{Easing, SineInOut};
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
+
 pub struct Unstable;
 
 impl Unstable {
     pub fn new() -> Self {
-        Self
+        Unstable
     }
 }
 
@@ -20,189 +21,79 @@ impl Effect for Unstable {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        unstable_frames(input)
-    }
-}
+        let lines: Vec<&str> = input.lines().collect();
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
+        let height = lines.len().max(1) as u16;
 
-fn random_unit(seed: u32) -> f32 {
-    let mut x = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-    x ^= x >> 16;
-    x = x.wrapping_mul(1103515245).wrapping_add(12345);
-    (x >> 8) as f32 / 16_777_215.0
-}
+        let mut terminal = Terminal::new(width, height);
+        let mut origins = Vec::new();
+        let mut next_id = 0u32;
 
-fn random_symbol(seed: u32) -> String {
-    const SYMBOLS: &[&str] = &["*", "+", "o", "O", "0", ".", ":", "x"];
-    let idx = (random_unit(seed.wrapping_mul(31)) * SYMBOLS.len() as f32) as usize;
-    SYMBOLS[idx.min(SYMBOLS.len() - 1)].to_string()
-}
-
-fn explosion_target(seed: u32, origin: Coord, width: u16, height: u16) -> Coord {
-    let angle = random_unit(seed.wrapping_add(1)) * 2.0 * std::f32::consts::PI;
-    let max_dim = if width > height { width } else { height };
-    let radius = 5.0 + random_unit(seed.wrapping_add(2)) * (max_dim as f32 * 0.6);
-
-    Coord::new(
-        origin.x + angle.cos() * radius,
-        origin.y + angle.sin() * radius * 0.5,
-    )
-}
-
-fn push_frame(
-    terminal: &mut Terminal,
-    positions: &[Coord],
-    symbols: &[String],
-    styles: &[CellStyle],
-) {
-    terminal.clear_canvas();
-
-    for (i, &pos) in positions.iter().enumerate() {
-        if pos.x < 0.0 || pos.y < 0.0 {
-            continue;
+        for (y, line) in lines.iter().enumerate() {
+            for (x, ch) in line.chars().enumerate() {
+                let coord = Coord::new(x as i32, y as i32);
+                let mut character = EffectCharacter::new(next_id, coord, ch);
+                character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+                terminal.add_character(character);
+                origins.push(coord);
+                next_id += 1;
+            }
         }
 
-        let x = pos.x.round() as u16;
-        let y = pos.y.round() as u16;
+        let total_frames: usize = 60;
+        let mut frames = Vec::with_capacity(total_frames);
 
-        if x >= terminal.canvas.width || y >= terminal.canvas.height {
-            continue;
+        let gradient = Gradient::new(vec![
+            (0.0, Color::new(255, 255, 255)),
+            (0.3, Color::new(255, 140, 0)),
+            (0.65, Color::new(220, 20, 60)),
+            (1.0, Color::new(160, 32, 240)),
+        ]);
+
+        for frame_index in 0..total_frames {
+            let t = frame_index as f64 / total_frames as f64;
+            let phase = if t < 0.5 { t / 0.5 } else { (1.0 - t) / 0.5 };
+            let eased = SineInOut.ease(phase);
+
+            let mut updates = Vec::new();
+
+            for (i, _character) in terminal.get_characters().iter().enumerate() {
+                let origin = origins[i];
+                let seed = ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ 0xBF58_476D_1CE4_E5B9;
+                let angle = ((seed % 360) as f64) * PI / 180.0;
+                let max_dist = 3.0 + ((seed >> 8) % 8) as f64;
+                let dist = eased * max_dist;
+
+                let jitter_base = ((seed % 360) as f64) * PI / 180.0;
+                let jitter_amount = eased * (1.0 - eased) * 4.0;
+                let jitter_x = ((frame_index as f64 * 0.9) + jitter_base).sin() * jitter_amount;
+                let jitter_y = ((frame_index as f64 * 0.7) + jitter_base * 0.8).cos() * jitter_amount;
+
+                let new_x = (origin.x as f64 + dist * angle.cos() + jitter_x).round() as i32;
+                let new_y = (origin.y as f64 + dist * angle.sin() + jitter_y).round() as i32;
+
+                let color_t = (t + ((i % 13) as f64 * 0.07)) % 1.0;
+                let color = gradient.color_at(color_t);
+
+                updates.push((i as u32, Coord::new(new_x, new_y), color));
+            }
+
+            for (character_id, coord, color) in updates {
+                if let Some(character) = terminal.get_character_mut(character_id) {
+                    character.position = coord;
+                    character.color_pair = ColorPair::new(color, Color::BLACK);
+                }
+            }
+
+            frames.push(terminal.render_frame());
         }
 
-        terminal
-            .canvas
-            .set_cell(x, y, Cell::new(symbols[i].clone(), styles[i]));
+        frames
     }
-}
-
-fn unstable_frames(input: &str) -> Vec<String> {
-    let (width, height) = Terminal::autodetect_size();
-    let mut terminal = Terminal::from_input(input, width, height);
-
-    if terminal.characters.is_empty() {
-        return vec![terminal.write_frame()];
-    }
-
-    let count = terminal.characters.len();
-    let origins: Vec<Coord> = terminal.characters.iter().map(|c| c.position).collect();
-    let input_symbols: Vec<String> = terminal
-        .characters
-        .iter()
-        .map(|c| c.input_symbol.clone())
-        .collect();
-    let targets: Vec<Coord> = origins
-        .iter()
-        .enumerate()
-        .map(|(i, &origin)| explosion_target(i as u32, origin, width, height))
-        .collect();
-
-    let explosion_gradient = Gradient::new()
-        .add_stop(0.0, Color::RED)
-        .add_stop(0.6, Color::YELLOW)
-        .add_stop(1.0, Color::WHITE);
-    let reassembly_gradient = Gradient::new()
-        .add_stop(0.0, Color::MAGENTA)
-        .add_stop(0.6, Color::CYAN)
-        .add_stop(1.0, Color::WHITE);
-
-    let mut frames = Vec::new();
-
-    // Rumble: short jitter before the text flies apart.
-    for step in 0..10usize {
-        let t = step as f32 / 10.0;
-        let positions: Vec<Coord> = origins
-            .iter()
-            .enumerate()
-            .map(|(i, &origin)| {
-                let jitter_x = random_unit(i as u32 + 3 * step as u32) * 2.0 - 1.0;
-                let jitter_y = random_unit(i as u32 + 7 * step as u32) * 2.0 - 1.0;
-                Coord::new(origin.x + jitter_x, origin.y + jitter_y)
-            })
-            .collect();
-        let symbols: Vec<String> = positions
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if t < 0.5 && random_unit(i as u32 + 11 * step as u32) > 0.65 {
-                    random_symbol(i as u32 + step as u32)
-                } else {
-                    input_symbols[i].clone()
-                }
-            })
-            .collect();
-        let styles = vec![CellStyle::new(Color::YELLOW, Color::BLACK); count];
-
-        push_frame(&mut terminal, &positions, &symbols, &styles);
-        frames.push(terminal.write_frame());
-    }
-
-    // Explosion: origin -> random scatter coordinates.
-    for step in 0..35usize {
-        let t = step as f32 / 35.0;
-        let eased = easing::ease_out_cubic(t);
-        let positions: Vec<Coord> = origins
-            .iter()
-            .zip(targets.iter())
-            .map(|(&a, &b)| a.lerp(b, eased))
-            .collect();
-        let symbols: Vec<String> = positions
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if random_unit(i as u32 + 13 * step as u32) > 0.7 {
-                    random_symbol(i as u32 + step as u32)
-                } else {
-                    input_symbols[i].clone()
-                }
-            })
-            .collect();
-        let styles: Vec<CellStyle> = (0..count)
-            .map(|_| CellStyle::new(explosion_gradient.color_at(eased), Color::BLACK))
-            .collect();
-
-        push_frame(&mut terminal, &positions, &symbols, &styles);
-        frames.push(terminal.write_frame());
-    }
-
-    // Reassembly: scatter -> origin.
-    for step in 0..45usize {
-        let t = step as f32 / 45.0;
-        let eased = easing::ease_in_cubic(t);
-        let positions: Vec<Coord> = targets
-            .iter()
-            .zip(origins.iter())
-            .map(|(&a, &b)| a.lerp(b, eased))
-            .collect();
-        let symbols: Vec<String> = positions
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if eased < 0.7 && random_unit(i as u32 + 23 * step as u32) > 0.65 {
-                    random_symbol(i as u32 + step as u32)
-                } else {
-                    input_symbols[i].clone()
-                }
-            })
-            .collect();
-        let styles: Vec<CellStyle> = (0..count)
-            .map(|_| CellStyle::new(reassembly_gradient.color_at(eased), Color::BLACK))
-            .collect();
-
-        push_frame(&mut terminal, &positions, &symbols, &styles);
-        frames.push(terminal.write_frame());
-    }
-
-    // Settle: original symbols with the terminal default style.
-    let final_positions = origins.clone();
-    let final_styles = vec![CellStyle::default(); count];
-    for _ in 0..8 {
-        push_frame(
-            &mut terminal,
-            &final_positions,
-            &input_symbols,
-            &final_styles,
-        );
-        frames.push(terminal.write_frame());
-    }
-
-    frames
 }

@@ -1,39 +1,24 @@
+use std::collections::HashMap;
+
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
 use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::Color;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
+
+fn lerp_color(start: Color, end: Color, t: f64) -> Color {
+    let r = (start.r as f64 + (end.r as f64 - start.r as f64) * t).round() as u8;
+    let g = (start.g as f64 + (end.g as f64 - start.g as f64) * t).round() as u8;
+    let b = (start.b as f64 + (end.b as f64 - start.b as f64) * t).round() as u8;
+    Color::new(r, g, b)
+}
 
 pub struct Smoke;
 
 impl Smoke {
     pub fn new() -> Self {
-        Self
+        Smoke
     }
-}
-
-struct Lcg(u32);
-
-impl Lcg {
-    fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
-        self.0
-    }
-
-    fn range(&mut self, low: f32, high: f32) -> f32 {
-        low + (self.next() as f32 / u32::MAX as f32) * (high - low)
-    }
-}
-
-struct Particle {
-    input_symbol: String,
-    start: Coord,
-    target: Coord,
-    start_frame: usize,
-    duration: usize,
-    done: bool,
 }
 
 impl Effect for Smoke {
@@ -42,123 +27,89 @@ impl Effect for Smoke {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        if input.is_empty() {
-            let terminal = Terminal::new(10, 10);
-            return vec![terminal.write_frame()];
-        }
-
         let lines: Vec<&str> = input.lines().collect();
-        let line_count = lines.len().max(1) as u16;
-        let max_line_len = lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(1) as u16;
+        let base_width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(1);
+        let base_height = lines.len().max(1);
 
-        let margin_x: u16 = 4;
-        let top_margin: u16 = 2;
-        let bottom_margin: u16 = 1;
-        let extra_height: u16 = 6;
-
-        let width = max_line_len + margin_x * 2 + 4;
-        let height = line_count + top_margin + bottom_margin + extra_height;
+        let width = (base_width + 4).max(1) as u16;
+        let height = (base_height + 18) as u16;
 
         let mut terminal = Terminal::new(width, height);
-        let mut particles = Vec::new();
-        let mut lcg = Lcg(0x72616E64); // arbitrary deterministic seed
-        let mut next_id: u32 = 0;
 
-        // Anchor text near the bottom so the smoke has room to rise.
-        let anchor_y = height - bottom_margin - line_count;
+        let non_space_count = input
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r' && *c != ' ')
+            .count();
 
-        for (line_index, line) in lines.iter().enumerate() {
-            for (col_index, ch) in line.chars().enumerate() {
-                let x = margin_x + col_index as u16;
-                let y = anchor_y + line_index as u16;
-                let coord = Coord::new(x as f32, y as f32);
+        let color_gradient = Gradient::new(vec![
+            (0.0, Color::new(70, 70, 70)),
+            (0.5, Color::new(160, 160, 160)),
+            (1.0, Color::new(235, 235, 235)),
+        ]);
 
-                let character = EffectCharacter::new(next_id, ch.to_string(), coord);
-                terminal.characters.push(character);
-                terminal
-                    .canvas
-                    .set_cell(x, y, Cell::new(ch.to_string(), terminal.config.default_style));
-                next_id += 1;
+        let mut id: u32 = 0;
+        let mut initial_positions: HashMap<u32, Coord> = HashMap::new();
+        let mut initial_colors: HashMap<u32, Color> = HashMap::new();
 
-                particles.push(Particle {
-                    input_symbol: ch.to_string(),
-                    start: coord,
-                    target: Coord::new(coord.x + lcg.range(-6.0, 6.0), top_margin as f32 - 2.0),
-                    start_frame: lcg.next() as usize % 18,
-                    duration: 14 + (lcg.next() as usize % 16),
-                    done: false,
-                });
+        let start_y = (height as i32 - base_height as i32 - 2).max(0);
+        let mut processed = 0;
+
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+
+                let t = processed as f64 / non_space_count.max(1) as f64;
+                let fg = color_gradient.color_at(t);
+                let coord = Coord::new(2 + col as i32, start_y + row as i32);
+
+                let mut character = EffectCharacter::new(id, coord, ch);
+                character.color_pair = ColorPair::new(fg, Color::new(12, 12, 12));
+
+                initial_positions.insert(id, coord);
+                initial_colors.insert(id, fg);
+                terminal.add_character(character);
+
+                id += 1;
+                processed += 1;
             }
         }
 
-        let smoke_symbols = ["█", "▓", "▒", "░", " "];
         let mut frames = Vec::new();
-        let mut frame_index = 0usize;
-        let max_frames = 160;
+        frames.push(terminal.render_frame());
 
-        loop {
-            terminal.clear_canvas();
-            let mut all_done = true;
+        let total_steps = 26;
+        for step in 1..=total_steps {
+            let progress = step as f64 / total_steps as f64;
+            let rise = progress * height as f64;
 
-            for particle in &mut particles {
-                if particle.done {
+            for character in terminal.get_characters_mut() {
+                if !character.visible {
                     continue;
                 }
 
-                if frame_index < particle.start_frame {
-                    all_done = false;
-                    let x = particle.start.x.round() as u16;
-                    let y = particle.start.y.round() as u16;
-                    if x < width && y < height {
-                        terminal.canvas.set_cell(
-                            x,
-                            y,
-                            Cell::new(particle.input_symbol.clone(), terminal.config.default_style),
-                        );
-                    }
-                    continue;
-                }
+                let initial = initial_positions[&character.id];
+                let drift = (progress * 8.0 * (character.id as f64 * 0.27).sin()) as i32;
+                character.position = Coord::new(initial.x + drift, initial.y - rise as i32);
 
-                let elapsed = (frame_index - particle.start_frame) as f32;
-                let progress = elapsed / particle.duration as f32;
-                if progress >= 1.0 {
-                    particle.done = true;
-                    continue;
-                }
+                let start_fg = initial_colors[&character.id];
+                let end_fg = Color::new(10, 10, 10);
+                character.color_pair = ColorPair::new(
+                    lerp_color(start_fg, end_fg, progress),
+                    Color::new(10, 10, 10),
+                );
 
-                all_done = false;
-
-                let eased = easing::ease_out_quart(progress);
-                let x = particle.start.x + (particle.target.x - particle.start.x) * eased;
-                let y = particle.start.y + (particle.target.y - particle.start.y) * eased;
-                let symbol_index = ((eased * (smoke_symbols.len() - 1) as f32).round() as usize)
-                    .min(smoke_symbols.len() - 1);
-                let v = 220.0 - eased * 180.0;
-                let fg = Color::new(v as u8, v as u8, v as u8);
-                let style = CellStyle::new(fg, Color::BLACK);
-
-                if x >= 0.0 && y >= 0.0 {
-                    let cx = x.round() as u16;
-                    let cy = y.round() as u16;
-                    if cx < width && cy < height {
-                        terminal
-                            .canvas
-                            .set_cell(cx, cy, Cell::new(smoke_symbols[symbol_index], style));
-                    }
+                if progress > 0.55 {
+                    let smoke_symbols = ['░', '▒', '▓'];
+                    let idx = ((progress - 0.55) * 8.0) as usize;
+                    let idx = idx.min(smoke_symbols.len() - 1);
+                    character.symbol = smoke_symbols[idx];
+                    character.dim = true;
                 }
             }
 
-            frames.push(terminal.write_frame());
-            frame_index += 1;
-
-            if all_done || frame_index >= max_frames {
-                break;
-            }
+            frames.push(terminal.render_frame());
         }
 
         frames

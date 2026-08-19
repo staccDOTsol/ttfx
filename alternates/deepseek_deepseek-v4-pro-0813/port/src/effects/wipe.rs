@@ -1,12 +1,14 @@
 use super::Effect;
-use crate::engine::canvas::Cell;
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair};
 
 pub struct Wipe;
 
 impl Wipe {
     pub fn new() -> Self {
-        Self
+        Wipe
     }
 }
 
@@ -16,41 +18,57 @@ impl Effect for Wipe {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (term_width, term_height) = Terminal::autodetect_size();
-        let width = term_width.max(1);
-        let height = term_height.max(1);
+        let lines: Vec<&str> = if input.is_empty() {
+            vec![""]
+        } else {
+            input.lines().collect()
+        };
 
-        let mut terminal = Terminal::from_input(input, width, height);
-        let characters = terminal.characters.clone();
+        let height = lines.len() as u16;
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+
+        let mut terminal = Terminal::new(width, height);
+
+        // Add one character per input symbol.
+        let mut id_counter = 0u32;
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let coord = Coord::new(col as i32, row as i32);
+                let character = EffectCharacter::new(id_counter, coord, ch);
+                terminal.add_character(character);
+                id_counter += 1;
+            }
+        }
+
+        // Initially hide all characters.
+        for character in terminal.get_characters_mut() {
+            character.visible = false;
+        }
 
         let mut frames = Vec::new();
 
-        // Start with a blank canvas.
-        terminal.clear_canvas();
-        frames.push(terminal.write_frame());
+        // Initial blank frame (all hidden). It still carries ANSI SGR escapes
+        // because the canvas renderer emits style codes for every cell.
+        frames.push(terminal.render_frame());
 
-        let cols = terminal.canvas.width as usize;
-
-        // Reveal the input characters column-by-column from left to right.
-        for current_col in 0..cols {
-            terminal.clear_canvas();
-
-            for character in &characters {
-                let x = character.position.x.round() as u16;
-                let y = character.position.y.round() as u16;
-
-                if x <= current_col as u16 {
-                    let cell = Cell::new(character.input_symbol.clone(), character.style);
-                    terminal.canvas.set_cell(x, y, cell);
+        // Wipe from left to right by column. The leading column is highlighted.
+        for col in 0..=width as i32 {
+            for character in terminal.get_characters_mut() {
+                if character.position.x < col {
+                    character.visible = true;
+                    character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+                } else if character.position.x == col {
+                    character.visible = true;
+                    character.color_pair = ColorPair::new(Color::RED, Color::BLACK);
+                } else {
+                    character.visible = false;
                 }
             }
-
-            frames.push(terminal.write_frame());
-        }
-
-        // If the terminal somehow has no columns, keep the blank frame.
-        if cols == 0 {
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames

@@ -1,14 +1,14 @@
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
-use crate::engine::terminal::Terminal;
-use crate::utils::easing;
+use crate::engine::{EffectCharacter, Terminal};
+use crate::utils::easing::{get_easing, Easing};
 use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
 pub struct Spray;
 
 impl Spray {
     pub fn new() -> Self {
-        Self
+        Spray
     }
 }
 
@@ -18,66 +18,88 @@ impl Effect for Spray {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        // Determine canvas size from the input.
-        let lines: Vec<&str> = input.lines().collect();
-        if lines.is_empty() {
+        let chars: Vec<char> = input.chars().collect();
+        if chars.is_empty() {
             return Vec::new();
         }
 
-        let width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0) as u16;
-        let height = lines.len() as u16;
-        if width == 0 || height == 0 {
-            return Vec::new();
+        // Build a terminal canvas that is wide enough to display all characters,
+        // wrapping long input onto multiple rows.
+        let width: u16 = 80;
+        let needed_height = ((chars.len() + width as usize - 1) / width as usize) as u16;
+        let height = needed_height.max(10);
+        let mut terminal = Terminal::new(width, height);
+
+        // A simple color gradient from red through green to blue.
+        let gradient = Gradient::new(vec![
+            (0.0, Color::RED),
+            (0.5, Color::GREEN),
+            (1.0, Color::BLUE),
+        ]);
+
+        // Deterministic pseudo-random positions based on the input characters.
+        let seed = chars.iter().map(|c| *c as u64).sum::<u64>().max(1);
+        let mut rng = XorShift::new(seed);
+        let mut initial_positions = Vec::with_capacity(chars.len());
+
+        for (i, &ch) in chars.iter().enumerate() {
+            let start_x = (rng.next_u64() % width as u64) as i32;
+            let start_y = (rng.next_u64() % height as u64) as i32;
+            initial_positions.push(Coord::new(start_x, start_y));
+
+            let t = i as f64 / chars.len().max(1) as f64;
+            let fg = gradient.color_at(t);
+            let color_pair = ColorPair::new(fg, Color::BLACK);
+
+            let mut character = EffectCharacter::new(i as u32, Coord::new(start_x, start_y), ch);
+            character.color_pair = color_pair;
+            character.visible = true;
+            character.bold = i % 3 == 0;
+            terminal.add_character(character);
         }
 
-        let mut terminal = Terminal::from_input(input, width, height);
+        let total_frames: u32 = 20;
+        let mut frames = Vec::with_capacity(total_frames as usize + 1);
+        let ease = get_easing("sine_out").expect("sine_out easing should exist");
 
-        struct Drop {
-            symbol: String,
-            target: Coord,
-            id: u32,
-        }
+        for frame in 0..=total_frames {
+            let t = frame as f64 / total_frames as f64;
+            let eased = ease.ease(t);
 
-        let drops: Vec<Drop> = terminal.characters.iter().map(|c| Drop {
-            symbol: c.output_symbol.clone(),
-            target: Coord::new(c.position.x, c.position.y),
-            id: c.id,
-        }).collect();
-
-        // Start each droplet at a nozzle centred near the bottom of the canvas.
-        let start = Coord::new(width as f32 / 2.0, height as f32 - 1.0);
-
-        let total_frames = 45usize;
-        let mut frames = Vec::with_capacity(total_frames);
-
-        for frame_idx in 0..total_frames {
-            let p = frame_idx as f32 / (total_frames - 1) as f32;
-            let eased = easing::ease_out_cubic(p);
-
-            terminal.clear_canvas();
-
-            for drop in &drops {
-                let base = start.lerp(drop.target, eased);
-
-                // Deterministic spray spread that converges to zero by the final frame.
-                let phase = drop.id as f32 * 12.9898;
-                let angle = drop.id as f32 * 2.399;
-                let spread = phase.sin() * 2.0 * (1.0 - p).powi(2);
-                let pos = Coord::new(
-                    base.x + spread * angle.cos(),
-                    base.y + spread * angle.sin(),
-                );
-
-                let x = pos.x.round().clamp(0.0, (width - 1) as f32) as u16;
-                let y = pos.y.round().clamp(0.0, (height - 1) as f32) as u16;
-
-                let style = CellStyle::default();
-                terminal.canvas.set_cell(x, y, Cell::new(drop.symbol.clone(), style));
+            {
+                let characters = terminal.get_characters_mut();
+                for (i, character) in characters.iter_mut().enumerate() {
+                    let target = Coord::new((i as u16 % width) as i32, (i as u16 / width) as i32);
+                    let start = initial_positions[i];
+                    let x = start.x as f64 + (target.x - start.x) as f64 * eased;
+                    let y = start.y as f64 + (target.y - start.y) as f64 * eased;
+                    character.position = Coord::new(x.round() as i32, y.round() as i32);
+                }
             }
 
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames
+    }
+}
+
+/// A tiny xorshift64* PRNG, used only to avoid external dependencies.
+struct XorShift {
+    state: u64,
+}
+
+impl XorShift {
+    fn new(seed: u64) -> Self {
+        XorShift { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
     }
 }

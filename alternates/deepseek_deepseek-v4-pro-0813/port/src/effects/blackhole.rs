@@ -1,16 +1,14 @@
-
-use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, ColorPair};
+use crate::utils::graphics::{Color, ColorPair, Gradient};
+use super::Effect;
 
 pub struct Blackhole;
 
 impl Blackhole {
     pub fn new() -> Self {
-        Self
+        Blackhole
     }
 }
 
@@ -20,218 +18,99 @@ impl Effect for Blackhole {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let mut terminal = Terminal::from_input(input, width, height);
+        let chars: Vec<char> = input
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        let fallback: Vec<char> = "TerminalTextEffects".chars().collect();
+        let chars = if chars.is_empty() { &fallback } else { &chars };
+        let len = chars.len();
 
-        if terminal.characters.is_empty() {
-            return vec![terminal.write_frame()];
+        let width = {
+            let w = (len as f64).sqrt().ceil() as u16 + 2;
+            if w < 10 { 10 } else { w }
+        };
+        let columns = (width - 2) as usize;
+        let rows = (len + columns - 1) / columns;
+        let height = (rows as u16 + 2).max(6);
+
+        let mut terminal = Terminal::new(width, height);
+
+        let center = Coord::new((width / 2) as i32, (height / 2) as i32);
+        let max_x = (width - 1) as i32;
+        let max_y = (height - 1) as i32;
+
+        let mut starts = Vec::with_capacity(len);
+        let mut dists = Vec::with_capacity(len);
+        let mut angles = Vec::with_capacity(len);
+        let mut color_offsets = Vec::with_capacity(len);
+
+        for (i, ch) in chars.iter().copied().enumerate() {
+            let col = 1 + (i % columns) as i32;
+            let row = 1 + (i / columns) as i32;
+            let coord = Coord::new(col.min(max_x), row.min(max_y));
+            let dist = coord.distance(&center).max(1.0);
+            let angle = i as f64 * 0.35 + dist * 0.15;
+            let color_offset = (i % 5) as f64 * 0.04;
+
+            starts.push(coord);
+            dists.push(dist);
+            angles.push(angle);
+            color_offsets.push(color_offset);
+
+            let character = EffectCharacter::new(i as u32, coord, ch);
+            terminal.add_character(character);
         }
 
-        let mut frames: Vec<String> = Vec::new();
-        frames.push(terminal.write_frame());
+        let base_steps = 60 + ((width.max(height) / 2) as usize);
+        let total_steps = base_steps.max(40);
 
-        let center = Coord::new(width as f32 / 2.0, height as f32 / 2.0);
-        let radius = (width as f32 * 0.3).round()
-            .min((height as f32 * 0.2).round())
-            .max(3.0);
+        let fg_gradient = Gradient::new(vec![
+            (0.0, Color::new(0, 230, 255)),
+            (0.5, Color::new(255, 140, 0)),
+            (0.85, Color::new(150, 0, 200)),
+            (1.0, Color::BLACK),
+        ]);
 
-        let char_count = terminal.characters.len();
-        let blackhole_count = (char_count / 10).max(1).min(char_count);
-        let blackhole_indices: Vec<usize> = (0..blackhole_count).collect();
+        let mut frames = Vec::with_capacity(total_steps);
 
-        let mut ring_index: Vec<Option<usize>> = vec![None; char_count];
-        for (bi, &idx) in blackhole_indices.iter().enumerate() {
-            ring_index[idx] = Some(bi);
-        }
+        for step in 0..total_steps {
+            let raw_p = step as f64 / (total_steps - 1) as f64;
+            // smoothstep ease-in-out
+            let p = raw_p * raw_p * (3.0 - 2.0 * raw_p);
 
-        let ring_positions = ring_positions(center, radius, blackhole_count);
+            for (idx, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                let dist = dists[idx];
+                let start_angle = angles[idx];
+                let radius = dist * (1.0 - p);
 
-        let mut rng = Rng::new(0x1234_5678);
+                let angle = start_angle + p * 2.0 * std::f64::consts::PI * 2.0;
+                let x = center.x + (radius * angle.cos()).round() as i32;
+                let y = center.y + (radius * angle.sin()).round() as i32;
 
-        let star_colors = [
-            Color::WHITE,
-            Color::new(160, 160, 160),
-            Color::new(100, 100, 100),
-        ];
-        let star_symbols = ["*", ".", ":", "·"];
-        let unstable_symbols = ["◦", "◎", "◉", "●", "◉", "◎", "◦"];
-        let blackhole_color = Color::WHITE;
+                character.position = Coord::new(
+                    x.clamp(0, max_x),
+                    y.clamp(0, max_y),
+                );
 
-        for (i, ch) in terminal.characters.iter_mut().enumerate() {
-            if blackhole_indices.contains(&i) {
-                ch.output_symbol = "*".to_string();
-                ch.style = CellStyle::with_color_pair(ColorPair::new(blackhole_color, Color::BLACK));
-            } else {
-                let sym = star_symbols[rng.usize_lt(star_symbols.len())];
-                let col = star_colors[rng.usize_lt(star_colors.len())];
-                ch.output_symbol = sym.to_string();
-                ch.style = CellStyle::with_color_pair(ColorPair::new(col, Color::BLACK));
-            }
-        }
+                let color_p = (p + color_offsets[idx]).min(1.0);
+                character.color_pair = ColorPair::new(fg_gradient.color_at(color_p), Color::BLACK);
+                character.visible = p < 1.0;
 
-        let initial_input_positions: Vec<Coord> =
-            terminal.characters.iter().map(|c| c.position).collect();
-
-        let mut positions = initial_input_positions.clone();
-        let mut star_initial_positions = vec![Coord::zero(); char_count];
-
-        for i in 0..char_count {
-            if !blackhole_indices.contains(&i) {
-                star_initial_positions[i] = random_coord(&mut rng, width, height);
-                positions[i] = star_initial_positions[i];
-            }
-        }
-
-        let attract_frames = 50;
-        let spin_frames = 40;
-        let collapse_frames = 25;
-        let total_frames = attract_frames + spin_frames + collapse_frames;
-
-        for step in 1..=total_frames {
-            if step <= attract_frames {
-                let t = step as f32 / attract_frames as f32;
-
-                for i in 0..char_count {
-                    if let Some(bi) = ring_index[i] {
-                        positions[i] = initial_input_positions[i]
-                            .lerp(ring_positions[bi], easing::ease_in_out_sine(t));
-                    } else {
-                        positions[i] =
-                            star_initial_positions[i].lerp(center, easing::ease_in_expo(t));
-                    }
-                }
-
-                update_characters(&mut terminal, &positions);
-                for ch in &mut terminal.characters {
-                    ch.visible = true;
-                }
-            } else if step <= attract_frames + spin_frames {
-                let spin_t = (step - attract_frames) as f32 / spin_frames as f32;
-
-                for i in 0..char_count {
-                    if let Some(bi) = ring_index[i] {
-                        let base_angle = bi as f32 * std::f32::consts::TAU / blackhole_count as f32;
-                        let angle = base_angle + spin_t * std::f32::consts::TAU * 0.5;
-                        positions[i] = Coord::new(
-                            center.x + radius * angle.cos(),
-                            center.y + radius * angle.sin(),
-                        );
-                    }
-                }
-
-                update_characters(&mut terminal, &positions);
-                for i in 0..char_count {
-                    terminal.characters[i].visible = ring_index[i].is_some();
-                }
-            } else {
-                let collapse_t =
-                    (step - attract_frames - spin_frames) as f32 / collapse_frames as f32;
-
-                for i in 0..char_count {
-                    if ring_index[i].is_some() {
-                        positions[i] = positions[i].lerp(center, easing::ease_in_expo(collapse_t));
-                    }
-                }
-
-                update_characters(&mut terminal, &positions);
-
-                for i in 0..char_count {
-                    if let Some(bi) = ring_index[i] {
-                        let sym_index = (bi + step) % unstable_symbols.len();
-                        terminal.characters[i].output_symbol = unstable_symbols[sym_index].to_string();
-                        terminal.characters[i].visible = true;
-                    } else {
-                        terminal.characters[i].visible = false;
-                    }
+                if p < 0.15 {
+                    character.symbol = character.input_symbol;
+                } else if p < 0.85 {
+                    // Keep the original symbol for readability; more dramatic effects can
+                    // swap symbols, but this keeps the text visible while moving.
+                    character.symbol = character.input_symbol;
+                } else {
+                    character.symbol = '*';
                 }
             }
 
-            render_terminal(&mut terminal);
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
-
-        for ch in &mut terminal.characters {
-            ch.visible = false;
-        }
-        terminal.canvas.clear();
-        frames.push(terminal.write_frame());
 
         frames
-    }
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let old = self.0;
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        old
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn range_f32(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.next_f32()
-    }
-
-    fn usize_lt(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
-    }
-}
-
-fn ring_positions(center: Coord, radius: f32, count: usize) -> Vec<Coord> {
-    (0..count)
-        .map(|i| {
-            let angle = i as f32 * std::f32::consts::TAU / count as f32;
-            Coord::new(center.x + radius * angle.cos(), center.y + radius * angle.sin())
-        })
-        .collect()
-}
-
-fn random_coord(rng: &mut Rng, width: u16, height: u16) -> Coord {
-    let x = rng.range_f32(0.0, width.saturating_sub(1).max(1) as f32);
-    let y = rng.range_f32(0.0, height.saturating_sub(1).max(1) as f32);
-    Coord::new(x, y)
-}
-
-fn update_characters(terminal: &mut Terminal, positions: &[Coord]) {
-    for (i, ch) in terminal.characters.iter_mut().enumerate() {
-        ch.position = positions[i];
-    }
-}
-
-fn render_terminal(terminal: &mut Terminal) {
-    let chars = &terminal.characters;
-    let canvas = &mut terminal.canvas;
-
-    canvas.clear();
-
-    for ch in chars {
-        if !ch.visible {
-            continue;
-        }
-
-        let x = ch.position.x.round();
-        let y = ch.position.y.round();
-
-        if x < 0.0 || y < 0.0 || x >= canvas.width as f32 || y >= canvas.height as f32 {
-            continue;
-        }
-
-        canvas.set_cell(
-            x as u16,
-            y as u16,
-            Cell::new(ch.output_symbol.clone(), ch.style),
-        );
     }
 }

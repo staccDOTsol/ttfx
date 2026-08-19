@@ -1,30 +1,14 @@
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::Color;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const FRAME_COUNT: usize = 80;
-const PALETTE: [Color; 7] = [
-    Color::RED,
-    Color::GREEN,
-    Color::BLUE,
-    Color::CYAN,
-    Color::MAGENTA,
-    Color::YELLOW,
-    Color::WHITE,
-];
-
-pub struct Bouncyballs {
-    frame_count: usize,
-}
+pub struct Bouncyballs;
 
 impl Bouncyballs {
     pub fn new() -> Self {
-        Self {
-            frame_count: FRAME_COUNT,
-        }
+        Bouncyballs
     }
 }
 
@@ -34,127 +18,148 @@ impl Effect for Bouncyballs {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = input_dimensions(input);
-        let mut terminal = Terminal::from_input(input, width, height);
+        let input = if input.trim().is_empty() {
+            "TerminalTextEffects"
+        } else {
+            input
+        };
 
-        let characters: Vec<(String, Coord)> = terminal
-            .characters
-            .iter()
-            .map(|c| (c.input_symbol.clone(), c.position))
-            .collect();
+        let mut chars: Vec<(Coord, char)> = Vec::new();
+        let mut width: usize = 0;
+        let mut height: usize = 0;
 
-        let mut rng = Rng::new(0x5EED_1234_5678_9ABC);
-        let mut balls: Vec<BallAnim> = characters
-            .into_iter()
-            .map(|(symbol, target)| BallAnim::new(symbol, target, &mut rng, width, height, &PALETTE))
-            .collect();
-
-        if balls.is_empty() {
-            balls.push(BallAnim::new(
-                "*".to_string(),
-                Coord::new(0.0, 0.0),
-                &mut rng,
-                width,
-                height,
-                &PALETTE,
-            ));
+        for (row, line) in input.lines().enumerate() {
+            width = width.max(line.chars().count());
+            height = row + 1;
+            for (col, ch) in line.chars().enumerate() {
+                chars.push((Coord::new(col as i32, row as i32), ch));
+            }
         }
 
-        let mut frames = Vec::with_capacity(self.frame_count);
+        if width == 0 || height == 0 || chars.is_empty() {
+            return Vec::new();
+        }
 
-        for frame_index in 0..self.frame_count {
-            terminal.clear_canvas();
+        let mut terminal = Terminal::new(width as u16, height as u16);
 
-            let t = frame_index as f32 / (self.frame_count - 1).max(1) as f32;
-            let eased = easing::ease_out_bounce(t);
+        for (id, (coord, symbol)) in chars.iter().enumerate() {
+            terminal.add_character(EffectCharacter::new(id as u32, *coord, *symbol));
+        }
 
-            for ball in &balls {
-                let pos = ball.start.lerp(ball.target, eased);
-                let x = pos.x.round() as u16;
-                let y = pos.y.round() as u16;
+        // Start with dim, clearly visible text; bouncing balls will recolor it.
+        for ch in terminal.characters.iter_mut() {
+            ch.visible = true;
+            ch.color_pair = ColorPair::new(Color::new(80, 80, 80), Color::new(0, 0, 0));
+        }
 
-                if x < terminal.canvas.width && y < terminal.canvas.height {
-                    let style = CellStyle::new(ball.color, Color::BLACK);
-                    terminal.canvas.set_cell(x, y, Cell::new(ball.symbol.clone(), style));
+        let mut balls = create_balls(width as i32, height as i32);
+        let total_frames = 200;
+        let mut frames = Vec::with_capacity(total_frames);
+
+        for _ in 0..total_frames {
+            update_balls(&mut balls, width as i32, height as i32);
+
+            for ch in terminal.characters.iter_mut() {
+                let char_pos = ch.position;
+                let mut best_dist = f64::MAX;
+                let mut best_color: Option<Color> = None;
+
+                for ball in balls.iter() {
+                    let dx = char_pos.x as f64 - ball.pos_x;
+                    let dy = char_pos.y as f64 - ball.pos_y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+
+                    if dist < ball.radius && dist < best_dist {
+                        best_dist = dist;
+                        let t = (dist / ball.radius).clamp(0.0, 1.0);
+                        best_color = Some(ball_gradient(ball.color).color_at(t));
+                    }
+                }
+
+                if let Some(color) = best_color {
+                    ch.color_pair = ColorPair::new(color, Color::new(10, 10, 10));
+                    ch.bold = best_dist < 1.5;
                 }
             }
 
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames
     }
 }
 
-struct BallAnim {
-    symbol: String,
-    start: Coord,
-    target: Coord,
+struct Ball {
+    pos_x: f64,
+    pos_y: f64,
+    vx: f64,
+    vy: f64,
     color: Color,
+    radius: f64,
 }
 
-impl BallAnim {
-    fn new(
-        symbol: String,
-        target: Coord,
-        rng: &mut Rng,
-        width: u16,
-        height: u16,
-        palette: &[Color],
-    ) -> Self {
-        let max_x = width.saturating_sub(1).max(1) as f32;
-        let max_y = height.saturating_sub(1).max(1) as f32;
+fn create_balls(width: i32, height: i32) -> Vec<Ball> {
+    let palette = [
+        Color::new(255, 85, 85),
+        Color::new(255, 184, 77),
+        Color::new(255, 255, 85),
+        Color::new(128, 255, 128),
+        Color::new(85, 221, 255),
+        Color::new(170, 128, 255),
+        Color::new(255, 85, 255),
+    ];
 
-        let start_x = rng.next_range(0.0, max_x);
-        let start_y = rng.next_range(0.0, max_y);
-        let color = palette[rng.next_u64() as usize % palette.len()];
+    let target_count = ((width as usize + height as usize) / 12 + 3).min(10);
+    let mut balls = Vec::with_capacity(target_count);
 
-        Self {
-            symbol,
-            start: Coord::new(start_x, start_y),
-            target,
-            color,
+    for i in 0..target_count {
+        let fx = (i + 1) as f64 / (target_count + 1) as f64;
+        let fy = ((i as f64 * 2.0) + 1.0) / (2.0 * target_count as f64);
+        let x = fx * (width.max(2) - 1) as f64;
+        let y = fy * (height.max(2) - 1) as f64;
+
+        let angle = i as f64 * 2.399963;
+        let speed = 0.35 + (i % 3) as f64 * 0.12;
+
+        balls.push(Ball {
+            pos_x: x,
+            pos_y: y,
+            vx: speed * angle.cos(),
+            vy: speed * angle.sin(),
+            color: palette[i % palette.len()],
+            radius: 4.5 + (i % 3) as f64,
+        });
+    }
+
+    balls
+}
+
+fn update_balls(balls: &mut [Ball], width: i32, height: i32) {
+    let max_x = (width.max(2) - 1) as f64;
+    let max_y = (height.max(2) - 1) as f64;
+
+    for ball in balls.iter_mut() {
+        ball.pos_x += ball.vx;
+        ball.pos_y += ball.vy;
+
+        if ball.pos_x <= 0.0 {
+            ball.pos_x = 0.0;
+            ball.vx = ball.vx.abs();
+        } else if ball.pos_x >= max_x {
+            ball.pos_x = max_x;
+            ball.vx = -ball.vx.abs();
+        }
+
+        if ball.pos_y <= 0.0 {
+            ball.pos_y = 0.0;
+            ball.vy = ball.vy.abs();
+        } else if ball.pos_y >= max_y {
+            ball.pos_y = max_y;
+            ball.vy = -ball.vy.abs();
         }
     }
 }
 
-fn input_dimensions(input: &str) -> (u16, u16) {
-    let normalized = input.replace('\r', "");
-    let lines: Vec<&str> = normalized.split('\n').collect();
-
-    let width = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0)
-        .clamp(10, 120) as u16;
-
-    let height = lines.len().clamp(10, 60) as u16;
-
-    (width, height)
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() as f32) / (u64::MAX as f32)
-    }
-
-    fn next_range(&mut self, min: f32, max: f32) -> f32 {
-        min + (max - min) * self.next_f32()
-    }
+fn ball_gradient(color: Color) -> Gradient {
+    Gradient::new(vec![(0.0, color), (1.0, Color::new(40, 40, 40))])
 }

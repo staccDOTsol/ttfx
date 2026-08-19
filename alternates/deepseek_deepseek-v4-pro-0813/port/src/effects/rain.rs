@@ -1,28 +1,15 @@
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
-use crate::utils::graphics::Color;
+use crate::utils::{Color, ColorPair, Coord, Gradient};
 
-const RAIN_COLORS: [Color; 5] = [
-    Color::GREEN,
-    Color::new(0, 200, 0),
-    Color::CYAN,
-    Color::new(0, 128, 0),
-    Color::BLUE,
-];
-
-const RAIN_SYMBOLS: &[&str] = &["│", "┃", "╽", "┆", "┇", "┊", "┋", "|"];
-
-const FRAMES_PER_DROP: f32 = 28.0;
-const MAX_DROP_DELAY: f32 = 22.0;
-const TRAIL_LENGTH: usize = 10;
-
+/// Rain effect: input characters fall from the top of the terminal as
+/// blue/cyan raindrops to their input positions.
 pub struct Rain;
 
 impl Rain {
     pub fn new() -> Self {
-        Self
+        Rain
     }
 }
 
@@ -32,78 +19,59 @@ impl Effect for Rain {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let width = input
-            .lines()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(1)
-            .max(1) as u16;
-        let height = input.lines().count().max(1) as u16;
+        let text: Vec<char> = input.chars().filter(|c| !c.is_control()).collect();
+        if text.is_empty() {
+            return Vec::new();
+        }
 
-        let mut terminal = Terminal::from_input(input, width, height);
-        let mut characters = std::mem::take(&mut terminal.characters);
+        let width = text.len() as u16;
+        let height = 24u16;
+        let target_row = (height / 2) as i32;
+        let max_delay = 8i32;
 
-        let total_frames = (MAX_DROP_DELAY + FRAMES_PER_DROP) as usize + 12;
-        let mut frames = Vec::with_capacity(total_frames);
+        // Rain-colored vertical gradient: bright cyan at top, deep blue at bottom.
+        let rain_gradient = Gradient::new(vec![
+            (0.0, Color::new(0, 191, 255)),
+            (0.5, Color::new(30, 144, 255)),
+            (1.0, Color::new(0, 0, 139)),
+        ]);
 
-        for frame_index in 0..total_frames {
-            terminal.canvas.clear();
-            let time = frame_index as f32;
+        let mut terminal = Terminal::new(width, height);
 
-            for character in &mut characters {
-                let id = character.id;
+        for (i, &symbol) in text.iter().enumerate() {
+            let mut character = EffectCharacter::new(i as u32, Coord::new(i as i32, 0), symbol);
+            character.bold = true;
+            terminal.add_character(character);
+        }
 
-                // Deterministic per-character delay in [0, MAX_DROP_DELAY].
-                let delay = ((id as f32 * 1.618_033_988_7).fract() * MAX_DROP_DELAY).round();
-                let start_y = -((id % 23) as f32 + 6.0);
+        let mut frames = Vec::new();
 
-                let target_x = character.position.x;
-                let target_y = character.position.y;
+        for step in 0..=(target_row + max_delay) {
+            {
+                let characters = terminal.get_characters_mut();
+                for (i, character) in characters.iter_mut().enumerate() {
+                    let delay = ((i as i32 * 7) % (max_delay + 1)) as i32;
+                    let y = if step < delay {
+                        -1
+                    } else {
+                        (step - delay).min(target_row)
+                    };
 
-                let progress = (time - delay) / FRAMES_PER_DROP;
+                    character.position = Coord::new(i as i32, y);
+                    character.visible = y >= 0;
 
-                if progress >= 1.0 {
-                    let style = CellStyle::default();
-                    terminal.canvas.set_cell(
-                        target_x as u16,
-                        target_y as u16,
-                        Cell::new(character.input_symbol.clone(), style),
-                    );
-                    continue;
-                }
+                    let progress = if y <= 0 {
+                        0.0
+                    } else {
+                        y as f64 / target_row as f64
+                    };
 
-                if progress < 0.0 {
-                    continue;
-                }
-
-                let eased = easing::ease_in_sine(progress.clamp(0.0, 1.0));
-                let y = start_y + (target_y - start_y) * eased;
-                let head_x = target_x;
-                let head_y = y.round() as i32;
-
-                for trail_offset in 0..TRAIL_LENGTH {
-                    let trail_y = head_y - trail_offset as i32;
-
-                    if trail_y < 0 || trail_y as u16 >= terminal.config.height {
-                        continue;
-                    }
-                    if head_x < 0.0 || head_x as u16 >= terminal.config.width {
-                        continue;
-                    }
-
-                    let symbol_index = (id as usize + trail_offset) % RAIN_SYMBOLS.len();
-                    let color_index = (id as usize + trail_offset) % RAIN_COLORS.len();
-
-                    let style = CellStyle::new(RAIN_COLORS[color_index], Color::BLACK);
-                    terminal.canvas.set_cell(
-                        head_x as u16,
-                        trail_y as u16,
-                        Cell::new(RAIN_SYMBOLS[symbol_index], style),
-                    );
+                    let fg = rain_gradient.color_at(progress);
+                    character.color_pair = ColorPair::new(fg, Color::BLACK);
                 }
             }
 
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
         frames

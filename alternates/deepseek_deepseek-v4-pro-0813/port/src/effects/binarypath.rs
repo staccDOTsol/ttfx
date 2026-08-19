@@ -1,14 +1,14 @@
-use crate::engine::canvas::{Cell, CellStyle};
-use crate::engine::terminal::Terminal;
-use crate::utils::graphics::{Color, ColorPair};
-
 use super::Effect;
+use crate::engine::character::EffectCharacter;
+use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair};
 
 pub struct Binarypath;
 
 impl Binarypath {
     pub fn new() -> Self {
-        Self
+        Binarypath
     }
 }
 
@@ -18,147 +18,122 @@ impl Effect for Binarypath {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = dimensions_for(input);
-        let mut terminal = Terminal::from_input(input, width, height);
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1) as u16;
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1) as u16;
 
-        struct CharacterPath {
-            symbol: String,
-            path: Vec<(i32, i32)>,
-        }
+        let mut terminal = Terminal::new(width, height);
+        let mut input_coords = Vec::new();
+        let mut input_symbols = Vec::new();
 
-        let mut paths = Vec::new();
-        for character in &terminal.characters {
-            let target_x = character.position.x.round() as i32;
-            let target_y = character.position.y.round() as i32;
-
-            let start_x = if character.id % 2 == 0 {
-                0
-            } else {
-                width as i32 - 1
-            };
-            let start_y = if (character.id / 2) % 2 == 0 {
-                0
-            } else {
-                height as i32 - 1
-            };
-
-            let path = binary_path((start_x, start_y), (target_x, target_y));
-            paths.push(CharacterPath {
-                symbol: character.input_symbol.clone(),
-                path,
-            });
-        }
-
-        let max_len = paths.iter().map(|p| p.path.len()).max().unwrap_or(0);
-        if max_len == 0 {
-            return vec![terminal.write_frame()];
-        }
-
-        let style = CellStyle::with_color_pair(ColorPair::new(Color::GREEN, Color::BLACK));
-        let mut frames = Vec::with_capacity(max_len + 5);
-
-        for frame_idx in 0..max_len {
-            terminal.clear_canvas();
-
-            for character_path in &paths {
-                let idx = frame_idx.min(character_path.path.len() - 1);
-                let (x, y) = character_path.path[idx];
-
-                if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-                    continue;
-                }
-
-                terminal.canvas.set_cell(
-                    x as u16,
-                    y as u16,
-                    Cell::new(character_path.symbol.clone(), style),
+        let mut character_id = 0u32;
+        for (y, line) in lines.iter().enumerate() {
+            for (x, ch) in line.chars().enumerate() {
+                let coord = Coord::new(x as i32, y as i32);
+                let mut character = EffectCharacter::new(character_id, coord, ch);
+                // Give each character a green/cyan binary-path colour.
+                let g = 160 + (character_id * 17 % 96) as u8;
+                character.color_pair = ColorPair::new(
+                    Color::new(80, g, 140 + (character_id * 11 % 100) as u8),
+                    Color::BLACK,
                 );
+                terminal.add_character(character);
+                input_coords.push(coord);
+                input_symbols.push(ch);
+                character_id += 1;
             }
-
-            frames.push(terminal.write_frame());
         }
 
-        for _ in 0..5 {
-            if let Some(last) = frames.last() {
-                frames.push(last.clone());
+        // If the input was empty, add a styled space so the frame still carries ANSI colours.
+        if terminal.characters.is_empty() {
+            let mut placeholder = EffectCharacter::new(0, Coord::new(0, 0), ' ');
+            placeholder.color_pair = ColorPair::new(Color::new(0, 255, 128), Color::BLACK);
+            terminal.add_character(placeholder);
+            input_coords.push(Coord::new(0, 0));
+            input_symbols.push(' ');
+        }
+
+        let start_positions = compute_binary_tree_positions(
+            terminal.characters.len(),
+            width,
+            height,
+        );
+
+        for (i, character) in terminal.characters.iter_mut().enumerate() {
+            character.position = start_positions[i];
+        }
+
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+
+        let total_steps = 30usize;
+        for step in 1..=total_steps {
+            let linear_t = step as f64 / total_steps as f64;
+            // Smoothstep gives a natural ease without requiring the easing module.
+            let t = linear_t * linear_t * (3.0 - 2.0 * linear_t);
+
+            for (i, character) in terminal.characters.iter_mut().enumerate() {
+                let start = start_positions[i];
+                let end = input_coords[i];
+
+                let x = (start.x as f64 + (end.x as f64 - start.x as f64) * t)
+                    .round()
+                    .clamp(0.0, width as f64 - 1.0) as i32;
+                let y = (start.y as f64 + (end.y as f64 - start.y as f64) * t)
+                    .round()
+                    .clamp(0.0, height as f64 - 1.0) as i32;
+
+                character.position = Coord::new(x, y);
             }
+
+            frames.push(terminal.render_frame());
         }
 
         frames
     }
 }
 
-fn dimensions_for(input: &str) -> (u16, u16) {
-    let line_count = input.lines().count().max(1);
-    let max_line = input
-        .lines()
-        .map(|line| line.chars().count().max(1))
-        .max()
-        .unwrap_or(1);
-
-    let width = (max_line as u32 + 2).min(200) as u16;
-    let height = (line_count as u32 + 2).min(100) as u16;
-
-    (width.max(5), height.max(5))
-}
-
-fn binary_path(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
-    if start == end {
-        return vec![start];
+fn compute_binary_tree_positions(count: usize, width: u16, height: u16) -> Vec<Coord> {
+    if count == 0 {
+        return Vec::new();
     }
 
-    let mut waypoints = vec![start];
-    let dx = end.0 - start.0;
-    let dy = end.1 - start.1;
-    let adx = dx.abs();
-    let ady = dy.abs();
+    let depth = if count <= 1 {
+        0
+    } else {
+        (count as f64).log2().ceil() as i32
+    };
 
-    let mut bit = 1;
-    while bit <= adx || bit <= ady {
-        bit <<= 1;
-    }
-    bit >>= 1;
+    let mut positions = Vec::with_capacity(count);
+    let root_x = width as f64 / 2.0;
+    let dy = height as f64 / (depth as f64 + 1.0);
+    let initial_step = width as f64 / 4.0;
 
-    let mut current = start;
-    while bit > 0 {
-        if adx & bit != 0 {
-            current.0 += if dx >= 0 { bit } else { -bit };
-            waypoints.push(current);
-        }
-        if ady & bit != 0 {
-            current.1 += if dy >= 0 { bit } else { -bit };
-            waypoints.push(current);
-        }
-        bit >>= 1;
-    }
+    for i in 0..count {
+        let mut x = root_x;
+        let mut y = 0.0;
+        let mut step = initial_step;
 
-    if *waypoints.last().unwrap() != end {
-        waypoints.push(end);
-    }
-
-    let mut path = Vec::new();
-    for pair in waypoints.windows(2) {
-        let from = pair[0];
-        let to = pair[1];
-        let mut cur = from;
-        path.push(cur);
-
-        while cur != to {
-            if cur.0 != to.0 {
-                cur.0 += if to.0 > cur.0 { 1 } else { -1 };
-            } else if cur.1 != to.1 {
-                cur.1 += if to.1 > cur.1 { 1 } else { -1 };
+        for level in 0..depth {
+            let bit = (i >> (depth - 1 - level)) & 1;
+            if bit == 0 {
+                x -= step;
+            } else {
+                x += step;
             }
-            path.push(cur);
+            y += dy;
+            step *= 0.5;
         }
+
+        let col = x.round().clamp(0.0, width as f64 - 1.0) as i32;
+        let row = y.round().clamp(0.0, height as f64 - 1.0) as i32;
+        positions.push(Coord::new(col, row));
     }
 
-    if path.first() != Some(&start) {
-        path.insert(0, start);
-    }
-    if path.last() != Some(&end) {
-        path.push(end);
-    }
-
-    path
+    positions
 }

@@ -1,13 +1,14 @@
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
 pub struct RandomSequence;
 
 impl RandomSequence {
     pub fn new() -> Self {
-        Self
+        RandomSequence
     }
 }
 
@@ -17,94 +18,96 @@ impl Effect for RandomSequence {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let mut terminal = Terminal::from_input(input, width, height);
-        terminal.clear_canvas();
-
-        let char_count = terminal.characters.len();
-        if char_count == 0 {
-            return vec![terminal.write_frame()];
+        let lines: Vec<&str> = input.lines().collect();
+        if lines.is_empty() {
+            return Vec::new();
         }
 
-        let mut ids: Vec<u32> = terminal.characters.iter().map(|c| c.id).collect();
-        shuffled(&mut ids, hash_input(input));
-
-        let gradient = Gradient::new()
-            .add_stop(0.0, Color::CYAN)
-            .add_stop(0.5, Color::BLUE)
-            .add_stop(1.0, Color::MAGENTA);
-
-        let color_by_id: Vec<(u32, Color)> = terminal
-            .characters
+        let height = lines.len().max(1) as u16;
+        let width = lines
             .iter()
-            .enumerate()
-            .map(|(index, character)| {
-                let t = if char_count > 1 {
-                    index as f32 / (char_count - 1) as f32
-                } else {
-                    0.0
-                };
-                (character.id, gradient.color_at(t))
-            })
-            .collect();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1) as u16;
 
-        let mut frames = Vec::with_capacity(char_count);
+        let mut terminal = Terminal::new(width, height);
 
-        for id in ids {
-            let fg = color_by_id
-                .iter()
-                .find(|(cid, _)| *cid == id)
-                .map(|(_, color)| *color)
-                .unwrap_or(Color::WHITE);
-            let pair = ColorPair::new(fg, Color::BLACK);
-
-            if let Some(character) = terminal.characters.iter_mut().find(|c| c.id == id) {
-                character.output_symbol = character.input_symbol.clone();
-                character.style = CellStyle::with_color_pair(pair);
-                character.visible = true;
-
-                let x = character.position.x.round() as u16;
-                let y = character.position.y.round() as u16;
-                terminal.canvas.set_cell(
-                    x,
-                    y,
-                    Cell::new(character.output_symbol.clone(), character.style),
-                );
+        // Create one character per visible input character, hidden initially.
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let id = terminal.characters.len() as u32;
+                let coord = Coord::new(col as i32, row as i32);
+                let mut character = EffectCharacter::new(id, coord, ch);
+                character.visible = false;
+                terminal.add_character(character);
             }
-
-            frames.push(terminal.write_frame());
         }
 
+        if terminal.get_characters().is_empty() {
+            return Vec::new();
+        }
+
+        // Deterministic PRNG so repeated runs with the same input are stable.
+        let mut seed = hash_u64(input);
+        if seed == 0 {
+            seed = 0x9e3779b97f4a7c15;
+        }
+        let mut order: Vec<u32> = terminal.get_characters().iter().map(|c| c.id).collect();
+        shuffle(&mut order, &mut seed);
+
+        let gradient = Gradient::new(vec![
+            (0.0, Color::new(255, 0, 0)),
+            (0.25, Color::new(255, 165, 0)),
+            (0.5, Color::new(0, 255, 0)),
+            (0.75, Color::new(0, 255, 255)),
+            (1.0, Color::new(255, 0, 255)),
+        ]);
+
+        let total = order.len().max(1);
+        let mut frames = Vec::with_capacity(order.len() + 2);
+
+        // Initial all-hidden frame still carries SGR styling from the canvas renderer.
+        frames.push(terminal.render_frame());
+
+        for (index, id) in order.iter().enumerate() {
+            {
+                if let Some(character) = terminal.get_character_mut(*id) {
+                    let t = index as f64 / (total - 1) as f64;
+                    character.color_pair = ColorPair::new(gradient.color_at(t), Color::BLACK);
+                    character.visible = true;
+                }
+            }
+            frames.push(terminal.render_frame());
+        }
+
+        // Extra hold frame so the final state is visible for a moment.
+        frames.push(terminal.render_frame());
         frames
     }
 }
 
-fn hash_input(input: &str) -> u64 {
-    let mut seed = 0xcbf29ce484222325u64;
-    for byte in input.as_bytes() {
-        seed ^= *byte as u64;
-        seed = seed.wrapping_mul(0x100000001b3);
+fn hash_u64(s: &str) -> u64 {
+    let mut state = 0xcbf29ce484222325u64;
+    for byte in s.bytes() {
+        state ^= byte as u64;
+        state = state.wrapping_mul(0x100000001b3);
     }
-    seed
+    state
 }
 
-fn next_random(state: &mut u64) -> u64 {
+fn rand_u64(state: &mut u64) -> u64 {
     let mut x = *state;
-    x ^= x.wrapping_shl(13);
-    x ^= x.wrapping_shr(7);
-    x ^= x.wrapping_shl(17);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
     *state = x;
     x
 }
 
-fn shuffled(items: &mut [u32], seed: u64) {
-    let mut rng = seed;
-    if rng == 0 {
-        rng = 0x9e3779b97f4a7c15;
-    }
-
-    for i in (1..items.len()).rev() {
-        let j = (next_random(&mut rng) as usize) % (i + 1);
-        items.swap(i, j);
+fn shuffle<T>(slice: &mut [T], state: &mut u64) {
+    for i in (1..slice.len()).rev() {
+        let j = (rand_u64(state) as usize) % (i + 1);
+        slice.swap(i, j);
     }
 }

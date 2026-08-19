@@ -1,12 +1,14 @@
 use super::Effect;
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::graphics::Color;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
 pub struct Highlight;
 
 impl Highlight {
     pub fn new() -> Self {
-        Self
+        Highlight
     }
 }
 
@@ -16,48 +18,80 @@ impl Effect for Highlight {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let terminal = Terminal::from_input(input, width, height);
+        let lines: Vec<&str> = if input.is_empty() {
+            vec![" "]
+        } else {
+            input
+                .split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .collect()
+        };
 
-        let beam_width = 5_usize;
-        let trail = beam_width as i32 - 1;
-        let mut frames = Vec::new();
+        let height = lines.len().max(1) as u16;
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
 
-        for beam_col in -trail..=(width as i32 + trail) {
-            frames.push(render_highlight_frame(&terminal, beam_col, trail));
+        let mut terminal = Terminal::new(width, height);
+        let mut id = 1u32;
+
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let character = EffectCharacter::new(
+                    id,
+                    Coord::new(col as i32, row as i32),
+                    ch,
+                );
+                terminal.add_character(character);
+                id += 1;
+            }
+        }
+
+        let total = terminal.get_characters().len();
+        if total == 0 {
+            return vec![terminal.render_frame()];
+        }
+
+        let total_f = total as f64;
+        let sigma = (total_f / 10.0).max(1.0);
+        let frame_count = (total * 2).clamp(40, 160);
+
+        let base_fg = Color::WHITE;
+        let base_bg = Color::BLACK;
+        let highlight_fg = Color::BLACK;
+        let highlight_bg = Color::new(255, 235, 59);
+
+        let bg_gradient = Gradient::new(vec![(0.0, base_bg), (1.0, highlight_bg)]);
+        let fg_gradient = Gradient::new(vec![(0.0, base_fg), (1.0, highlight_fg)]);
+
+        let mut frames = Vec::with_capacity(frame_count);
+
+        for frame_idx in 0..frame_count {
+            let progress = frame_idx as f64 / (frame_count - 1) as f64;
+            let center = progress * (total_f + 2.0 * sigma) - sigma;
+
+            for (idx, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                let idx_f = idx as f64;
+                let dist = (idx_f - center).abs();
+
+                if dist <= sigma {
+                    let raw = 1.0 - dist / sigma;
+                    let smooth = raw * raw * (3.0 - 2.0 * raw);
+                    character.color_pair = ColorPair::new(
+                        fg_gradient.color_at(smooth),
+                        bg_gradient.color_at(smooth),
+                    );
+                } else {
+                    character.color_pair = ColorPair::new(base_fg, base_bg);
+                }
+            }
+
+            frames.push(terminal.render_frame());
         }
 
         frames
     }
-}
-
-fn render_highlight_frame(terminal: &Terminal, beam_col: i32, trail: i32) -> String {
-    let mut out = String::new();
-
-    // Move to the top-left and clear before drawing the frame.
-    out.push_str("\x1b[2J\x1b[H");
-
-    for y in 0..terminal.canvas.height {
-        for x in 0..terminal.canvas.width {
-            let symbol = terminal
-                .canvas
-                .get(x, y)
-                .map(|cell| cell.symbol.clone())
-                .unwrap_or_else(|| " ".to_string());
-
-            let (fg, bg) = if (x as i32) >= beam_col - trail && (x as i32) <= beam_col {
-                (Color::BLACK, Color::YELLOW)
-            } else {
-                (Color::WHITE, Color::BLACK)
-            };
-
-            out.push_str(&format!(
-                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{}",
-                fg.r, fg.g, fg.b, bg.r, bg.g, bg.b, symbol
-            ));
-        }
-        out.push_str("\x1b[0m\n");
-    }
-
-    out
 }

@@ -1,14 +1,14 @@
-use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
-use crate::engine::terminal::Terminal;
+use crate::engine::{EffectCharacter, Terminal};
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::Color;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
+
+use super::Effect;
 
 pub struct Spotlights;
 
 impl Spotlights {
     pub fn new() -> Self {
-        Self
+        Spotlights
     }
 }
 
@@ -18,151 +18,192 @@ impl Effect for Spotlights {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = input_dimensions(input);
-        let width = width.max(1);
-        let height = height.max(1);
+        // Parse input into lines. Preserve empty input as a single blank line.
+        let raw_lines: Vec<&str> = if input.is_empty() {
+            vec![" "]
+        } else {
+            input.lines().collect()
+        };
 
-        let mut terminal = Terminal::from_input(input, width, height);
+        let height = raw_lines.len().max(1);
+        let width = raw_lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
-        let mut rng = Rng::new(seed());
-        let spotlight_count = 6usize;
-        let beam_radius = 6.5f32;
-        let frame_count = 110usize;
+        let mut terminal = Terminal::new(width as u16, height as u16);
 
-        let mut positions = Vec::with_capacity(spotlight_count);
-        let mut targets = Vec::with_capacity(spotlight_count);
-
-        for _ in 0..spotlight_count {
-            positions.push(random_coord(&mut rng, width, height));
-            targets.push(random_coord(&mut rng, width, height));
+        let mut character_id = 0u32;
+        for (row, line) in raw_lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let coord = Coord::new(col as i32, row as i32);
+                let mut character = EffectCharacter::new(character_id, coord, ch);
+                character.visible = false;
+                terminal.add_character(character);
+                character_id += 1;
+            }
         }
 
-        let mut frames = Vec::with_capacity(frame_count + 1);
+        let paths = Self::generate_spotlight_paths(&terminal);
+        let mut frames = Vec::new();
 
-        for _ in 0..frame_count {
-            for i in 0..spotlight_count {
-                let speed = 0.012 + (i as f32 * 0.006);
-                positions[i] = positions[i].lerp(targets[i], speed);
+        const BEAM_RADIUS: f64 = 6.0;
+        const SEGMENT_FRAMES: usize = 20;
+        const TOTAL_FRAMES: usize = 180;
 
-                if positions[i].distance(targets[i]) < 1.0 {
-                    targets[i] = random_coord(&mut rng, width, height);
+        let beam_gradient = Gradient::new(vec![
+            (0.0, Color::new(255, 255, 255)),
+            (0.3, Color::new(170, 210, 255)),
+            (0.7, Color::new(80, 140, 255)),
+            (1.0, Color::new(20, 60, 200)),
+        ]);
+
+        for frame_idx in 0..TOTAL_FRAMES {
+            let mut centers = Vec::new();
+
+            for path in &paths {
+                let path_len = path.len().max(2);
+                let cycle_len = path_len * SEGMENT_FRAMES;
+                let pos_in_cycle = frame_idx % cycle_len;
+                let segment = pos_in_cycle / SEGMENT_FRAMES;
+                let progress = (pos_in_cycle % SEGMENT_FRAMES) as f64 / SEGMENT_FRAMES as f64;
+                let eased = ease_in_out_quad(progress);
+
+                let start = path[segment];
+                let end = path[(segment + 1) % path_len];
+
+                let x = start.x as f64 + ((end.x - start.x) as f64 * eased);
+                let y = start.y as f64 + ((end.y - start.y) as f64 * eased);
+                centers.push(Coord::new(x.round() as i32, y.round() as i32));
+            }
+
+            {
+                let characters = terminal.get_characters_mut();
+                for character in characters.iter_mut() {
+                    let coord = character.position;
+                    let mut best_distance = f64::INFINITY;
+
+                    for center in &centers {
+                        let distance = coord.distance(center);
+                        if distance < best_distance {
+                            best_distance = distance;
+                        }
+                    }
+
+                    if best_distance <= BEAM_RADIUS {
+                        let t = 1.0 - (best_distance / BEAM_RADIUS);
+                        let color = beam_gradient.color_at(t);
+                        character.visible = true;
+                        character.color_pair = ColorPair::new(color, Color::BLACK);
+                    } else {
+                        character.visible = false;
+                    }
                 }
             }
 
-            render_spotlight_frame(&mut terminal, &positions, beam_radius);
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
         }
 
-        let characters = terminal.characters.clone();
-        terminal.clear_canvas();
-        for character in &characters {
-            let x = character.position.x.round() as u16;
-            let y = character.position.y.round() as u16;
-            let x = x.min(width - 1);
-            let y = y.min(height - 1);
-
-            terminal.canvas.set_cell(
-                x,
-                y,
-                Cell::new(character.input_symbol.clone(), CellStyle::default()),
-            );
+        // Final frame: all characters visible in white.
+        {
+            let characters = terminal.get_characters_mut();
+            for character in characters.iter_mut() {
+                character.visible = true;
+                character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+            }
         }
-        frames.push(terminal.write_frame());
+        frames.push(terminal.render_frame());
 
         frames
     }
 }
 
-fn render_spotlight_frame(terminal: &mut Terminal, positions: &[Coord], beam_radius: f32) {
-    let characters = terminal.characters.clone();
-    terminal.clear_canvas();
+impl Spotlights {
+    fn generate_spotlight_paths(terminal: &Terminal) -> Vec<Vec<Coord>> {
+        const SPOTLIGHT_COUNT: usize = 5;
+        const WAYPOINT_COUNT: usize = 6;
 
-    for character in &characters {
-        let pos = character.position;
+        let width = terminal.canvas.width as i32;
+        let height = terminal.canvas.height as i32;
+        let mut rng = Rng::new(0x5eed_1234_5678_abcd);
+        let mut paths = Vec::new();
 
-        let nearest = positions
-            .iter()
-            .map(|p| p.distance(pos))
-            .fold(f32::MAX, f32::min);
+        let min_distance = if width >= 8 && height >= 8 { 5.0 } else { 1.0 };
 
-        let falloff = (nearest / beam_radius).clamp(0.0, 1.0);
-        let intensity = (1.0 - falloff) * (1.0 - falloff);
+        for _ in 0..SPOTLIGHT_COUNT {
+            let mut waypoints = Vec::new();
 
-        let r = (255.0 * intensity) as u8;
-        let g = (220.0 * intensity) as u8;
-        let b = (160.0 * intensity) as u8;
+            let first_x = rng.uniform_int(0, (width - 1).max(0));
+            let first_y = rng.uniform_int(0, (height - 1).max(0));
+            let mut last = Coord::new(first_x, first_y);
+            waypoints.push(last);
 
-        let mut style = CellStyle::new(Color::new(r, g, b), Color::BLACK);
-        if intensity < 0.06 {
-            style.hidden = true;
+            for _ in 0..WAYPOINT_COUNT - 1 {
+                let mut found = false;
+
+                for _ in 0..200 {
+                    let candidate = Coord::new(
+                        rng.uniform_int(0, (width - 1).max(0)),
+                        rng.uniform_int(0, (height - 1).max(0)),
+                    );
+
+                    if candidate != last && candidate.distance(&last) as f64 >= min_distance {
+                        last = candidate;
+                        waypoints.push(candidate);
+                        found = true;
+                        break;
+                    }
+                }
+
+                if !found {
+                    waypoints.push(last);
+                }
+            }
+
+            if waypoints.len() < 2 {
+                waypoints.push(Coord::new(width / 2, height / 2));
+            }
+
+            paths.push(waypoints);
         }
 
-        let x = pos.x.round() as u16;
-        let y = pos.y.round() as u16;
-        let x = x.min(terminal.canvas.width - 1);
-        let y = y.min(terminal.canvas.height - 1);
-
-        terminal.canvas.set_cell(x, y, Cell::new(character.input_symbol.clone(), style));
+        paths
     }
 }
 
-fn input_dimensions(input: &str) -> (u16, u16) {
-    let mut max_width: u16 = 0;
-    let mut current_width: u16 = 0;
-    let mut height: u16 = 1;
-
-    for ch in input.chars() {
-        if ch == '\n' {
-            max_width = max_width.max(current_width);
-            height += 1;
-            current_width = 0;
-        } else {
-            current_width += 1;
-        }
+fn ease_in_out_quad(t: f64) -> f64 {
+    if t < 0.5 {
+        2.0 * t * t
+    } else {
+        -1.0 + (4.0 - 2.0 * t) * t
     }
-
-    max_width = max_width.max(current_width);
-    (max_width.max(1), height.max(1))
 }
 
-fn random_coord(rng: &mut Rng, width: u16, height: u16) -> Coord {
-    let x = rng.next_range(0.0, width as f32 - 1.0);
-    let y = rng.next_range(0.0, height as f32 - 1.0);
-    Coord::new(x, y)
-}
-
-fn seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-struct Rng {
-    state: u64,
-}
+struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self {
-            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
-        }
+        Rng(seed)
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
     }
 
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() & 0x00FFFFFF) as f32 / 0x00FFFFFF as f32
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn next_range(&mut self, min: f32, max: f32) -> f32 {
-        min + (max - min) * self.next_f32()
+    fn uniform_int(&mut self, min: i32, max: i32) -> i32 {
+        if max <= min {
+            return min;
+        }
+        min + (self.next_f64() * (max - min + 1) as f64).floor() as i32
     }
 }

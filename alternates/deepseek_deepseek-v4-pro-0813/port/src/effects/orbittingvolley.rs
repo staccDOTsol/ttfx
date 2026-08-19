@@ -1,66 +1,16 @@
 use super::Effect;
-use crate::engine::canvas::{Canvas, Cell, CellStyle};
-use crate::utils::easing;
+use crate::engine::{EffectCharacter, Terminal};
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Gradient};
+use crate::utils::graphics::{Color, ColorPair, Gradient};
+use std::f64::consts::PI;
 
 pub struct Orbittingvolley;
 
 impl Orbittingvolley {
     pub fn new() -> Self {
-        Self
+        Orbittingvolley
     }
 }
-
-struct PlacedChar {
-    symbol: String,
-    input: Coord,
-}
-
-fn parse_input(input: &str) -> (Vec<PlacedChar>, u16, u16) {
-    let mut chars = Vec::new();
-    let mut max_cols = 0u16;
-    let mut rows = 0u16;
-
-    for (line_index, line) in input.lines().enumerate() {
-        let y = line_index as u16;
-        rows = rows.max(y + 1);
-        let line_cols = line.chars().count() as u16;
-        if line_cols > max_cols {
-            max_cols = line_cols;
-        }
-        for (x, ch) in line.chars().enumerate() {
-            chars.push(PlacedChar {
-                symbol: ch.to_string(),
-                input: Coord::new(x as f32, y as f32),
-            });
-        }
-    }
-
-    if input.is_empty() {
-        max_cols = 1;
-        rows = 1;
-    }
-
-    (chars, max_cols.max(1), rows.max(1))
-}
-
-fn draw_at(
-    canvas: &mut Canvas,
-    position: Coord,
-    symbol: &str,
-    style: CellStyle,
-    width: u16,
-    height: u16,
-) {
-    let x = position.x.round().clamp(0.0, width as f32 - 1.0) as u16;
-    let y = position.y.round().clamp(0.0, height as f32 - 1.0) as u16;
-    canvas.set_cell(x, y, Cell::new(symbol, style));
-}
-
-const TOTAL_FRAMES: usize = 90;
-const LAUNCH_FRACTION: f32 = 0.5;
-const LAUNCHER_SYMBOL: &str = "●";
 
 impl Effect for Orbittingvolley {
     fn name(&self) -> &str {
@@ -68,80 +18,98 @@ impl Effect for Orbittingvolley {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (chars, width, height) = parse_input(input);
-        if chars.is_empty() {
-            return vec![Canvas::new(width, height).render_frame()];
+        // Keep only printable characters (ignore newlines and carriage returns).
+        let input_chars: Vec<char> = input
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .collect();
+
+        if input_chars.is_empty() {
+            return Vec::new();
         }
 
-        let color_gradient = Gradient::new()
-            .add_stop(0.0, Color::CYAN)
-            .add_stop(0.5, Color::YELLOW)
-            .add_stop(1.0, Color::MAGENTA);
+        // Fixed canvas width, height scales with the number of characters.
+        // At least 3 rows so there is vertical room to orbit.
+        let cols: usize = 40;
+        let rows = ((input_chars.len() + cols - 1) / cols).max(3);
+        let width = cols as u16;
+        let height = rows as u16;
 
-        let launcher_style = CellStyle::new(Color::GREEN, Color::BLACK);
-        let mut frames = Vec::with_capacity(TOTAL_FRAMES);
+        // Store the original input coordinate for each character.
+        let input_coords: Vec<Coord> = input_chars
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let col = (i % cols) as i32;
+                let row = (i / cols) as i32;
+                Coord::new(col, row)
+            })
+            .collect();
 
-        for frame_index in 0..TOTAL_FRAMES {
-            let global_t = if TOTAL_FRAMES <= 1 {
-                1.0
+        let mut terminal = Terminal::new(width, height);
+
+        // Give every character a visible style so SGR codes are guaranteed.
+        for (i, &ch) in input_chars.iter().enumerate() {
+            let mut character = EffectCharacter::new(i as u32, input_coords[i], ch);
+            character.bold = true; // additional SGR attribute
+            terminal.add_character(character);
+        }
+
+        // Simple orange-to-blue gradient for animated color.
+        let start_color = Color::new(255, 120, 0);
+        let end_color = Color::new(0, 120, 255);
+        let gradient = Gradient::new(vec![(0.0, start_color), (1.0, end_color)]);
+
+        let total_frames = 40;
+        let center_x = width as f64 / 2.0;
+        let center_y = height as f64 / 2.0;
+        let mut frames = Vec::with_capacity(total_frames + 1);
+
+        // Rotate all characters around the canvas centre.
+        for frame in 0..total_frames {
+            let t = if total_frames > 1 {
+                frame as f64 / (total_frames - 1) as f64
             } else {
-                frame_index as f32 / (TOTAL_FRAMES - 1) as f32
+                0.0
             };
+            let color = gradient.color_at(t);
+            let color_pair = ColorPair::new(color, Color::BLACK);
 
-            let mut canvas = Canvas::new(width, height);
+            let angle = 2.0 * PI * (frame as f64) / (total_frames as f64);
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
 
-            // The launcher travels along the top edge while it has characters to fire.
-            if global_t <= LAUNCH_FRACTION {
-                let launcher_progress = easing::ease_in_out_quad(global_t / LAUNCH_FRACTION);
-                let launcher_x =
-                    (launcher_progress * (width.saturating_sub(1) as f32)).round() as u16;
-                draw_at(
-                    &mut canvas,
-                    Coord::new(launcher_x as f32, 0.0),
-                    LAUNCHER_SYMBOL,
-                    launcher_style,
-                    width,
-                    height,
+            for (idx, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                let orig = input_coords[idx];
+                let dx = orig.x as f64 - center_x;
+                let dy = orig.y as f64 - center_y;
+
+                let rot_x = dx * cos_a - dy * sin_a;
+                let rot_y = dx * sin_a + dy * cos_a;
+
+                let new_x = (center_x + rot_x).round() as i32;
+                let new_y = (center_y + rot_y).round() as i32;
+
+                // Clamp to canvas boundaries to avoid out-of-bounds coordinates.
+                character.position = Coord::new(
+                    new_x.clamp(0, (width - 1) as i32),
+                    new_y.clamp(0, (height - 1) as i32),
                 );
+                character.color_pair = color_pair;
             }
 
-            for (index, placed_char) in chars.iter().enumerate() {
-                let launch_t = if chars.len() <= 1 {
-                    0.0
-                } else {
-                    (index as f32 / (chars.len() - 1) as f32) * LAUNCH_FRACTION
-                };
-
-                if global_t <= launch_t {
-                    continue;
-                }
-
-                let raw_flight = (global_t - launch_t) / (1.0 - launch_t).max(0.0001);
-                let flight_t = easing::ease_out_cubic(raw_flight.min(1.0));
-
-                let launcher_progress_at_launch = {
-                    let raw_progress = launch_t / LAUNCH_FRACTION;
-                    easing::ease_in_out_quad(raw_progress.min(1.0))
-                };
-                let start_x =
-                    (launcher_progress_at_launch * (width.saturating_sub(1) as f32)).round();
-                let start = Coord::new(start_x, 0.0);
-                let position = start.lerp(placed_char.input, flight_t);
-
-                let fg = color_gradient.color_at(flight_t);
-                let character_style = CellStyle::new(fg, Color::BLACK);
-                draw_at(
-                    &mut canvas,
-                    position,
-                    &placed_char.symbol,
-                    character_style,
-                    width,
-                    height,
-                );
-            }
-
-            frames.push(canvas.render_frame());
+            frames.push(terminal.render_frame());
         }
+
+        // Final frame: characters return to their exact input positions,
+        // using the final gradient color.
+        let final_color = gradient.color_at(1.0);
+        let final_pair = ColorPair::new(final_color, Color::BLACK);
+        for (idx, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+            character.position = input_coords[idx];
+            character.color_pair = final_pair;
+        }
+        frames.push(terminal.render_frame());
 
         frames
     }

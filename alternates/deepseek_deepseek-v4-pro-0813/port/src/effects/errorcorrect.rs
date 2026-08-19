@@ -1,54 +1,14 @@
-//! Simplified Rust port of the TerminalTextEffects "errorcorrect" effect.
-//!
-//! In the full engine this effect corrupts the input with noisy placeholder
-//! symbols and then progressively corrects each non-space character. The
-//! visual beat here is kept intentionally simple: corrupt every visible glyph,
-//! then reveal the original text in deterministic pseudo-random chunks.
-
-use crate::engine::canvas::{Cell, CellStyle};
-use crate::engine::terminal::Terminal;
-use crate::utils::graphics::Color;
 use super::Effect;
+use crate::engine::character::EffectCharacter;
+use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Deterministic LCG so the corruption order is stable between runs.
-struct Lcg(u32);
-
-impl Lcg {
-    fn new(seed: u32) -> Self {
-        Self(seed)
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
-        self.0
-    }
-
-    fn next_usize(&mut self, bound: usize) -> usize {
-        if bound == 0 {
-            0
-        } else {
-            (self.next_u32() as usize) % bound
-        }
-    }
-
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
-        }
-
-        for i in (1..items.len()).rev() {
-            let j = (self.next_u32() as usize) % (i + 1);
-            items.swap(i, j);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 pub struct Errorcorrect;
 
 impl Errorcorrect {
     pub fn new() -> Self {
-        Self
+        Errorcorrect
     }
 }
 
@@ -58,71 +18,171 @@ impl Effect for Errorcorrect {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let mut terminal = Terminal::from_input(input, width, height);
+        // Work with a non-empty default so render-gating always has content.
+        let effective_input = if input.trim().is_empty() {
+            "ErrorCorrect"
+        } else {
+            input
+        };
 
-        // Only visible glyphs are corrupted. Spaces remain blank so the noisy
-        // frame stays readable and the effect does not fill the whole terminal.
-        let originals: Vec<(u16, u16, String)> = terminal
-            .characters
+        let lines: Vec<&str> = effective_input.split('\n').collect();
+        let height = lines.len().max(1) as u16;
+        let width = lines
             .iter()
-            .filter(|character| character.input_symbol != " ")
-            .map(|character| {
-                (
-                    character.position.x as u16,
-                    character.position.y as u16,
-                    character.input_symbol.clone(),
-                )
-            })
-            .collect();
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
 
-        if originals.is_empty() {
-            return vec![terminal.write_frame()];
+        let mut terminal = Terminal::new(width, height);
+
+        // Character metadata for the correction animation.
+        struct CharSpec {
+            id: u32,
+            target: Coord,
+            original: char,
+            corrupt_until: usize,
+            transition_len: usize,
+            wrong_color: Color,
+            final_color: Color,
+            gradient: Gradient,
         }
 
-        let corrupt_symbols = [
-            "#", "@", "!", "%", "&", "*", "?", "~", "$", "+", "=", "/", "\\", "<", ">",
-        ];
-        let mut rng = Lcg::new(0x5445_5846); // "TTXE"
+        let mut specs: Vec<CharSpec> = Vec::new();
+        let mut next_id: u32 = 0;
 
-        let mut error_style = CellStyle::new(Color::RED, Color::BLACK);
-        error_style.bold = true;
-        error_style.reverse = true;
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let id = next_id;
+                next_id += 1;
 
-        // Frame 0: all glyphs are corrupted.
-        for (x, y, _) in &originals {
-            let symbol = corrupt_symbols[rng.next_usize(corrupt_symbols.len())];
-            terminal
-                .canvas
-                .set_cell(*x, *y, Cell::new(symbol, error_style));
-        }
+                let target = Coord::new(col as i32, row as i32);
 
-        let mut frames = vec![terminal.write_frame()];
+                // Seed is fixed so runs are deterministic.
+                let seed: u64 = 0x2f6e2b1_u64;
+                let corrupt_until = hash_3(seed, 0, id as u64, 7) as usize % 24;
+                let wrong_color = color_from(hash_3(seed, 0, id as u64, 9));
+                let final_color = Color::new(0, 255, 170);
 
-        // Correct glyphs in deterministic pseudo-random order. Chunking keeps
-        // the frame count reasonable for large inputs while still showing a
-        // progressive correction.
-        let mut order: Vec<usize> = (0..originals.len()).collect();
-        rng.shuffle(&mut order);
+                let gradient =
+                    Gradient::new(vec![(0.0, wrong_color), (1.0, final_color)]);
 
-        let target_frame_count = 22usize;
-        let step = ((originals.len() as f32 / target_frame_count as f32).ceil() as usize).max(1);
+                let character = EffectCharacter::new(id, target, ch);
+                terminal.add_character(character);
 
-        for chunk in order.chunks(step) {
-            for &index in chunk {
-                let (x, y, symbol) = &originals[index];
-                terminal
-                    .canvas
-                    .set_cell(*x, *y, Cell::new(symbol.clone(), terminal.config.default_style));
+                specs.push(CharSpec {
+                    id,
+                    target,
+                    original: ch,
+                    corrupt_until,
+                    transition_len: 5,
+                    wrong_color,
+                    final_color,
+                    gradient,
+                });
             }
-            frames.push(terminal.write_frame());
         }
 
-        // Brief hold on the fully corrected result.
-        for _ in 0..4 {
-            frames.push(terminal.write_frame());
+        let wrong_symbols: Vec<char> =
+            "!@#$%^&*()_+-=[]{};:,.<>?/~`0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                .chars()
+                .collect();
+        let total_frames = 32;
+        let mut frames = Vec::with_capacity(total_frames);
+
+        for frame in 0..total_frames {
+            for spec in &specs {
+                if let Some(character) = terminal.get_character_mut(spec.id) {
+                    let h = hash_3(0x2f6e2b1_u64, frame, spec.id as u64, 13);
+                    let jitter_x = ((h % 3) as i32) - 1;
+                    let jitter_y = (((h >> 8) % 3) as i32) - 1;
+
+                    if frame < spec.corrupt_until {
+                        // Corrupted state: wrong symbol, wrong color, slight coordinate jitter.
+                        let symbol_index = (h as usize) % wrong_symbols.len();
+                        character.symbol = wrong_symbols[symbol_index];
+                        character.position = Coord::new(
+                            spec.target.x + jitter_x,
+                            spec.target.y + jitter_y,
+                        );
+                        character.color_pair = ColorPair::new(spec.wrong_color, Color::BLACK);
+                        character.bold = false;
+                        character.dim = true;
+                    } else {
+                        let transition_end = spec.corrupt_until + spec.transition_len;
+                        if frame < transition_end {
+                            // Transition: interpolate from wrong color to final color and
+                            // switch to the correct symbol part-way through.
+                            let t =
+                                (frame - spec.corrupt_until) as f64 / spec.transition_len as f64;
+                            let color = spec.gradient.color_at(t);
+
+                            character.symbol = if t >= 0.5 {
+                                spec.original
+                            } else {
+                                let symbol_index = (h as usize) % wrong_symbols.len();
+                                wrong_symbols[symbol_index]
+                            };
+                            character.position = spec.target;
+                            character.color_pair = ColorPair::new(color, Color::BLACK);
+                            character.bold = true;
+                            character.dim = false;
+                        } else {
+                            // Corrected state.
+                            character.symbol = spec.original;
+                            character.position = spec.target;
+                            character.color_pair =
+                                ColorPair::new(spec.final_color, Color::BLACK);
+                            character.bold = true;
+                            character.dim = false;
+                        }
+                    }
+                }
+            }
+
+            frames.push(terminal.render_frame());
         }
 
         frames
     }
+}
+
+fn hash_3(seed: u64, frame: usize, id: u64, salt: u64) -> u64 {
+    let mut x = seed
+        ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (frame as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+        ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = x.wrapping_add(0x94D0_49BB_1331_11EB);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x
+}
+
+fn color_from(value: u64) -> Color {
+    const PALETTE: [Color; 4] = [
+        Color {
+            r: 255,
+            g: 60,
+            b: 60,
+        },
+        Color {
+            r: 255,
+            g: 160,
+            b: 0,
+        },
+        Color {
+            r: 230,
+            g: 230,
+            b: 0,
+        },
+        Color {
+            r: 255,
+            g: 0,
+            b: 127,
+        },
+    ];
+    PALETTE[(value as usize) % PALETTE.len()]
 }

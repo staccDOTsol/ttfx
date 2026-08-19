@@ -1,133 +1,114 @@
-use crate::engine::canvas::{Canvas, Cell, CellStyle};
-use crate::utils::graphics::{Color, Gradient};
-
 use super::Effect;
+use crate::engine::character::EffectCharacter;
+use crate::engine::terminal::Terminal;
+use crate::utils::geometry::Coord;
+use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-#[derive(Clone, Copy)]
-enum Direction {
-    Vertical,
-    Horizontal,
-}
-
-pub struct Synthgrid {
-    grid_symbol: String,
-    grid_color: Color,
-    direction: Direction,
-    name: &'static str,
-}
+pub struct Synthgrid;
 
 impl Synthgrid {
     pub fn new() -> Self {
-        Self {
-            grid_symbol: "▚".to_string(),
-            grid_color: Color::GREEN,
-            direction: Direction::Vertical,
-            name: "synthgrid",
-        }
+        Synthgrid
     }
 }
 
 impl Effect for Synthgrid {
     fn name(&self) -> &str {
-        self.name
+        "synthgrid"
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let _ = input;
+        synthgrid_frames(input)
+    }
+}
 
-        let width: u16 = 80;
-        let height: u16 = 24;
-        let spacing: u16 = 6;
-        let total_frames: u16 = 60;
+fn synthgrid_frames(input: &str) -> Vec<String> {
+    let width: u16 = 80;
+    let height: u16 = 24;
+    let mut frames = Vec::new();
 
-        let mut canvas = Canvas::new(width, height);
-        let gradient = Gradient::new()
-            .add_stop(0.0, Color::BLACK)
-            .add_stop(0.5, self.grid_color)
-            .add_stop(1.0, Color::BLACK);
+    let input_chars: Vec<char> = input.chars().filter(|c| !c.is_whitespace()).collect();
 
-        let mut frames = Vec::with_capacity(total_frames as usize);
+    let grid_gradient = Gradient::new(vec![
+        (0.0, Color::new(255, 0, 255)), // magenta
+        (0.5, Color::new(0, 255, 255)), // cyan
+        (1.0, Color::new(255, 0, 255)), // magenta
+    ]);
 
-        for frame in 0..total_frames {
-            canvas.clear();
-            let offset = frame % spacing;
+    let frame_count = 12u16;
+    for frame_idx in 0..frame_count {
+        let mut terminal = Terminal::new(width, height);
+        let mut id = 0u32;
 
-            match self.direction {
-                Direction::Vertical => {
-                    let mut x = offset;
-                    while x < width {
-                        draw_vertical_line(&mut canvas, x, height, &self.grid_symbol, &gradient);
-                        x += spacing;
-                    }
-                }
-                Direction::Horizontal => {
-                    let mut y = offset;
-                    while y < height {
-                        draw_horizontal_line(&mut canvas, y, width, &self.grid_symbol, &gradient);
-                        y += spacing;
-                    }
+        // Retro sun centered above the horizon.
+        let sun_center = Coord::new(40, 5);
+        let sun_radius = 5.0;
+        for y in 0..height {
+            for x in 0..width {
+                let coord = Coord::new(x as i32, y as i32);
+                let dist = coord.distance(&sun_center);
+                if dist <= sun_radius {
+                    let t = dist / sun_radius;
+                    let color = grid_gradient.color_at(t);
+                    let mut ec = EffectCharacter::new(id, coord, '█');
+                    ec.color_pair = ColorPair::new(color, Color::BLACK);
+                    ec.bold = true;
+                    terminal.add_character(ec);
+                    id += 1;
                 }
             }
-
-            frames.push(canvas.render_frame());
         }
 
-        frames
-    }
-}
-
-fn draw_vertical_line(
-    canvas: &mut Canvas,
-    x: u16,
-    height: u16,
-    symbol: &str,
-    gradient: &Gradient,
-) {
-    if x >= canvas.width {
-        return;
-    }
-
-    for y in 0..height {
-        if y >= canvas.height {
-            break;
+        // Horizontal grid lines, scrolled by frame index.
+        let scroll = (frame_idx % 4) as i32;
+        let mut y = 8 + scroll;
+        while y < height as i32 {
+            let t = (y as f64 - 8.0) / (height as f64 - 8.0);
+            let line_color = grid_gradient.color_at(t);
+            for x in 0..width as i32 {
+                let coord = Coord::new(x, y);
+                let mut ec = EffectCharacter::new(id, coord, '█');
+                ec.color_pair = ColorPair::new(line_color, Color::BLACK);
+                ec.bold = true;
+                terminal.add_character(ec);
+                id += 1;
+            }
+            y += 4;
         }
 
-        let t = if height <= 1 {
-            0.5
-        } else {
-            y as f32 / (height - 1) as f32
-        };
-
-        let fg = gradient.color_at(t);
-        let style = CellStyle::new(fg, Color::BLACK);
-        canvas.set_cell(x, y, Cell::new(symbol, style));
-    }
-}
-
-fn draw_horizontal_line(
-    canvas: &mut Canvas,
-    y: u16,
-    width: u16,
-    symbol: &str,
-    gradient: &Gradient,
-) {
-    if y >= canvas.height {
-        return;
-    }
-
-    for x in 0..width {
-        if x >= canvas.width {
-            break;
+        // Vertical converging grid lines (approximate perspective).
+        for x in (0..width as i32).step_by(10) {
+            for y in 8..height as i32 {
+                let t = (y as f64 - 8.0) / (height as f64 - 8.0);
+                let line_color = grid_gradient.color_at(t);
+                let coord = Coord::new(x, y);
+                let mut ec = EffectCharacter::new(id, coord, '█');
+                ec.color_pair = ColorPair::new(line_color, Color::BLACK);
+                ec.dim = true;
+                terminal.add_character(ec);
+                id += 1;
+            }
         }
 
-        let t = if width <= 1 {
-            0.5
-        } else {
-            x as f32 / (width - 1) as f32
-        };
+        // Place input characters on/above the grid.
+        for (i, &ch) in input_chars.iter().enumerate() {
+            let col = (i % 70 + 5) as i32;
+            let row = 8 + (i / 70) as i32;
+            if row >= height as i32 {
+                break;
+            }
+            let coord = Coord::new(col, row);
+            let t = (col as f64 / width as f64 + frame_idx as f64 * 0.08) % 1.0;
+            let color = grid_gradient.color_at(t);
+            let mut ec = EffectCharacter::new(id, coord, ch);
+            ec.color_pair = ColorPair::new(color, Color::BLACK);
+            ec.bold = true;
+            terminal.add_character(ec);
+            id += 1;
+        }
 
-        let fg = gradient.color_at(t);
-        let style = CellStyle::new(fg, Color::BLACK);
-        canvas.set_cell(x, y, Cell::new(symbol, style));
+        frames.push(terminal.render_frame());
     }
+
+    frames
 }

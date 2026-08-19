@@ -1,34 +1,16 @@
-
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing;
+use crate::utils::easing::{Easing, QuadInOut};
 use crate::utils::geometry::Coord;
-use crate::utils::graphics::{Color, Gradient};
+use crate::utils::graphics::{Color, ColorPair};
 
 use super::Effect;
-
-fn edge_coord(seed: u32, width: u16, height: u16) -> Coord {
-    let w = width.max(1) as f32;
-    let h = height.max(1) as f32;
-    let perimeter = 2.0 * (w + h);
-    let d = ((seed % 10007) as f32 * 12.9898) % perimeter;
-
-    if d < w {
-        Coord::new(d, 0.0)
-    } else if d < w + h {
-        Coord::new(w - 1.0, d - w)
-    } else if d < w + h + w {
-        Coord::new(w - 1.0 - (d - w - h), h - 1.0)
-    } else {
-        Coord::new(0.0, h - 1.0 - (d - w - h - w))
-    }
-}
 
 pub struct Swarm;
 
 impl Swarm {
     pub fn new() -> Self {
-        Self
+        Swarm
     }
 }
 
@@ -38,90 +20,140 @@ impl Effect for Swarm {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let (width, height) = Terminal::autodetect_size();
-        let mut terminal = Terminal::from_input(input, width, height);
+        let lines: Vec<&str> = input.lines().collect();
+        let height = lines.len().max(1) as u16;
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
 
-        let characters = terminal.characters.clone();
-        let n = characters.len().max(1) as f32;
+        let mut terminal = Terminal::new(width, height);
+        let mut rng = Rng::new(0x2e4b5f6e);
+        let mut ids: Vec<u32> = Vec::new();
+        let mut starts: Vec<Coord> = Vec::new();
+        let mut targets: Vec<Coord> = Vec::new();
+        let mut progress: Vec<f64> = Vec::new();
+        let mut next_id = 0u32;
 
-        let input_positions: Vec<Coord> = characters.iter().map(|c| c.position).collect();
-        let input_symbols: Vec<String> = characters.iter().map(|c| c.input_symbol.clone()).collect();
+        for (row, line) in lines.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                let start = Coord::new(
+                    rng.range_i32(0, width as i32 - 1),
+                    rng.range_i32(0, height as i32 - 1),
+                );
+                let target = Coord::new(col as i32, row as i32);
+                let character = EffectCharacter::new(next_id, start, ch);
+                terminal.add_character(character);
 
-        let swarm_symbols: [char; 8] = ['+', '*', 'o', '●', '○', '·', '✱', 'x'];
+                ids.push(next_id);
+                starts.push(start);
+                targets.push(target);
+                progress.push(rng.next_f64() * 0.35);
+                next_id += 1;
+            }
+        }
 
-        let gradient = Gradient::new()
-            .add_stop(0.0, Color::new(255, 220, 80))
-            .add_stop(0.6, Color::new(255, 160, 40))
-            .add_stop(1.0, Color::WHITE);
+        if ids.is_empty() {
+            return vec![terminal.render_frame()];
+        }
 
-        let total_frames: usize = 90;
-        let mut frames = Vec::with_capacity(total_frames);
+        let mut frames = Vec::new();
+        let speed = 0.055;
 
-        for frame_index in 0..total_frames {
-            terminal.clear_canvas();
-
-            let progress = (frame_index as f32) / ((total_frames - 1) as f32).max(1.0);
-
-            for (idx, ch) in characters.iter().enumerate() {
-                let target = input_positions[idx];
-
-                let stagger = (idx as f32 / n) * 0.25;
-                let local_progress = ((progress - stagger) / (1.0 - stagger)).clamp(0.0, 1.0);
-                let eased = easing::ease_in_out_quad(local_progress);
-
-                let is_blank = input_symbols[idx].trim().is_empty();
-                if is_blank && eased < 0.95 {
-                    continue;
+        for _ in 0..80 {
+            for i in 0..ids.len() {
+                if progress[i] < 1.0 {
+                    progress[i] = (progress[i] + speed).min(1.0);
                 }
 
-                if eased < 0.85 {
-                    let start = edge_coord(ch.id, width, height);
-                    let mut pos = start.lerp(target, eased);
+                let t = progress[i];
+                let eased = QuadInOut.ease(t);
+                let start = starts[i];
+                let target = targets[i];
 
-                    let dx = target.x - start.x;
-                    let dy = target.y - start.y;
-                    let len = (dx * dx + dy * dy).sqrt();
-                    if len > 0.01 {
-                        let wobble = (1.0 - eased) * 8.0;
-                        let wave = (ch.id as f32 + frame_index as f32 * 0.4).sin();
-                        let nx = -dy / len;
-                        let ny = dx / len;
-                        pos.x += nx * wave * wobble;
-                        pos.y += ny * wave * wobble;
-                    }
+                let sway = ((t * std::f64::consts::PI * 2.0) + (i as f64 * 0.7)).sin() * 1.4;
+                let x = start.x as f64 + (target.x - start.x) as f64 * eased + sway;
+                let y = start.y as f64 + (target.y - start.y) as f64 * eased + sway * 0.5;
+                let pos = Coord::new(x.round() as i32, y.round() as i32);
 
-                    let x = pos.x.round();
-                    let y = pos.y.round();
-                    if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
-                        continue;
-                    }
-
-                    let sym_index = (ch.id as usize + frame_index / 2) % swarm_symbols.len();
-                    let style = CellStyle::new(gradient.color_at(eased), Color::BLACK);
-
-                    terminal.canvas.set_cell(
-                        x as u16,
-                        y as u16,
-                        Cell::new(swarm_symbols[sym_index].to_string(), style),
-                    );
-                } else {
-                    let x = target.x.round();
-                    let y = target.y.round();
-                    if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
-                        continue;
-                    }
-
-                    terminal.canvas.set_cell(
-                        x as u16,
-                        y as u16,
-                        Cell::new(input_symbols[idx].clone(), terminal.config.default_style),
-                    );
+                if let Some(character) = terminal.get_character_mut(ids[i]) {
+                    character.position = pos;
+                    character.visible = true;
+                    character.color_pair = ColorPair::new(Self::color_for(t, i), Color::BLACK);
                 }
             }
 
-            frames.push(terminal.write_frame());
+            frames.push(terminal.render_frame());
+
+            if progress.iter().all(|&p| p >= 1.0) {
+                break;
+            }
         }
 
+        // Final frame: all characters at their input coordinates with white-on-black styling.
+        for i in 0..ids.len() {
+            if let Some(character) = terminal.get_character_mut(ids[i]) {
+                character.position = targets[i];
+                character.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+            }
+        }
+        frames.push(terminal.render_frame());
+
         frames
+    }
+}
+
+impl Swarm {
+    fn color_for(t: f64, idx: usize) -> Color {
+        let palette = [
+            Color::new(255, 60, 0),
+            Color::new(255, 160, 0),
+            Color::new(255, 255, 0),
+            Color::new(0, 200, 80),
+            Color::new(0, 170, 255),
+            Color::new(180, 0, 255),
+        ];
+
+        let start = palette[idx % palette.len()];
+        let end = Color::WHITE;
+
+        let r = (start.r as f64 + (end.r as f64 - start.r as f64) * t).round() as u8;
+        let g = (start.g as f64 + (end.g as f64 - start.g as f64) * t).round() as u8;
+        let b = (start.b as f64 + (end.b as f64 - start.b as f64) * t).round() as u8;
+
+        Color::new(r, g, b)
+    }
+}
+
+struct Rng {
+    state: u64,
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn range_i32(&mut self, min: i32, max: i32) -> i32 {
+        if max <= min {
+            return min;
+        }
+        let r = self.next_f64();
+        min + (r * (max - min + 1) as f64) as i32
     }
 }

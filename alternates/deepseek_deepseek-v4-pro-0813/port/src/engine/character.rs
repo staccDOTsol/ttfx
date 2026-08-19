@@ -1,33 +1,41 @@
-use crate::engine::canvas::CellStyle;
 use crate::utils::geometry::Coord;
+use crate::utils::graphics::ColorPair;
 
-#[derive(Clone, Debug)]
+/// A single character in the effect, with position, symbol, and style.
 pub struct EffectCharacter {
     pub id: u32,
-    pub input_symbol: String,
-    pub output_symbol: String,
     pub position: Coord,
-    pub style: CellStyle,
+    pub symbol: char,
+    pub input_symbol: char,
+    pub color_pair: ColorPair,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub blink: bool,
+    pub reverse: bool,
+    pub hidden: bool,
+    pub strike: bool,
     pub visible: bool,
 }
 
 impl EffectCharacter {
-    pub fn new(id: u32, input_symbol: String, position: Coord) -> Self {
-        Self {
+    pub fn new(id: u32, position: Coord, symbol: char) -> Self {
+        EffectCharacter {
             id,
-            input_symbol: input_symbol.clone(),
-            output_symbol: input_symbol,
             position,
-            style: CellStyle::default(),
+            symbol,
+            input_symbol: symbol,
+            color_pair: ColorPair::default(),
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            blink: false,
+            reverse: false,
+            hidden: false,
+            strike: false,
             visible: true,
         }
-    }
-
-    pub fn set_visibility(&mut self, visible: bool) {
-        self.visible = visible;
-    }
-
-    pub fn is_visible(&self) -> bool {
-        self.visible
     }
 }

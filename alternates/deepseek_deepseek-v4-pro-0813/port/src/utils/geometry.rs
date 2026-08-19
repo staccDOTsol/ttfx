@@ -1,52 +1,51 @@
-use std::ops::{Add, Mul, Sub};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// A 2D coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Coord {
-    pub x: f32,
-    pub y: f32,
+    pub x: i32,
+    pub y: i32,
 }
 
 impl Coord {
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
+    pub fn new(x: i32, y: i32) -> Self {
+        Coord { x, y }
     }
 
-    pub const fn zero() -> Self {
-        Self::new(0.0, 0.0)
-    }
-
-    pub fn distance(self, other: Self) -> f32 {
-        ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
-    }
-
-    pub fn lerp(self, other: Self, t: f32) -> Self {
-        Self::new(
-            self.x + (other.x - self.x) * t,
-            self.y + (other.y - self.y) * t,
-        )
+    pub fn distance(&self, other: &Coord) -> f64 {
+        let dx = (self.x - other.x) as f64;
+        let dy = (self.y - other.y) as f64;
+        (dx * dx + dy * dy).sqrt()
     }
 }
 
-impl Add for Coord {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(self.x + rhs.x, self.y + rhs.y)
-    }
+/// Compute the length of a line between two points.
+pub fn find_length_of_line(start: Coord, end: Coord) -> f64 {
+    start.distance(&end)
 }
 
-impl Sub for Coord {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::new(self.x - rhs.x, self.y - rhs.y)
+/// Compute the length of a Bezier curve (simplified: straight line approximation).
+pub fn find_length_of_bezier_curve(
+    start: Coord,
+    control1: Coord,
+    control2: Coord,
+    end: Coord,
+) -> f64 {
+    // For now, approximate as sum of line segments
+    let mut length = 0.0;
+    let steps = 20;
+    let mut prev = start;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let x = (1.0 - t).powi(3) * start.x as f64
+            + 3.0 * (1.0 - t).powi(2) * t * control1.x as f64
+            + 3.0 * (1.0 - t) * t.powi(2) * control2.x as f64
+            + t.powi(3) * end.x as f64;
+        let y = (1.0 - t).powi(3) * start.y as f64
+            + 3.0 * (1.0 - t).powi(2) * t * control1.y as f64
+            + 3.0 * (1.0 - t) * t.powi(2) * control2.y as f64
+            + t.powi(3) * end.y as f64;
+        let current = Coord::new(x.round() as i32, y.round() as i32);
+        length += find_length_of_line(prev, current);
+        prev = current;
     }
-}
-
-impl Mul<f32> for Coord {
-    type Output = Self;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        Self::new(self.x * rhs, self.y * rhs)
-    }
+    length
 }

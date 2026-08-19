@@ -1,31 +1,69 @@
 use super::Effect;
-use crate::engine::canvas::{Cell, CellStyle};
+use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::Terminal;
-use crate::utils::easing::ease_out_quad;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair};
 
-const LAUNCH_DURATION: usize = 22;
-const EXPLOSION_DURATION: usize = 26;
-const PARTICLE_COUNT: usize = 24;
-const MAX_ACTIVITY_FRAMES: usize = 200;
+struct Particle {
+    id: u32,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    color: Color,
+    life: f64,
+    visible: bool,
+}
 
-static PARTICLE_COLORS: [Color; 6] = [
-    Color::RED,
-    Color::YELLOW,
-    Color::MAGENTA,
-    Color::CYAN,
-    Color::GREEN,
-    Color::new(255, 128, 0),
-];
+struct Rng {
+    state: u64,
+}
 
-static PARTICLE_SYMBOLS: [&str; 6] = ["*", "●", "◦", "·", "+", "◆"];
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng { state: seed | 1 }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn firework_colors() -> Vec<Color> {
+    vec![
+        Color::new(255, 0, 0),
+        Color::new(255, 140, 0),
+        Color::new(255, 255, 0),
+        Color::new(0, 255, 0),
+        Color::new(0, 200, 255),
+        Color::new(0, 0, 255),
+        Color::new(255, 0, 255),
+    ]
+}
+
+fn fade_color(color: Color, life: f64) -> Color {
+    let factor = life.max(0.0).min(1.0);
+    Color::new(
+        (color.r as f64 * factor) as u8,
+        (color.g as f64 * factor) as u8,
+        (color.b as f64 * factor) as u8,
+    )
+}
 
 pub struct Fireworks;
 
 impl Fireworks {
     pub fn new() -> Self {
-        Self
+        Fireworks
     }
 }
 
@@ -35,141 +73,124 @@ impl Effect for Fireworks {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        firework_frames(input)
-    }
-}
+        let lines: Vec<&str> = input.lines().collect();
+        let max_line_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let width = max_line_len.max(30) as u16;
+        let height = lines.len().max(10) as u16;
 
-#[derive(Clone, Copy)]
-struct Shell {
-    target: Coord,
-}
+        let mut terminal = Terminal::new(width, height);
 
-fn firework_frames(input: &str) -> Vec<String> {
-    let (width, height) = Terminal::autodetect_size();
-    let mut terminal = Terminal::from_input(input, width.max(1), height.max(1));
-    terminal.clear_canvas();
-
-    let shells: Vec<Shell> = terminal
-        .characters
-        .iter()
-        .map(|character| Shell {
-            target: character.position,
-        })
-        .collect();
-
-    let char_count = terminal.characters.len().max(1);
-    let launch_delay = calculate_launch_delay(char_count);
-    let activity_frames = char_count * launch_delay + LAUNCH_DURATION + EXPLOSION_DURATION;
-    let frame_count = activity_frames.min(MAX_ACTIVITY_FRAMES).max(20);
-
-    let mut frames = Vec::with_capacity(frame_count + 1);
-
-    for frame_idx in 0..frame_count {
-        terminal.clear_canvas();
-        for (shell_idx, shell) in shells.iter().enumerate() {
-            render_shell(&mut terminal, shell_idx, *shell, frame_idx, launch_delay);
+        let mut symbols: Vec<char> = input.chars().filter(|c| !c.is_whitespace()).collect();
+        if symbols.is_empty() {
+            symbols = vec!['*'];
         }
-        frames.push(terminal.write_frame());
-    }
 
-    frames.push(draw_input_text(&mut terminal));
-    frames
-}
+        let launch_x = width / 2;
+        let launch_y = height - 1;
+        let explosion_y = (height / 3).max(1) as i32;
 
-fn calculate_launch_delay(char_count: usize) -> usize {
-    let overhead = LAUNCH_DURATION + EXPLOSION_DURATION;
-    let delay = MAX_ACTIVITY_FRAMES.saturating_sub(overhead) / char_count;
-    delay.clamp(1, 12)
-}
+        let mut particles: Vec<Particle> = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, &sym)| {
+                let id = i as u32;
+                let character = EffectCharacter::new(
+                    id,
+                    Coord::new(launch_x as i32, launch_y as i32),
+                    sym,
+                );
+                terminal.add_character(character);
+                Particle {
+                    id,
+                    x: launch_x as f64,
+                    y: launch_y as f64,
+                    vx: 0.0,
+                    vy: 0.0,
+                    color: Color::WHITE,
+                    life: 1.0,
+                    visible: false,
+                }
+            })
+            .collect();
 
-fn render_shell(
-    terminal: &mut Terminal,
-    shell_idx: usize,
-    shell: Shell,
-    frame_idx: usize,
-    launch_delay: usize,
-) {
-    let start_frame = shell_idx * launch_delay;
-    let detonation_frame = start_frame + LAUNCH_DURATION;
-    let final_frame = detonation_frame + EXPLOSION_DURATION;
-
-    if frame_idx >= start_frame && frame_idx < detonation_frame {
-        let t = (frame_idx - start_frame) as f32 / LAUNCH_DURATION as f32;
-        let eased_t = ease_out_quad(t);
-        let start = Coord::new(
-            terminal.canvas.width as f32 / 2.0,
-            terminal.canvas.height as f32 - 1.0,
-        );
-        let position = start.lerp(shell.target, eased_t);
-        let symbol = if frame_idx % 2 == 0 { "●" } else { "○" };
-
-        draw_cell(
-            terminal,
-            position,
-            symbol,
-            CellStyle::with_color_pair(ColorPair::new(Color::WHITE, Color::BLACK)),
-        );
-    } else if frame_idx >= detonation_frame && frame_idx < final_frame {
-        let elapsed = (frame_idx - detonation_frame) as f32;
-
-        for particle_idx in 0..PARTICLE_COUNT {
-            let angle = ((shell_idx * 13 + particle_idx) % PARTICLE_COUNT) as f32
-                * 2.0
-                * std::f32::consts::PI
-                / PARTICLE_COUNT as f32;
-            let speed = 1.25 + ((shell_idx + particle_idx) % 6) as f32 * 0.18;
-            let velocity_x = angle.cos() * speed;
-            let velocity_y = angle.sin() * speed;
-            let gravity = 0.035;
-
-            let x = shell.target.x + velocity_x * elapsed;
-            let y = shell.target.y + velocity_y * elapsed
-                + 0.5 * gravity * elapsed * elapsed;
-
-            let symbol =
-                PARTICLE_SYMBOLS[(shell_idx * 5 + particle_idx) % PARTICLE_SYMBOLS.len()];
-            let color = PARTICLE_COLORS[(shell_idx * 7 + particle_idx) % PARTICLE_COLORS.len()];
-
-            draw_cell(
-                terminal,
-                Coord::new(x, y),
-                symbol,
-                CellStyle::with_color_pair(ColorPair::new(color, Color::BLACK)),
-            );
+        for p in &particles {
+            terminal.set_character_visibility(p.id, p.visible);
         }
-    }
-}
+        let rocket_id = particles[0].id;
+        terminal.set_character_visibility(rocket_id, true);
 
-fn draw_cell(terminal: &mut Terminal, position: Coord, symbol: &str, style: CellStyle) {
-    let x = position.x.round() as i32;
-    let y = position.y.round() as i32;
+        let mut frames = Vec::new();
 
-    if x >= 0 && y >= 0 && x < terminal.canvas.width as i32 && y < terminal.canvas.height as i32 {
-        terminal.canvas.set_cell(x as u16, y as u16, Cell::new(symbol, style));
-    }
-}
-
-fn draw_input_text(terminal: &mut Terminal) -> String {
-    terminal.clear_canvas();
-
-    let style = terminal.config.default_style;
-    let characters: Vec<(u16, u16, String)> = terminal
-        .characters
-        .iter()
-        .map(|character| {
-            (
-                character.position.x.round() as u16,
-                character.position.y.round() as u16,
-                character.input_symbol.clone(),
-            )
-        })
-        .collect();
-
-    for (x, y, symbol) in characters {
-        if x < terminal.canvas.width && y < terminal.canvas.height {
-            terminal.canvas.set_cell(x, y, Cell::new(symbol, style));
+        // Launch the rocket from the bottom to the explosion height.
+        let launch_frames = 12;
+        for frame in 0..launch_frames {
+            let t = frame as f64 / launch_frames as f64;
+            let y = launch_y as f64 - (launch_y as f64 - explosion_y as f64) * t;
+            if let Some(ch) = terminal.get_character_mut(rocket_id) {
+                ch.position = Coord::new(launch_x as i32, y.round() as i32);
+                ch.color_pair = ColorPair::new(Color::WHITE, Color::BLACK);
+            }
+            frames.push(terminal.render_frame());
         }
-    }
 
-    terminal.write_frame()
+        // Explode: turn every character into a firework spark with a radial velocity.
+        let mut rng = Rng::new(0x9E37_79B9_7F4A_7C15);
+        let colors = firework_colors();
+        for p in particles.iter_mut() {
+            p.x = launch_x as f64;
+            p.y = explosion_y as f64;
+            p.visible = true;
+            p.life = 1.0;
+
+            let angle = rng.next_f64() * 2.0 * std::f64::consts::PI;
+            let speed = 0.5 + rng.next_f64() * 2.0;
+            p.vx = angle.cos() * speed;
+            p.vy = angle.sin() * speed;
+            p.color = colors[rng.next_u64() as usize % colors.len()];
+
+            terminal.set_character_visibility(p.id, true);
+        }
+
+        // Particle flight, gravity, fading, and eventual removal.
+        let post_frames = 60;
+        for _ in 0..post_frames {
+            for p in particles.iter_mut() {
+                if !p.visible {
+                    if let Some(ch) = terminal.get_character_mut(p.id) {
+                        ch.visible = false;
+                    }
+                    continue;
+                }
+
+                p.vy += 0.06;
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life -= 0.03;
+
+                if p.life <= 0.0
+                    || p.y > terminal.canvas.height as f64 + 2.0
+                    || p.y < -2.0
+                    || p.x < -2.0
+                    || p.x > terminal.canvas.width as f64 + 2.0
+                {
+                    p.visible = false;
+                }
+
+                let color = fade_color(p.color, p.life);
+                if let Some(ch) = terminal.get_character_mut(p.id) {
+                    ch.position = Coord::new(p.x.round() as i32, p.y.round() as i32);
+                    ch.color_pair = ColorPair::new(color, Color::BLACK);
+                    ch.visible = p.visible;
+                }
+            }
+
+            let all_hidden = particles.iter().all(|p| !p.visible);
+            frames.push(terminal.render_frame());
+            if all_hidden {
+                break;
+            }
+        }
+
+        frames
+    }
 }
