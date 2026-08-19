@@ -1,51 +1,32 @@
-//! Middleout effect: text expands in a single row or column in the middle of the
-//! canvas before expanding to its original position.
-//!
+//! Middleout effect: text expands from the center row (or column) outward,
+//! then travels to its final position while fading to the final gradient.
 //! Port of terminaltexteffects/effects/effect_middleout.py.
 
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::easing::{self, EasingFn};
+use crate::utils::easing;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Direction the text expands from the center line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExpandDirection {
-    /// Expand vertically from a center row.
-    Vertical,
-    /// Expand horizontally from a center column.
-    Horizontal,
-}
+/// Maximum number of frames to render (safety bound).
+const MAX_FRAMES: usize = 5000;
 
+/// Middleout effect configuration, mirroring the Python `MiddleOutConfig` defaults.
 pub struct Middleout {
-    /// Color for the initial text in the center of the canvas.
     starting_color: Color,
-    /// Colors for the final gradient applied across the canvas (vertical direction).
     final_gradient_stops: Vec<Color>,
-    /// Number of interpolation steps between gradient stops.
     final_gradient_steps: usize,
-    /// Direction the text expands (Python default: "vertical").
-    expand_direction: ExpandDirection,
-    /// Speed of the characters moving to the center line/column.
+    /// "vertical" expands out from the center row; false = horizontal.
+    expand_direction_vertical: bool,
     center_movement_speed: f64,
-    /// Speed of the characters expanding to the full text.
     full_movement_speed: f64,
-    /// Easing for the center movement.
-    center_easing: EasingFn,
-    /// Easing for the full expansion movement.
-    full_easing: EasingFn,
+    center_easing: easing::EasingFunction,
+    full_easing: easing::EasingFunction,
 }
 
 impl Middleout {
     pub fn new() -> Self {
-        Middleout {
-            // Python defaults: starting_color=ffffff,
-            // final_gradient_stops=(8A008A, 00D1FF, FFFFFF), steps=12,
-            // expand_direction="vertical",
-            // center_movement_speed=0.35, full_movement_speed=0.35,
-            // center/full easing = in_out_sine.
+        Self {
             starting_color: Color::from_hex("ffffff").expect("valid hex"),
             final_gradient_stops: vec![
                 Color::from_hex("8A008A").expect("valid hex"),
@@ -53,7 +34,7 @@ impl Middleout {
                 Color::from_hex("FFFFFF").expect("valid hex"),
             ],
             final_gradient_steps: 12,
-            expand_direction: ExpandDirection::Vertical,
+            expand_direction_vertical: true,
             center_movement_speed: 0.35,
             full_movement_speed: 0.35,
             center_easing: easing::in_out_sine,
@@ -64,7 +45,7 @@ impl Middleout {
 
 impl Default for Middleout {
     fn default() -> Self {
-        Middleout::new()
+        Self::new()
     }
 }
 
@@ -75,92 +56,98 @@ impl Effect for Middleout {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-
-        // Final gradient mapped vertically across the canvas, as the Python
-        // effect's build_coordinate_color_mapping(..., direction=vertical).
-        let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
-        let fallback_color = self.starting_color;
-
         let center = terminal.canvas.center();
-        let canvas_height = terminal.canvas.height;
+        let height = terminal.canvas.height;
 
-        // --- build phase (Python: MiddleoutIterator.build) ---
+        let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
+        let starting_color = self.starting_color;
+        let expand_vertical = self.expand_direction_vertical;
+        let center_speed = self.center_movement_speed;
+        let full_speed = self.full_movement_speed;
+        let center_easing = self.center_easing;
+        let full_easing = self.full_easing;
+
+        // ---- build (mirrors Python build()) ----
         for character in terminal.get_characters_mut() {
-            // Final color for this character based on its input row.
-            let fraction = if canvas_height > 1 {
-                (character.input_coord.row - 1) as f64 / (canvas_height as f64 - 1.0)
+            // Final gradient color mapped by row (vertical gradient direction, the
+            // upstream default), matching build_coordinate_color_mapping.
+            let t = if height > 1 {
+                (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
                 0.0
             };
             let final_color = final_gradient
-                .get_color_at_fraction(fraction)
-                .unwrap_or(fallback_color);
+                .get_color_at_fraction(t)
+                .unwrap_or(starting_color);
 
-            // Characters start collapsed at the canvas center.
+            // Characters start at the canvas center.
             character.motion.current_coord = center;
 
-            // Center path: move to the center line (vertical) or column (horizontal).
-            let (column, row) = match self.expand_direction {
-                ExpandDirection::Vertical => (character.input_coord.column, center.row),
-                ExpandDirection::Horizontal => (center.column, character.input_coord.row),
+            // Center waypoint: keep own column (vertical expand) or own row (horizontal).
+            let (column, row) = if expand_vertical {
+                (character.input_coord.column, center.row)
+            } else {
+                (center.column, character.input_coord.row)
             };
-            let center_path = character.motion.new_path(
-                "center",
-                self.center_movement_speed,
-                Some(self.center_easing),
-            );
-            center_path.add_waypoint(Coord::new(column, row));
-
-            // Full path: expand out to the original input coordinate.
-            let full_path =
-                character
+            {
+                let center_path =
+                    character
+                        .motion
+                        .new_path("center", center_speed, Some(center_easing));
+                center_path.new_waypoint("0", Coord::new(column, row));
+            }
+            {
+                let full_path = character
                     .motion
-                    .new_path("full", self.full_movement_speed, Some(self.full_easing));
-            full_path.add_waypoint(character.input_coord);
-
-            // Full scene: fade from the starting color to the character's final
-            // gradient color while it expands (Python: apply_gradient_to_symbols).
-            let symbol = character.input_symbol;
-            let fade = Gradient::new(&[self.starting_color, final_color], 10);
-            let full_scene = character.animation.new_scene("full", false);
-            for color in &fade.spectrum {
-                full_scene.add_frame(symbol, 5, ColorPair::fg(*color), false);
+                    .new_path("full", full_speed, Some(full_easing));
+                full_path.new_waypoint("0", character.input_coord);
             }
 
-            // Show the character in the starting color and head for the center line.
-            character.animation.current_visual =
-                CharacterVisual::new(symbol, false, ColorPair::fg(self.starting_color));
-            character.is_visible = true;
-            character.motion.activate_path("center");
-        }
-
-        // --- animation loop (Python: __next__ with center/expand phases) ---
-        let mut frames = Vec::new();
-        frames.push(terminal.get_formatted_output_string());
-
-        let mut expanded = false;
-        const MAX_FRAMES: usize = 20_000;
-        loop {
-            let active = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
-
-            if active == 0 {
-                if !expanded {
-                    // Center phase complete: expand every character to its
-                    // input coordinate while fading to the final gradient color.
-                    expanded = true;
-                    for character in terminal.get_characters_mut() {
-                        character.motion.activate_path("full");
-                        character.animation.activate_scene("full");
-                    }
-                } else {
-                    break;
+            // "full" scene: gradient from the starting color to the character's
+            // final gradient color (Python: apply_gradient_to_symbols, 10 steps).
+            let char_gradient = Gradient::new(&[starting_color, final_color], 10);
+            let input_symbol = character.input_symbol;
+            {
+                let full_scene = character.animation.new_scene("full", false);
+                for color in &char_gradient.spectrum {
+                    full_scene.add_frame(input_symbol, 10, Some(ColorPair::fg_only(*color)));
                 }
             }
 
-            if frames.len() >= MAX_FRAMES {
-                break;
-            }
+            // Initial appearance: input symbol in the starting color (styled output).
+            character
+                .animation
+                .set_appearance(input_symbol, Some(ColorPair::fg_only(starting_color)));
+
+            character.motion.activate_path("center");
+            character.is_visible = true;
+        }
+
+        // ---- frame loop (mirrors Python __next__) ----
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+
+        // Phase 1: everyone converges on the center row/column.
+        while frames.len() < MAX_FRAMES
+            && terminal
+                .get_characters()
+                .iter()
+                .any(|c| !c.motion.movement_is_complete())
+        {
+            terminal.tick();
+            frames.push(terminal.render_frame());
+        }
+
+        // Phase 2: once expanded, activate the "full" path and the "full" scene
+        // (upstream registers PATH_ACTIVATED -> ACTIVATE_SCENE for the full path).
+        for character in terminal.get_characters_mut() {
+            character.motion.activate_path("full");
+            character.animation.activate_scene("full");
+        }
+
+        while frames.len() < MAX_FRAMES && terminal.is_active() {
+            terminal.tick();
+            frames.push(terminal.render_frame());
         }
 
         frames

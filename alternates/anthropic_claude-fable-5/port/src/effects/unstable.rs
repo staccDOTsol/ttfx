@@ -1,67 +1,48 @@
-//! Unstable: characters are jumbled to swapped positions, rumble with growing
-//! intensity, explode outward to the canvas edges, then reassemble into the
-//! original input text while shifting to the final gradient colors.
+//! Unstable effect: characters spawn jumbled, rumble with increasing intensity,
+//! explode to the canvas edges, then reassemble into the input text.
 //!
-//! Port of terminaltexteffects/effects/effect_unstable.py, adapted to the
-//! simplified engine in this crate (no event handlers; phases are driven
-//! directly from the frame loop).
+//! Port of terminaltexteffects/effects/effect_unstable.py.
 
 use super::Effect;
-use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
+use crate::engine::terminal::{Terminal, TerminalConfig};
 
-/// Small deterministic xorshift64 PRNG (the crate has no rand dependency).
-struct Rng(u64);
+/// Small deterministic PRNG (LCG) so the effect needs no external crates.
+struct Lcg(u64);
 
-impl Rng {
+impl Lcg {
     fn new(seed: u64) -> Self {
-        // Never allow the zero state.
-        Rng(seed | 1)
+        Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
     }
 
-    /// Inclusive range [lo, hi].
-    fn gen_range(&mut self, lo: i32, hi: i32) -> i32 {
+    /// Inclusive range [lo, hi], like Python's random.randint.
+    fn randint(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;
         }
-        let span = (hi - lo + 1) as u64;
-        lo + (self.next_u64() % span) as i32
+        lo + (self.next_u32() % ((hi - lo + 1) as u32)) as i32
     }
 
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
-        }
-        for i in (1..items.len()).rev() {
-            let j = (self.next_u64() % (i as u64 + 1)) as usize;
-            items.swap(i, j);
-        }
+    fn choice(&mut self, options: &[i32]) -> i32 {
+        options[(self.next_u32() as usize) % options.len()]
     }
 }
-
-const EXPLOSION_SPEED: f64 = 0.75;
-const REASSEMBLY_SPEED: f64 = 0.75;
-const RUMBLE_TICKS: u32 = 110;
-const PAUSE_TICKS: u32 = 12;
-const FINAL_HOLD_TICKS: u32 = 10;
-const GUARD_LIMIT: u32 = 5000;
 
 pub struct Unstable;
 
 impl Unstable {
     pub fn new() -> Self {
-        Unstable
+        Self
     }
 }
 
@@ -72,86 +53,78 @@ impl Effect for Unstable {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
+        let mut rng = Lcg::new(0x7f4a_7c15_9e37_79b9);
 
-        // Deterministic seed derived from the input text.
-        let mut seed: u64 = 0xA5A5_1234_5678_9ABC;
-        for b in input.bytes() {
-            seed = seed.wrapping_mul(31).wrapping_add(b as u64);
+        if terminal.get_characters().is_empty() {
+            return vec![terminal.render_frame()];
         }
-        let mut rng = Rng::new(seed);
 
-        // Colors mirroring the Python defaults.
+        // Config mirrored from the Python defaults.
         let unstable_color = Color::from_hex("ff9200").expect("valid hex");
-        let dim_unstable = Color::new(0x71, 0x40, 0x00);
-        let final_gradient = Gradient::new(
-            &[
-                Color::from_hex("8A008A").expect("valid hex"),
-                Color::from_hex("00D1FF").expect("valid hex"),
-                Color::from_hex("FFFFFF").expect("valid hex"),
-            ],
-            12,
-        );
-        let rumble_gradient = Gradient::new(&[dim_unstable, unstable_color], 6);
+        let start_color = Color::from_hex("ffffff").expect("valid hex");
+        let explosion_speed = 0.75;
+        let reassembly_speed = 0.75;
+        let final_gradient_stops = [
+            Color::from_hex("8A008A").expect("valid hex"),
+            Color::from_hex("00D1FF").expect("valid hex"),
+            Color::from_hex("FFFFFF").expect("valid hex"),
+        ];
+        let final_gradient = Gradient::new(&final_gradient_stops, 12);
 
-        // Jumble: each character takes another character's input coordinate.
-        let mut jumbled: Vec<Coord> = terminal
-            .characters
+        // Pool of input coordinates to jumble the characters across the text area.
+        let mut character_coords: Vec<Coord> = terminal
+            .get_characters()
             .iter()
             .map(|c| c.input_coord)
             .collect();
-        rng.shuffle(&mut jumbled);
+        // Jumbled coordinate per character, in arena (input) order.
+        let mut jumbled_coords: Vec<Coord> = Vec::with_capacity(character_coords.len());
 
-        // Build paths and scenes per character.
-        for (i, character) in terminal.characters.iter_mut().enumerate() {
-            let jumbled_coord = jumbled[i];
+        // --- build (mirrors UnstableIterator.build) ---
+        for character in terminal.get_characters_mut() {
             let input_coord = character.input_coord;
-            let symbol = character.input_symbol;
+            let input_symbol = character.input_symbol;
 
-            character.is_visible = true;
+            // Pick an explosion target on a random canvas edge.
+            let pos = rng.randint(0, 3);
+            let (col, row) = match pos {
+                0 => (1, rng.randint(1, height)),
+                1 => (width, rng.randint(1, height)),
+                2 => (rng.randint(1, width), 1),
+                _ => (rng.randint(1, width), height),
+            };
+
+            // Assign a random jumbled starting coordinate from the pool.
+            let idx = rng.randint(0, character_coords.len() as i32 - 1) as usize;
+            let jumbled_coord = character_coords.remove(idx);
+            jumbled_coords.push(jumbled_coord);
             character.motion.current_coord = jumbled_coord;
 
-            // Random point on one of the four canvas edges (explosion target).
-            let pos = rng.gen_range(0, 3);
-            let (col, row) = match pos {
-                0 => (1, rng.gen_range(1, height)),
-                1 => (width, rng.gen_range(1, height)),
-                2 => (rng.gen_range(1, width), 1),
-                _ => (rng.gen_range(1, width), height),
-            };
-            let edge_coord = Coord::new(col, row);
+            // Explosion path to the canvas edge.
+            let explosion_path =
+                character
+                    .motion
+                    .new_path("explosion", explosion_speed, Some(easing::out_expo));
+            explosion_path.new_waypoint("0", Coord::new(col, row));
 
-            // Explosion: jumbled position -> edge of canvas.
-            let path = character
-                .motion
-                .new_path("explosion", EXPLOSION_SPEED, Some(easing::out_expo));
-            path.add_waypoint(jumbled_coord);
-            path.add_waypoint(edge_coord);
+            // Reassembly path back to the original input coordinate.
+            let reassembly_path =
+                character
+                    .motion
+                    .new_path("reassembly", reassembly_speed, Some(easing::out_expo));
+            reassembly_path.new_waypoint("0", input_coord);
 
-            // Reassembly: edge of canvas -> original input position.
-            let path = character
-                .motion
-                .new_path("reassembly", REASSEMBLY_SPEED, Some(easing::out_expo));
-            path.add_waypoint(edge_coord);
-            path.add_waypoint(input_coord);
-
-            // Rumble scene: looping ping-pong flicker through the unstable colors.
-            let scene = character.animation.new_scene("rumble", true);
-            for color in rumble_gradient
-                .spectrum
-                .iter()
-                .chain(rumble_gradient.spectrum.iter().rev())
-            {
-                scene.add_frame(symbol, 2, ColorPair::fg(*color), false);
+            // Rumble scene: fade from the neutral start color to the unstable color.
+            let rumble_gradient = Gradient::new(&[start_color, unstable_color], 12);
+            let rumble_scn = character.animation.new_scene("rumble", false);
+            for color in &rumble_gradient.spectrum {
+                rumble_scn.add_frame(input_symbol, 6, Some(ColorPair::fg_only(*color)));
             }
 
-            // Explosion scene: bright unstable color while flying outward.
-            let scene = character.animation.new_scene("explosion", false);
-            scene.add_frame(symbol, 1, ColorPair::fg(unstable_color), true);
-
-            // Final scene: fade from unstable color to the final gradient color
-            // (vertical gradient across the canvas, matching upstream defaults).
+            // Final scene: fade from unstable color to the per-character final
+            // gradient color (vertical gradient across the canvas).
             let fraction = if height > 1 {
                 (input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
@@ -159,88 +132,71 @@ impl Effect for Unstable {
             };
             let final_color = final_gradient
                 .get_color_at_fraction(fraction)
-                .unwrap_or(unstable_color);
-            let reassembly_gradient = Gradient::new(&[unstable_color, final_color], 10);
-            let scene = character.animation.new_scene("final", false);
-            for color in &reassembly_gradient.spectrum {
-                scene.add_frame(symbol, 3, ColorPair::fg(*color), false);
+                .unwrap_or(start_color);
+            let settle_gradient = Gradient::new(&[unstable_color, final_color], 12);
+            let final_scn = character.animation.new_scene("final", false);
+            for color in &settle_gradient.spectrum {
+                final_scn.add_frame(input_symbol, 5, Some(ColorPair::fg_only(*color)));
             }
 
             character.animation.activate_scene("rumble");
+            character.is_visible = true;
         }
 
-        let mut frames_out: Vec<String> = Vec::new();
-        frames_out.push(terminal.get_formatted_output_string());
+        let mut frames: Vec<String> = Vec::new();
+        frames.push(terminal.render_frame());
 
-        // Phase 1: rumble — jitter around the jumbled coords, intensifying.
-        for tick in 0..RUMBLE_TICKS {
-            let intensity = if tick > RUMBLE_TICKS * 3 / 4 { 2 } else { 1 };
-            let jitter_now = tick % 2 == 0;
-            for (i, character) in terminal.characters.iter_mut().enumerate() {
-                let base = jumbled[i];
-                let (dc, dr) = if jitter_now {
-                    (
-                        rng.gen_range(-intensity, intensity),
-                        rng.gen_range(-intensity, intensity),
-                    )
-                } else {
-                    (0, 0)
-                };
-                let column = (base.column + dc).clamp(1, width);
-                let row = (base.row + dr).clamp(1, height);
-                character.motion.current_coord = Coord::new(column, row);
+        // --- phase 1: rumble (accelerating jitter around the jumbled coords) ---
+        let rumble_ticks: i32 = 100;
+        for tick in 0..rumble_ticks {
+            let period = ((rumble_ticks - tick) / 10 + 1).max(1);
+            if tick % period == 0 {
+                for (i, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+                    let column_offset = rng.choice(&[-1, 0, 1]);
+                    let row_offset = rng.choice(&[-1, 0, 1]);
+                    character.motion.current_coord = Coord::new(
+                        jumbled_coords[i].column + column_offset,
+                        jumbled_coords[i].row + row_offset,
+                    );
+                }
             }
             terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
+            frames.push(terminal.render_frame());
+        }
+        // Snap back onto the jumbled coordinates before exploding.
+        for (i, character) in terminal.get_characters_mut().iter_mut().enumerate() {
+            character.motion.current_coord = jumbled_coords[i];
         }
 
-        // Phase 2: explosion — fling every character to its edge coordinate.
-        for (i, character) in terminal.characters.iter_mut().enumerate() {
-            character.motion.current_coord = jumbled[i];
-            character.animation.activate_scene("explosion");
+        // --- phase 2: explosion (fly to the canvas edges) ---
+        for character in terminal.get_characters_mut() {
             character.motion.activate_path("explosion");
         }
-        let mut guard = 0u32;
-        loop {
+        let mut guard = 0usize;
+        while terminal
+            .get_characters()
+            .iter()
+            .any(|c| !c.motion.movement_is_complete())
+            && guard < 600
+        {
             terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
+            frames.push(terminal.render_frame());
             guard += 1;
-            let movement_done = terminal
-                .characters
-                .iter()
-                .all(|c| c.motion.movement_is_complete());
-            if movement_done || guard > GUARD_LIMIT {
-                break;
-            }
         }
 
-        // Brief pause at the edges before reassembly.
-        for _ in 0..PAUSE_TICKS {
-            terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
-        }
-
-        // Phase 3: reassembly — return to input coords with the final colors.
-        for character in terminal.characters.iter_mut() {
+        // --- phase 3: reassembly (return home, settle into final colors) ---
+        for character in terminal.get_characters_mut() {
             character.animation.activate_scene("final");
             character.motion.activate_path("reassembly");
         }
-        let mut guard = 0u32;
-        loop {
-            let active = terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
-            guard += 1;
-            if active == 0 || guard > GUARD_LIMIT {
-                break;
-            }
-        }
-
-        // Hold the finished text on screen briefly.
-        for _ in 0..FINAL_HOLD_TICKS {
+        let mut guard = 0usize;
+        while terminal.is_active() && guard < 800 {
             terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
+            frames.push(terminal.render_frame());
+            guard += 1;
         }
+        frames.push(terminal.render_frame());
 
-        frames_out
+        frames
     }
 }

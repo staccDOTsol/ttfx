@@ -1,97 +1,76 @@
-//! Blackhole effect: characters are scattered into a starfield, consumed by a
-//! rotating black hole, collapsed into a singularity, and then explode back
-//! to their input coordinates while cooling to a final gradient.
+//! Blackhole effect: a group of characters forms a rotating black hole ring,
+//! the remaining characters become a starfield that is pulled into the
+//! singularity, then the hole collapses and explodes the text back into place.
 //!
 //! Port of terminaltexteffects/effects/effect_blackhole.py, adapted to the
-//! engine available in this crate (no event handlers, layers, or hold times:
-//! the phases are orchestrated directly in `frames`).
-
-use std::f64::consts::PI;
+//! simplified Rust engine (phases are orchestrated directly in `frames`).
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
-use crate::utils::geometry::Coord;
+use crate::utils::geometry::{find_coords_on_circle, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const MAX_FRAMES: usize = 20_000;
-
-/// Minimal deterministic PRNG (splitmix-style LCG) so the effect needs no
-/// external crates. Mirrors the Python effect's use of `random` in spirit.
+/// Small deterministic xorshift64 PRNG (the crate has no rand dependency).
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed | 1)
+        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
     }
 
-    fn next_u32(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
     }
 
-    fn next_f64(&mut self) -> f64 {
-        self.next_u32() as f64 / u32::MAX as f64
+    fn gen_usize(&mut self, bound: usize) -> usize {
+        if bound == 0 {
+            0
+        } else {
+            (self.next_u64() % bound as u64) as usize
+        }
     }
 
-    /// Inclusive integer range, like Python's random.randint.
-    fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
+    /// Inclusive range.
+    fn gen_range_i32(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
-            return lo;
-        }
-        lo + (self.next_u32() % ((hi - lo + 1) as u32)) as i32
-    }
-
-    /// Float range, like Python's random.uniform.
-    fn range_f64(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.next_f64()
-    }
-
-    fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[(self.next_u32() as usize) % items.len()]
-    }
-
-    /// Fisher-Yates, like Python's random.shuffle.
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
-        }
-        for i in (1..items.len()).rev() {
-            let j = (self.next_u32() as usize) % (i + 1);
-            items.swap(i, j);
+            lo
+        } else {
+            lo + (self.next_u64() % ((hi - lo + 1) as u64)) as i32
         }
     }
-}
 
-fn hex(s: &str) -> Color {
-    Color::from_hex(s).expect("valid hex literal")
-}
+    fn gen_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
 
-/// Points on a circle around `center`. Rows are compressed by 0.5 to
-/// approximate the Python engine's double-row-diff so the ring looks round
-/// in a terminal cell grid.
-fn ring_positions(center: Coord, radius: f64, count: usize) -> Vec<Coord> {
-    (0..count)
-        .map(|i| {
-            let theta = 2.0 * PI * i as f64 / count as f64;
-            Coord::new(
-                center.column + (radius * theta.cos()).round() as i32,
-                center.row + (radius * theta.sin() * 0.5).round() as i32,
-            )
-        })
-        .collect()
+    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.gen_f64()
+    }
 }
 
 pub struct Blackhole;
 
 impl Blackhole {
     pub fn new() -> Self {
-        Blackhole
+        Self
     }
 }
+
+impl Default for Blackhole {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const STAR_SYMBOLS: [char; 16] = [
+    '*', '✸', '✺', '✹', '✷', '✵', '✶', '⋆', '.', '⬫', '⬪', '⬩', '⬨', '⬧', '⬦', '⬥',
+];
 
 impl Effect for Blackhole {
     fn name(&self) -> &str {
@@ -100,234 +79,232 @@ impl Effect for Blackhole {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut out: Vec<String> = Vec::new();
+        let mut frames: Vec<String> = Vec::new();
+        let mut rng = Rng::new(0x5EED_B14C_4801_E001);
 
-        let n = terminal.characters.len();
-        if n == 0 {
-            return out;
-        }
-
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
         let center = terminal.canvas.center();
 
-        let mut rng = Rng::new(0x00b1_ac40_13d5_ee0d ^ (input.len() as u64));
+        let n = terminal.get_characters().len();
+        if n == 0 {
+            frames.push(terminal.render_frame());
+            return frames;
+        }
 
-        // ---- palette (defaults from the Python effect config) ----
-        let blackhole_color = hex("ffffff");
-        let star_colors = [
-            hex("ffcc00"),
-            hex("ffff66"),
-            hex("ff9900"),
-            hex("00ccff"),
-            hex("ffffff"),
+        // Colors mirroring the Python defaults.
+        let blackhole_color = Color::from_hex("ffffff").expect("valid hex");
+        let star_colors: Vec<Color> = ["ffcc0d", "ff7326", "ff194d", "bf2669", "702a8c", "049dbf"]
+            .iter()
+            .map(|h| Color::from_hex(h).expect("valid hex"))
+            .collect();
+        let final_stops = [
+            Color::from_hex("8A008A").expect("valid hex"),
+            Color::from_hex("00D1FF").expect("valid hex"),
+            Color::from_hex("ffffff").expect("valid hex"),
         ];
-        let star_symbols = ['*', '.', '+', '·', '✸', '✶'];
-        let flare_colors = [hex("ffcc00"), hex("ffff66"), hex("ffffff"), hex("ffff99")];
-        let final_gradient = Gradient::new(&[hex("8A008A"), hex("00D1FF"), hex("ffffff")], 12);
+        let final_gradient = Gradient::new(&final_stops, 12);
 
-        // ---- choose the black hole characters and ring geometry ----
-        let mut order: Vec<usize> = (0..n).collect();
-        rng.shuffle(&mut order);
-        let bh_count = (n / 10).max(3).min(n);
-        let blackhole: Vec<usize> = order[..bh_count].to_vec();
-        let starfield: Vec<usize> = order[bh_count..].to_vec();
-
-        let radius = ((width.min(height * 2) as f64) / 4.0).max(2.0);
-        let ring = ring_positions(center, radius, bh_count);
-
-        // ---- setup: black hole chars travel to the ring, others twinkle ----
-        for (pos_idx, &i) in blackhole.iter().enumerate() {
-            let ch = &mut terminal.characters[i];
-            let scn = ch.animation.new_scene("blackhole", false);
-            scn.add_frame('*', 1, ColorPair::fg(blackhole_color), false);
-            ch.animation.activate_scene("blackhole");
-            let cur = ch.motion.current_coord;
-            let path = ch.motion.new_path("blackhole", 0.7, Some(easing::in_out_sine));
-            path.add_waypoint(cur);
-            path.add_waypoint(ring[pos_idx]);
-            ch.motion.activate_path("blackhole");
-            ch.is_visible = true;
-        }
-        for &i in &starfield {
-            let ch = &mut terminal.characters[i];
-            ch.motion.current_coord =
-                Coord::new(rng.range_i32(1, width), rng.range_i32(1, height));
-            let symbol = *rng.choice(&star_symbols);
-            let color = *rng.choice(&star_colors);
-            let scn = ch.animation.new_scene("star", false);
-            scn.add_frame(symbol, 1, ColorPair::fg(color), false);
-            ch.animation.activate_scene("star");
-            ch.is_visible = true;
-        }
-
-        // ---- phase: form the black hole ring ----
-        loop {
-            terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if out.len() >= MAX_FRAMES {
-                return out;
-            }
-            let done = blackhole
-                .iter()
-                .all(|&i| terminal.characters[i].motion.movement_is_complete());
-            if done {
-                break;
-            }
-        }
-
-        // ---- phase: rotate the ring while consuming the starfield ----
-        for (pos_idx, &i) in blackhole.iter().enumerate() {
-            let ch = &mut terminal.characters[i];
-            let path = ch.motion.new_path("rotation", 0.45, None);
-            for k in 0..=(bh_count * 2) {
-                path.add_waypoint(ring[(pos_idx + k) % bh_count]);
-            }
-            ch.motion.activate_path("rotation");
-        }
-
-        let mut awaiting: Vec<usize> = starfield.clone();
-        rng.shuffle(&mut awaiting);
-        let mut consuming: Vec<usize> = Vec::new();
-        let group_size = (starfield.len() / 15).max(1);
-        let mut tick_count = 0usize;
-
-        while !awaiting.is_empty() || !consuming.is_empty() {
-            if tick_count % 3 == 0 {
-                for _ in 0..group_size {
-                    let Some(i) = awaiting.pop() else { break };
-                    let ch = &mut terminal.characters[i];
-                    let cur = ch.motion.current_coord;
-                    let speed = rng.range_f64(0.17, 0.30);
-                    let path = ch.motion.new_path("singularity", speed, Some(easing::in_expo));
-                    path.add_waypoint(cur);
-                    path.add_waypoint(center);
-                    ch.motion.activate_path("singularity");
-                    consuming.push(i);
-                }
-            }
-            // keep the ring spinning
-            for &i in &blackhole {
-                if terminal.characters[i].motion.movement_is_complete() {
-                    terminal.characters[i].motion.activate_path("rotation");
-                }
-            }
-
-            terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if out.len() >= MAX_FRAMES {
-                return out;
-            }
-
-            // characters that reached the singularity are consumed
-            let mut still_consuming = Vec::with_capacity(consuming.len());
-            for i in consuming {
-                if terminal.characters[i].motion.movement_is_complete() {
-                    terminal.characters[i].is_visible = false;
+        // Final gradient color per character, mapped vertically by row
+        // (as the Python effect's VERTICAL gradient direction does).
+        let final_colors: Vec<Color> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| {
+                let t = if height > 1 {
+                    (c.input_coord.row - 1) as f64 / (height - 1) as f64
                 } else {
-                    still_consuming.push(i);
+                    0.0
+                };
+                final_gradient
+                    .get_color_at_fraction(t)
+                    .unwrap_or(blackhole_color)
+            })
+            .collect();
+
+        // Choose round(sqrt(n)) characters to form the black hole ring.
+        let mut indices: Vec<usize> = (0..n).collect();
+        for i in (1..indices.len()).rev() {
+            let j = rng.gen_usize(i + 1);
+            indices.swap(i, j);
+        }
+        let bh_count = ((n as f64).sqrt().round() as usize).clamp(1, n);
+        let bh: Vec<usize> = indices[..bh_count].to_vec();
+        let stars: Vec<usize> = indices[bh_count..].to_vec();
+
+        let blackhole_radius = (width.min(height) / 3).max(2);
+        let ring: Vec<Coord> = find_coords_on_circle(center, blackhole_radius, bh_count);
+
+        // ---- Phase 1: forming — black hole characters travel to the ring. ----
+        {
+            let chars = terminal.get_characters_mut();
+            for (k, &i) in bh.iter().enumerate() {
+                let ch = &mut chars[i];
+                ch.is_visible = true;
+                ch.animation
+                    .set_appearance('*', Some(ColorPair::fg_only(blackhole_color)));
+                {
+                    let path = ch.motion.new_path("blackhole", 0.7, Some(easing::in_out_sine));
+                    path.new_waypoint("0", ring[k]);
+                }
+                ch.motion.activate_path("blackhole");
+            }
+        }
+        frames.push(terminal.render_frame());
+        let mut guard = 0usize;
+        while bh
+            .iter()
+            .any(|&i| !terminal.get_characters()[i].motion.movement_is_complete())
+            && guard < 600
+        {
+            terminal.tick();
+            frames.push(terminal.render_frame());
+            guard += 1;
+        }
+
+        // ---- Phase 2: rotation + starfield consumption. ----
+        {
+            let chars = terminal.get_characters_mut();
+            // Rotation waypoints: ring positions rotated to start at each
+            // character's own position (as the Python effect builds them).
+            for (k, &i) in bh.iter().enumerate() {
+                let ch = &mut chars[i];
+                {
+                    let path = ch.motion.new_path("rotation", 0.45, None);
+                    for (w, idx) in (k..bh_count).chain(0..k).enumerate() {
+                        path.new_waypoint(&w.to_string(), ring[idx]);
+                    }
+                }
+                ch.motion.activate_path("rotation");
+            }
+            // Scatter the remaining characters into a starfield and send each
+            // toward the singularity with in_expo easing.
+            for &i in &stars {
+                let starfield_coord = Coord::new(
+                    rng.gen_range_i32(1, width),
+                    rng.gen_range_i32(1, height),
+                );
+                let symbol = STAR_SYMBOLS[rng.gen_usize(STAR_SYMBOLS.len())];
+                let color = star_colors[rng.gen_usize(star_colors.len())];
+                let speed = rng.uniform(0.17, 0.30);
+                let ch = &mut chars[i];
+                ch.motion.current_coord = starfield_coord;
+                ch.animation
+                    .set_appearance(symbol, Some(ColorPair::fg_only(color)));
+                ch.is_visible = true;
+                {
+                    let path = ch.motion.new_path("singularity", speed, Some(easing::in_expo));
+                    path.new_waypoint("0", center);
+                }
+                ch.motion.activate_path("singularity");
+            }
+        }
+        frames.push(terminal.render_frame());
+
+        let mut consumed: Vec<bool> = vec![false; n];
+        guard = 0;
+        while stars.iter().any(|&i| !consumed[i]) && guard < 1200 {
+            terminal.tick();
+            {
+                let chars = terminal.get_characters_mut();
+                for &i in &stars {
+                    if !consumed[i] && chars[i].motion.movement_is_complete() {
+                        consumed[i] = true;
+                        chars[i].is_visible = false; // swallowed by the singularity
+                    }
+                }
+                // Keep the ring rotating: reactivate the loop when it completes.
+                for &i in &bh {
+                    if chars[i].motion.movement_is_complete() {
+                        chars[i].motion.activate_path("rotation");
+                    }
                 }
             }
-            consuming = still_consuming;
-            tick_count += 1;
+            frames.push(terminal.render_frame());
+            guard += 1;
+        }
+        // Force-consume any stragglers so the collapse can proceed.
+        {
+            let chars = terminal.get_characters_mut();
+            for &i in &stars {
+                if !consumed[i] {
+                    chars[i].is_visible = false;
+                }
+            }
         }
 
-        // ---- phase: collapse the ring into a point ----
-        for &i in &blackhole {
-            let ch = &mut terminal.characters[i];
-            let cur = ch.motion.current_coord;
-            let path = ch.motion.new_path("collapse", 0.5, Some(easing::in_expo));
-            path.add_waypoint(cur);
-            path.add_waypoint(center);
-            ch.motion.activate_path("collapse");
+        // ---- Phase 3: collapse — the ring falls into the center point. ----
+        {
+            let chars = terminal.get_characters_mut();
+            for &i in &bh {
+                let ch = &mut chars[i];
+                {
+                    let path = ch.motion.new_path("collapse", 0.4, Some(easing::in_expo));
+                    path.new_waypoint("0", center);
+                }
+                ch.motion.activate_path("collapse");
+            }
         }
-        loop {
+        guard = 0;
+        while bh
+            .iter()
+            .any(|&i| !terminal.get_characters()[i].motion.movement_is_complete())
+            && guard < 400
+        {
             terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if out.len() >= MAX_FRAMES {
-                return out;
-            }
-            let done = blackhole
-                .iter()
-                .all(|&i| terminal.characters[i].motion.movement_is_complete());
-            if done {
-                break;
-            }
+            frames.push(terminal.render_frame());
+            guard += 1;
         }
 
-        // brief singularity flare
-        for &i in &blackhole {
-            let ch = &mut terminal.characters[i];
-            let scn = ch.animation.new_scene("point", false);
-            for color in &flare_colors {
-                scn.add_frame('*', 3, ColorPair::fg(*color), false);
+        // ---- Phase 4: explosion — everything bursts back to the input text. ----
+        {
+            let chars = terminal.get_characters_mut();
+            for i in 0..n {
+                let ch = &mut chars[i];
+                let input_symbol = ch.input_symbol;
+                let input_coord = ch.input_coord;
+                ch.motion.current_coord = center;
+                ch.is_visible = true;
+                // Cooldown scene: white flash fading into the final gradient color.
+                let cooldown = Gradient::new(&[blackhole_color, final_colors[i]], 10);
+                {
+                    let scene = ch.animation.new_scene("cooldown", false);
+                    scene.frames.clear();
+                    scene.add_frame('*', 2, Some(ColorPair::fg_only(blackhole_color)));
+                    for color in &cooldown.spectrum {
+                        scene.add_frame(input_symbol, 3, Some(ColorPair::fg_only(*color)));
+                    }
+                }
+                ch.animation.activate_scene("cooldown");
+                {
+                    let path = ch.motion.new_path("explosion", 0.7, Some(easing::out_expo));
+                    path.new_waypoint("0", input_coord);
+                }
+                ch.motion.activate_path("explosion");
             }
-            ch.animation.activate_scene("point");
         }
-        for _ in 0..12 {
+        frames.push(terminal.render_frame());
+        guard = 0;
+        while terminal.is_active() && guard < 600 {
             terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if out.len() >= MAX_FRAMES {
-                return out;
-            }
+            frames.push(terminal.render_frame());
+            guard += 1;
         }
 
-        // ---- phase: explosion back home, cooling to the final gradient ----
-        let white = hex("ffffff");
-        for i in 0..n {
-            let star_color = *rng.choice(&star_colors);
-            let angle = rng.range_f64(0.0, 2.0 * PI);
-            let burst_radius = radius + rng.range_f64(2.0, 6.0);
-            let speed = rng.range_f64(0.35, 0.7);
-
-            let ch = &mut terminal.characters[i];
-            let input_coord = ch.input_coord;
-            let symbol = ch.input_symbol;
-
-            let fraction = if height > 1 {
-                (input_coord.row - 1) as f64 / (height - 1) as f64
-            } else {
-                1.0
-            };
-            let final_color = final_gradient.get_color_at_fraction(fraction).unwrap_or(white);
-
-            let cooling = Gradient::new(&[white, star_color, final_color], 5);
-            let scn = ch.animation.new_scene("cooling", false);
-            for color in &cooling.spectrum {
-                scn.add_frame(symbol, 3, ColorPair::fg(*color), false);
-            }
-            ch.animation.activate_scene("cooling");
-
-            ch.motion.current_coord = center;
-            let nearby = Coord::new(
-                center.column + (burst_radius * angle.cos()).round() as i32,
-                center.row + (burst_radius * angle.sin() * 0.5).round() as i32,
-            );
-            let path = ch.motion.new_path("home", speed, Some(easing::out_expo));
-            path.add_waypoint(center);
-            path.add_waypoint(nearby);
-            path.add_waypoint(input_coord);
-            ch.motion.activate_path("home");
-            ch.is_visible = true;
-        }
-
-        loop {
-            let active = terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if active == 0 || out.len() >= MAX_FRAMES {
-                break;
+        // Final settle: every character at home with its final gradient color.
+        {
+            let chars = terminal.get_characters_mut();
+            for i in 0..n {
+                let ch = &mut chars[i];
+                let input_symbol = ch.input_symbol;
+                ch.motion.current_coord = ch.input_coord;
+                ch.animation
+                    .set_appearance(input_symbol, Some(ColorPair::fg_only(final_colors[i])));
+                ch.is_visible = true;
             }
         }
+        frames.push(terminal.render_frame());
 
-        // a few settle frames on the fully restored text
-        for _ in 0..3 {
-            terminal.tick();
-            out.push(terminal.get_formatted_output_string());
-            if out.len() >= MAX_FRAMES {
-                break;
-            }
-        }
-
-        out
+        frames
     }
 }

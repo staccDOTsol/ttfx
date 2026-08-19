@@ -1,23 +1,62 @@
-//! Sweep effect: a sweep passes over the canvas revealing the text as dim
-//! block-noise, then a reverse sweep resolves each column into the final
-//! gradient-colored text. Port of terminaltexteffects/effects/effect_sweep.py
-//! adapted to this engine's simplified scene/tick model.
+//! Sweep effect: a dim noise sweep passes over the canvas revealing the
+//! characters as blocky static, then a second sweep passes back across and
+//! resolves each character to its final gradient color.
+//!
+//! Port of terminaltexteffects/effects/effect_sweep.py.
+
+use std::collections::{BTreeMap, VecDeque};
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Symbols cycled while a character is in its unresolved "noise" state.
-const NOISE_SYMBOLS: [char; 4] = ['░', '▒', '▓', '▒'];
+/// Block symbols cycled while a character is unresolved noise.
+const SWEEP_SYMBOLS: [char; 4] = ['█', '▓', '▒', '░'];
 
-/// Ticks to hold between the end of the first sweep and the start of the second.
-const SWEEP_GAP_TICKS: i32 = 10;
+/// Hard cap on emitted frames, mirroring the bounded run loop.
+const MAX_FRAMES: usize = 2000;
+
+/// Fixed PRNG seed so output is reproducible.
+const SWEEP_SEED: u64 = 0x5EED_0000_51EE_D001;
+
+/// Small deterministic PRNG so noise symbol choice is reproducible
+/// without pulling in an external rand crate.
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed | 1)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+
+    fn choice<T: Copy>(&mut self, items: &[T]) -> T {
+        items[(self.next_u32() as usize) % items.len()]
+    }
+}
 
 pub struct Sweep;
 
 impl Sweep {
     pub fn new() -> Self {
         Sweep
+    }
+}
+
+/// Activate a scene on the character with the given id.
+fn activate_scene(terminal: &mut Terminal, id: u32, scene_id: &str) {
+    if let Some(character) = terminal
+        .get_characters_mut()
+        .iter_mut()
+        .find(|c| c.character_id == id)
+    {
+        character.animation.activate_scene(scene_id);
     }
 }
 
@@ -28,94 +67,106 @@ impl Effect for Sweep {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
+        let mut rng = Lcg::new(SWEEP_SEED);
 
-        // Colors (mirroring the upstream defaults).
-        let noise_color = Color::from_hex("474747").unwrap_or(Color::new(0x47, 0x47, 0x47));
-        let white = Color::new(0xFF, 0xFF, 0xFF);
-        let stops = [
-            Color::from_hex("8A008A").unwrap_or(Color::new(0x8A, 0x00, 0x8A)),
-            Color::from_hex("00D1FF").unwrap_or(Color::new(0x00, 0xD1, 0xFF)),
-            white,
+        // Defaults mirroring the Python effect config: dim gray noise for the
+        // first sweep, and the standard purple -> cyan -> white final gradient.
+        let noise_color = Color::from_hex("404040").expect("valid hex");
+        let final_stops = [
+            Color::from_hex("8A008A").expect("valid hex"),
+            Color::from_hex("00D1FF").expect("valid hex"),
+            Color::from_hex("FFFFFF").expect("valid hex"),
         ];
-        let final_gradient = Gradient::new(&stops, 12);
+        let final_gradient = Gradient::new(&final_stops, 12);
 
-        // Build the per-character scenes.
-        for character in terminal.get_characters_mut() {
-            let symbol = character.input_symbol;
-            let row = character.input_coord.row;
-            let fraction = if height > 1 {
-                (row - 1) as f64 / (height - 1) as f64
-            } else {
-                0.0
-            };
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
+
+        // Snapshot character info before taking mutable borrows.
+        let char_info: Vec<(u32, char, i32, i32)> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| (c.character_id, c.input_symbol, c.input_coord.column, c.input_coord.row))
+            .collect();
+
+        // Build per-character scenes: a looping "noise" scene of random sweep
+        // symbols, and a non-looping "sweep" scene fading from the noise color
+        // to the character's final gradient color, ending on the input symbol.
+        for &(id, symbol, column, row) in &char_info {
+            // Diagonal gradient mapping across the canvas.
+            let denom = ((height - 1) + (width - 1)).max(1) as f64;
+            let frac = ((row - 1) + (column - 1)) as f64 / denom;
             let final_color = final_gradient
-                .get_color_at_fraction(fraction)
-                .unwrap_or(white);
+                .get_color_at_fraction(frac)
+                .unwrap_or(final_stops[final_stops.len() - 1]);
 
-            // First sweep: looping dim noise.
+            // Pre-pick the noise symbols for this character.
+            let noise_syms: Vec<char> = (0..4).map(|_| rng.choice(&SWEEP_SYMBOLS)).collect();
+
+            let fade = Gradient::new(&[noise_color, final_color], 3);
+
+            if let Some(character) = terminal
+                .get_characters_mut()
+                .iter_mut()
+                .find(|c| c.character_id == id)
             {
+                // Looping static while waiting for the resolving sweep.
                 let noise_scn = character.animation.new_scene("noise", true);
-                for &noise_symbol in NOISE_SYMBOLS.iter() {
-                    noise_scn.add_frame(noise_symbol, 3, ColorPair::fg(noise_color), false);
+                for &sym in &noise_syms {
+                    noise_scn.add_frame(sym, 2, Some(ColorPair::fg_only(noise_color)));
                 }
-            }
 
-            // Second sweep: flash bright blocks, then fade the input symbol
-            // from white down to its final gradient color.
-            {
-                let resolve_scn = character.animation.new_scene("resolve", false);
-                resolve_scn.add_frame('▓', 2, ColorPair::fg(white), false);
-                resolve_scn.add_frame('▒', 2, ColorPair::fg(white), false);
-                resolve_scn.add_frame('░', 2, ColorPair::fg(white), false);
-                let fade = Gradient::new(&[white, final_color], 8);
-                for color in fade.spectrum.iter() {
-                    resolve_scn.add_frame(symbol, 2, ColorPair::fg(*color), false);
+                // Resolve: descend through the block symbols while the color
+                // brightens toward the final gradient color, then settle on
+                // the input symbol.
+                let sweep_scn = character.animation.new_scene("sweep", false);
+                for (i, &sym) in SWEEP_SYMBOLS.iter().enumerate() {
+                    let color = fade
+                        .spectrum
+                        .get(i.min(fade.spectrum.len().saturating_sub(1)))
+                        .copied()
+                        .unwrap_or(final_color);
+                    sweep_scn.add_frame(sym, 2, Some(ColorPair::fg_only(color)));
                 }
+                sweep_scn.add_frame(symbol, 1, Some(ColorPair::fg_only(final_color)));
             }
         }
 
-        // Sweep schedule:
-        //   ticks [0, width)                       first sweep, left -> right
-        //   ticks [width, second_start)            hold
-        //   ticks [second_start, second_start+width) second sweep, right -> left
-        let second_start = width + SWEEP_GAP_TICKS;
-        let second_end = second_start + width;
-        let max_ticks = second_end + 200;
+        // Group character ids by column for the two sweep passes.
+        let mut columns: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for &(id, _, column, _) in &char_info {
+            columns.entry(column).or_default().push(id);
+        }
+
+        // First sweep travels right-to-left revealing noise; the second sweep
+        // travels back left-to-right resolving characters.
+        let mut first_sweep: VecDeque<Vec<u32>> = columns.values().rev().cloned().collect();
+        let mut second_sweep: VecDeque<Vec<u32>> = columns.values().cloned().collect();
 
         let mut frames: Vec<String> = Vec::new();
-        let mut tick: i32 = 0;
+        frames.push(terminal.render_frame());
 
+        let mut emitted = 0usize;
         loop {
-            if tick < width {
-                // First sweep reveals column `tick + 1`.
-                let column = tick + 1;
-                for character in terminal.get_characters_mut() {
-                    if character.input_coord.column == column {
-                        character.is_visible = true;
-                        character.animation.activate_scene("noise");
-                    }
+            if let Some(group) = first_sweep.pop_front() {
+                for id in group {
+                    terminal.set_character_visibility(id, true);
+                    activate_scene(&mut terminal, id, "noise");
                 }
-            } else if tick >= second_start && tick < second_end {
-                // Second sweep resolves columns right-to-left.
-                let column = width - (tick - second_start);
-                for character in terminal.get_characters_mut() {
-                    if character.input_coord.column == column {
-                        character.is_visible = true;
-                        character.animation.activate_scene("resolve");
-                    }
+            } else if let Some(group) = second_sweep.pop_front() {
+                for id in group {
+                    activate_scene(&mut terminal, id, "sweep");
                 }
             }
 
-            let active = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
+            terminal.tick();
+            frames.push(terminal.render_frame());
+            emitted += 1;
 
-            tick += 1;
-            if tick >= second_end && active == 0 {
+            if emitted >= MAX_FRAMES {
                 break;
             }
-            if tick >= max_ticks {
+            if first_sweep.is_empty() && second_sweep.is_empty() && !terminal.is_active() {
                 break;
             }
         }

@@ -1,42 +1,44 @@
-//! Canvas: a grid of styled cells, row 1 at the bottom (TTE convention).
+//! The Canvas: a grid of styled cells with bottom-left origin (1,1).
 
 use crate::engine::animation::CharacterVisual;
 use crate::utils::geometry::Coord;
 
 /// A rectangular grid of optional styled cells.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct Canvas {
-    pub width: usize,
-    pub height: usize,
+    pub width: i32,
+    pub height: i32,
     cells: Vec<Option<CharacterVisual>>,
 }
 
 impl Canvas {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: i32, height: i32) -> Self {
         let width = width.max(1);
         let height = height.max(1);
-        Canvas {
+        Self {
             width,
             height,
-            cells: vec![None; width * height],
+            cells: vec![None; (width * height) as usize],
         }
     }
 
-    /// True if the coord lies within the canvas (1-based, inclusive).
-    pub fn coord_is_in_canvas(&self, coord: Coord) -> bool {
-        coord.column >= 1
-            && coord.column <= self.width as i32
-            && coord.row >= 1
-            && coord.row <= self.height as i32
-    }
-
-    fn index(&self, coord: Coord) -> usize {
-        (coord.row as usize - 1) * self.width + (coord.column as usize - 1)
-    }
-
-    /// Center coordinate of the canvas.
+    /// Coordinate of the canvas center cell.
     pub fn center(&self) -> Coord {
-        Coord::new((self.width as i32 + 1) / 2, (self.height as i32 + 1) / 2)
+        Coord::new((self.width + 1) / 2, (self.height + 1) / 2)
+    }
+
+    pub fn coord_is_in_canvas(&self, coord: Coord) -> bool {
+        coord.column >= 1 && coord.column <= self.width && coord.row >= 1 && coord.row <= self.height
+    }
+
+    fn index(&self, coord: Coord) -> Option<usize> {
+        if !self.coord_is_in_canvas(coord) {
+            return None;
+        }
+        // Row 1 is the bottom row; store top row first for rendering.
+        let row_from_top = (self.height - coord.row) as usize;
+        let col = (coord.column - 1) as usize;
+        Some(row_from_top * self.width as usize + col)
     }
 
     pub fn clear(&mut self) {
@@ -46,33 +48,29 @@ impl Canvas {
     }
 
     pub fn set_cell(&mut self, coord: Coord, visual: CharacterVisual) {
-        if self.coord_is_in_canvas(coord) {
-            let idx = self.index(coord);
+        if let Some(idx) = self.index(coord) {
             self.cells[idx] = Some(visual);
         }
     }
 
     pub fn get_cell(&self, coord: Coord) -> Option<&CharacterVisual> {
-        if self.coord_is_in_canvas(coord) {
-            self.cells[self.index(coord)].as_ref()
-        } else {
-            None
-        }
+        self.index(coord).and_then(|idx| self.cells[idx].as_ref())
     }
 
-    /// Render the canvas top-to-bottom into a printable frame string.
+    /// Render the canvas to a newline-joined frame string.
     pub fn to_frame_string(&self) -> String {
-        let mut rows: Vec<String> = Vec::with_capacity(self.height);
-        for row in (1..=self.height as i32).rev() {
-            let mut line = String::new();
-            for column in 1..=self.width as i32 {
-                match self.get_cell(Coord::new(column, row)) {
-                    Some(visual) => line.push_str(&visual.formatted()),
-                    None => line.push(' '),
+        let mut out = String::with_capacity((self.width as usize + 1) * self.height as usize);
+        for row in 0..self.height as usize {
+            for col in 0..self.width as usize {
+                match &self.cells[row * self.width as usize + col] {
+                    Some(visual) => out.push_str(&visual.formatted()),
+                    None => out.push(' '),
                 }
             }
-            rows.push(line);
+            if row + 1 < self.height as usize {
+                out.push('\n');
+            }
         }
-        rows.join("\n")
+        out
     }
 }

@@ -1,202 +1,182 @@
-//! Scenes, frames and per-character animation state.
+//! Scenes, frames, and per-character animation state.
 
 use std::collections::HashMap;
 
 use crate::utils::graphics::ColorPair;
 
-/// The symbol, colors and modes a character displays for one frame.
-#[derive(Clone, Debug, PartialEq)]
+/// The styled appearance of a character for a single frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharacterVisual {
     pub symbol: char,
+    pub colors: Option<ColorPair>,
     pub bold: bool,
-    pub colors: ColorPair,
-}
-
-impl Default for CharacterVisual {
-    fn default() -> Self {
-        CharacterVisual {
-            symbol: ' ',
-            bold: false,
-            colors: ColorPair::default(),
-        }
-    }
 }
 
 impl CharacterVisual {
-    pub fn new(symbol: char, bold: bool, colors: ColorPair) -> Self {
-        CharacterVisual {
-            symbol,
-            bold,
-            colors,
-        }
+    pub fn new(symbol: char, colors: Option<ColorPair>) -> Self {
+        Self { symbol, colors, bold: false }
     }
 
-    /// Apply ANSI sequences for the active modes/colors around the symbol.
+    pub fn plain(symbol: char) -> Self {
+        Self::new(symbol, None)
+    }
+
+    /// The symbol with ANSI SGR sequences applied.
     pub fn formatted(&self) -> String {
+        let mut needs_reset = false;
         let mut out = String::new();
-        let mut styled = false;
         if self.bold {
             out.push_str("\x1b[1m");
-            styled = true;
+            needs_reset = true;
         }
-        if let Some(fg) = self.colors.fg {
-            out.push_str(&fg.to_ansi_fg());
-            styled = true;
-        }
-        if let Some(bg) = self.colors.bg {
-            out.push_str(&bg.to_ansi_bg());
-            styled = true;
+        if let Some(colors) = &self.colors {
+            if let Some(fg) = colors.fg {
+                out.push_str(&format!("\x1b[38;2;{};{};{}m", fg.r, fg.g, fg.b));
+                needs_reset = true;
+            }
+            if let Some(bg) = colors.bg {
+                out.push_str(&format!("\x1b[48;2;{};{};{}m", bg.r, bg.g, bg.b));
+                needs_reset = true;
+            }
         }
         out.push(self.symbol);
-        if styled {
+        if needs_reset {
             out.push_str("\x1b[0m");
         }
         out
     }
 }
 
-/// One frame of a scene: a visual held for `duration` ticks.
-#[derive(Clone, Debug)]
+/// A single frame in a scene: a visual shown for `duration` ticks.
+#[derive(Debug, Clone)]
 pub struct Frame {
     pub visual: CharacterVisual,
     pub duration: u32,
     pub ticks_elapsed: u32,
 }
 
-impl Frame {
-    pub fn new(visual: CharacterVisual, duration: u32) -> Self {
-        Frame {
-            visual,
-            duration: duration.max(1),
-            ticks_elapsed: 0,
-        }
-    }
-}
-
-/// A sequence of frames stepped once per engine tick.
-#[derive(Clone, Debug, Default)]
+/// An ordered sequence of frames, optionally looping.
+#[derive(Debug, Clone)]
 pub struct Scene {
     pub scene_id: String,
     pub frames: Vec<Frame>,
-    pub frame_index: usize,
+    pub current_frame_index: usize,
     pub is_looping: bool,
-    pub complete: bool,
 }
 
 impl Scene {
     pub fn new(scene_id: &str, is_looping: bool) -> Self {
-        Scene {
+        Self {
             scene_id: scene_id.to_string(),
             frames: Vec::new(),
-            frame_index: 0,
+            current_frame_index: 0,
             is_looping,
-            complete: false,
         }
     }
 
-    pub fn add_frame(&mut self, symbol: char, duration: u32, colors: ColorPair, bold: bool) {
-        self.frames
-            .push(Frame::new(CharacterVisual::new(symbol, bold, colors), duration));
+    pub fn add_frame(&mut self, symbol: char, duration: u32, colors: Option<ColorPair>) {
+        self.frames.push(Frame {
+            visual: CharacterVisual::new(symbol, colors),
+            duration: duration.max(1),
+            ticks_elapsed: 0,
+        });
     }
 
     pub fn reset(&mut self) {
-        self.frame_index = 0;
-        self.complete = false;
+        self.current_frame_index = 0;
         for frame in &mut self.frames {
             frame.ticks_elapsed = 0;
         }
     }
 
-    /// Advance one tick and return the visual to display.
-    pub fn get_next_visual(&mut self) -> Option<CharacterVisual> {
+    pub fn is_complete(&self) -> bool {
+        !self.is_looping && self.current_frame_index >= self.frames.len()
+    }
+
+    /// Advance the scene one tick and return the visual for this tick.
+    pub fn step(&mut self) -> CharacterVisual {
         if self.frames.is_empty() {
-            self.complete = true;
-            return None;
+            return CharacterVisual::plain(' ');
         }
-        let last = self.frames.len() - 1;
-        if self.complete {
-            return Some(self.frames[last].visual.clone());
+        if self.current_frame_index >= self.frames.len() {
+            return self.frames.last().expect("non-empty frames").visual.clone();
         }
-        let idx = self.frame_index.min(last);
-        let visual = self.frames[idx].visual.clone();
-        let frame = &mut self.frames[idx];
+        let len = self.frames.len();
+        let frame = &mut self.frames[self.current_frame_index];
+        let visual = frame.visual.clone();
         frame.ticks_elapsed += 1;
         if frame.ticks_elapsed >= frame.duration {
             frame.ticks_elapsed = 0;
-            if idx < last {
-                self.frame_index = idx + 1;
-            } else if self.is_looping {
-                self.frame_index = 0;
-            } else {
-                self.complete = true;
+            self.current_frame_index += 1;
+            if self.current_frame_index >= len && self.is_looping {
+                self.current_frame_index = 0;
             }
         }
-        Some(visual)
+        visual
     }
 }
 
-/// Per-character animation: a set of scenes and the currently active one.
-#[derive(Clone, Debug, Default)]
+/// Animation state for a single character: a set of scenes and the current visual.
+#[derive(Debug, Clone)]
 pub struct Animation {
-    scenes: HashMap<String, Scene>,
-    pub active_scene: Option<String>,
+    pub scenes: HashMap<String, Scene>,
+    pub active_scene_id: Option<String>,
     pub current_visual: CharacterVisual,
 }
 
 impl Animation {
-    pub fn new(symbol: char) -> Self {
-        Animation {
+    pub fn new(input_symbol: char) -> Self {
+        Self {
             scenes: HashMap::new(),
-            active_scene: None,
-            current_visual: CharacterVisual::new(symbol, false, ColorPair::default()),
+            active_scene_id: None,
+            current_visual: CharacterVisual::plain(input_symbol),
         }
     }
 
     pub fn new_scene(&mut self, scene_id: &str, is_looping: bool) -> &mut Scene {
         self.scenes
-            .insert(scene_id.to_string(), Scene::new(scene_id, is_looping));
-        self.scenes.get_mut(scene_id).expect("scene just inserted")
+            .entry(scene_id.to_string())
+            .or_insert_with(|| Scene::new(scene_id, is_looping))
     }
 
-    pub fn query_scene(&self, scene_id: &str) -> Option<&Scene> {
-        self.scenes.get(scene_id)
-    }
-
-    pub fn query_scene_mut(&mut self, scene_id: &str) -> Option<&mut Scene> {
+    pub fn query_scene(&mut self, scene_id: &str) -> Option<&mut Scene> {
         self.scenes.get_mut(scene_id)
     }
 
     pub fn activate_scene(&mut self, scene_id: &str) {
         if let Some(scene) = self.scenes.get_mut(scene_id) {
             scene.reset();
-            self.active_scene = Some(scene_id.to_string());
+            self.active_scene_id = Some(scene_id.to_string());
         }
     }
 
     pub fn deactivate_scene(&mut self) {
-        self.active_scene = None;
-    }
-
-    /// Step the active scene one tick, updating the current visual.
-    pub fn step_animation(&mut self) {
-        let Some(scene_id) = self.active_scene.clone() else {
-            return;
-        };
-        if let Some(scene) = self.scenes.get_mut(&scene_id) {
-            if let Some(visual) = scene.get_next_visual() {
-                self.current_visual = visual;
-            }
-        }
+        self.active_scene_id = None;
     }
 
     pub fn active_scene_is_complete(&self) -> bool {
-        match &self.active_scene {
-            Some(scene_id) => self
-                .scenes
-                .get(scene_id)
-                .map(|s| s.complete && !s.is_looping)
-                .unwrap_or(true),
+        match &self.active_scene_id {
+            Some(id) => self.scenes.get(id).map(Scene::is_complete).unwrap_or(true),
             None => true,
+        }
+    }
+
+    /// Directly set the character's appearance (bypassing scenes).
+    pub fn set_appearance(&mut self, symbol: char, colors: Option<ColorPair>) {
+        self.current_visual = CharacterVisual::new(symbol, colors);
+    }
+
+    /// Advance the active scene one tick, updating the current visual.
+    pub fn step_animation(&mut self) {
+        if let Some(id) = self.active_scene_id.clone() {
+            let mut finished = false;
+            if let Some(scene) = self.scenes.get_mut(&id) {
+                self.current_visual = scene.step();
+                finished = scene.is_complete();
+            }
+            if finished {
+                self.active_scene_id = None;
+            }
         }
     }
 }

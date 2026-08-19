@@ -1,89 +1,82 @@
 //! Bubbles effect: characters are grouped into bubbles that float down the
-//! canvas, pop when they reach the floor, and then fly to their input coords.
+//! canvas and pop when they reach the bottom, scattering the characters
+//! before they settle (colored by the final gradient) at their input coords.
 //!
-//! Port of terminaltexteffects/effects/effect_bubbles.py adapted to the
-//! simplified engine: bubble anchors are driven by standalone `Path`s and the
-//! member characters are positioned on a circle around the anchor each frame.
-
-use std::f64::consts::PI;
+//! Port of terminaltexteffects/effects/effect_bubbles.py.
 
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::motion::Path;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
-use crate::utils::geometry::Coord;
+use crate::utils::geometry::{find_coords_on_circle, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const BUBBLE_SPEED: f64 = 0.1;
+const BUBBLE_COLORS: [&str; 4] = ["d33aff", "7395c4", "43c2a7", "02ff7f"];
+const POP_COLOR: &str = "ffffff";
+const FINAL_GRADIENT_STOPS: [&str; 3] = ["d33aff", "02ff7f", "ffffff"];
+const BUBBLE_SPEED: f64 = 0.25;
+const BUBBLE_DELAY: usize = 15;
 const POP_OUT_SPEED: f64 = 0.3;
-const MOVEMENT_SPEED: f64 = 0.3;
-const LAUNCH_INTERVAL: usize = 12;
-const MAX_FRAMES: usize = 5000;
+const MOVEMENT_SPEED: f64 = 0.25;
+const MAX_FRAMES: usize = 2000;
 
-/// Minimal deterministic PRNG (xorshift64) so the effect needs no external crates.
+/// Tiny deterministic xorshift PRNG (no external rand dependency).
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed | 1)
+        Self(if seed == 0 { 0x9e3779b97f4a7c15 } else { seed })
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn next_u32(&mut self) -> u32 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.0 = x;
-        x
+        (x >> 32) as u32
     }
 
-    /// Inclusive range.
-    fn gen_range(&mut self, lo: i32, hi: i32) -> i32 {
+    /// Inclusive range [lo, hi].
+    fn range(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;
         }
-        let span = (hi - lo + 1) as u64;
-        lo + (self.next_u64() % span) as i32
-    }
-
-    fn shuffle<T>(&mut self, v: &mut [T]) {
-        if v.len() < 2 {
-            return;
-        }
-        for i in (1..v.len()).rev() {
-            let j = (self.next_u64() % (i as u64 + 1)) as usize;
-            v.swap(i, j);
-        }
+        lo + (self.next_u32() % ((hi - lo + 1) as u32)) as i32
     }
 }
 
-/// One bubble: an anchor path plus the character indices riding on its rim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharState {
+    InBubble,
+    PopOut,
+    Final,
+    Done,
+}
+
+/// One bubble: a set of member characters arranged on a circle around an
+/// invisible anchor point that floats down to the bubble's landing row.
 struct Bubble {
-    members: Vec<usize>,
-    path: Path,
-    anchor: Coord,
+    member_indices: Vec<usize>,
+    anchor_path: Path,
+    anchor_coord: Coord,
     radius: i32,
-    color: Color,
-    popped: bool,
+    activation_tick: usize,
+    active: bool,
+    landed: bool,
 }
-
-/// Character lifecycle stages after the bubble pops.
-const STAGE_FLOATING: u8 = 0;
-const STAGE_POPPING: u8 = 1;
-const STAGE_FINAL: u8 = 2;
 
 pub struct Bubbles;
 
 impl Bubbles {
     pub fn new() -> Self {
-        Bubbles
+        Self
     }
 }
 
 impl Default for Bubbles {
     fn default() -> Self {
-        Bubbles::new()
+        Self::new()
     }
 }
 
@@ -94,186 +87,209 @@ impl Effect for Bubbles {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
-        let char_count = terminal.characters.len();
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
 
-        if char_count == 0 {
-            return vec![terminal.get_formatted_output_string()];
+        if terminal.get_characters().is_empty() {
+            return vec![terminal.render_frame()];
         }
 
-        let seed = input
-            .bytes()
-            .fold(0x9E37_79B9_7F4A_7C15u64, |acc, b| {
-                acc.wrapping_mul(31).wrapping_add(b as u64)
-            });
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::new(0x5eed_b0bb_1e50_0001);
 
-        // Colors matching the Python defaults.
-        let bubble_colors: Vec<Color> = ["d33aff", "7395c4", "43c2a7", "02ff7f"]
+        let pop_color = Color::from_hex(POP_COLOR).expect("valid pop color");
+        let bubble_palette: Vec<Color> = BUBBLE_COLORS
             .iter()
-            .filter_map(|h| Color::from_hex(h))
+            .map(|h| Color::from_hex(h).expect("valid bubble color"))
             .collect();
-        let pop_color = Color::from_hex("ffffff").unwrap_or(Color::new(255, 255, 255));
-        let grad_start = Color::from_hex("d33aff").unwrap_or(Color::new(211, 58, 255));
-        let grad_end = Color::from_hex("02ff7f").unwrap_or(Color::new(2, 255, 127));
-        let final_gradient = Gradient::new(&[grad_start, grad_end], 24);
-
-        // Diagonal final-gradient color per character.
-        let denom = (((width - 1) + (height - 1)).max(1)) as f64;
-        let final_colors: Vec<Color> = terminal
-            .get_characters()
+        let gradient_stops: Vec<Color> = FINAL_GRADIENT_STOPS
             .iter()
-            .map(|ch| {
-                let frac =
-                    ((ch.input_coord.column - 1) + (ch.input_coord.row - 1)) as f64 / denom;
-                final_gradient.get_color_at_fraction(frac).unwrap_or(grad_end)
-            })
+            .map(|h| Color::from_hex(h).expect("valid gradient stop"))
             .collect();
+        let final_gradient = Gradient::new(&gradient_stops, 12);
 
-        // Group shuffled characters into bubbles.
-        let radius = (width.min(height) / 6).max(1);
-        let group_size = ((2.0 * PI * radius as f64).round() as usize).max(1);
+        // --- per-character setup: pop scene, final scene, final path ---
+        {
+            let chars = terminal.get_characters_mut();
+            for ch in chars.iter_mut() {
+                let sym = ch.input_symbol;
+                let t = if height > 1 {
+                    (ch.input_coord.row - 1) as f64 / (height - 1) as f64
+                } else {
+                    0.0
+                };
+                let final_color = final_gradient
+                    .get_color_at_fraction(t)
+                    .unwrap_or(Color::new(255, 255, 255));
 
+                let pop_scn = ch.animation.new_scene("pop", false);
+                pop_scn.add_frame('*', 5, Some(ColorPair::fg_only(pop_color)));
+                pop_scn.add_frame('\'', 5, Some(ColorPair::fg_only(pop_color)));
+                pop_scn.add_frame('.', 5, Some(ColorPair::fg_only(pop_color)));
+
+                let final_scn = ch.animation.new_scene("final", false);
+                final_scn.add_frame(sym, 1, Some(ColorPair::fg_only(final_color)));
+
+                let final_path =
+                    ch.motion
+                        .new_path("final", MOVEMENT_SPEED, Some(easing::in_out_sine));
+                final_path.new_waypoint("input_coord", ch.input_coord);
+            }
+        }
+
+        // --- group characters into bubbles (rows top to bottom, left to right) ---
+        let char_count = terminal.get_characters().len();
         let mut order: Vec<usize> = (0..char_count).collect();
-        rng.shuffle(&mut order);
+        {
+            let chars = terminal.get_characters();
+            order.sort_by_key(|&i| (-(chars[i].input_coord.row), chars[i].input_coord.column));
+        }
 
         let mut bubbles: Vec<Bubble> = Vec::new();
-        for chunk in order.chunks(group_size) {
-            let start = Coord::new(rng.gen_range(1, width), height + radius);
-            let floor = Coord::new(rng.gen_range(1, width), (1 + radius).min(height));
-            let mut path = Path::new("float", BUBBLE_SPEED, None);
-            path.add_waypoint(start);
-            path.add_waypoint(floor);
-            let color = if bubble_colors.is_empty() {
-                pop_color
+        let mut idx = 0usize;
+        while idx < order.len() {
+            let remaining = order.len() - idx;
+            let size = if remaining < 5 {
+                remaining
             } else {
-                bubble_colors[(rng.next_u64() as usize) % bubble_colors.len()]
+                rng.range(5, remaining.min(15) as i32) as usize
             };
+            let members: Vec<usize> = order[idx..idx + size].to_vec();
+            idx += size;
+
+            let radius = ((members.len() as i32 + 4) / 5)
+                .max(1)
+                .min((width.min(height) / 2).max(1));
+            let col_lo = (1 + radius).min(width);
+            let col_hi = (width - radius).max(col_lo);
+            let origin = Coord::new(rng.range(col_lo, col_hi), (height - radius).max(1));
+            let floor_coord = Coord::new(rng.range(col_lo, col_hi), (radius + 1).min(height));
+
+            let mut anchor_path = Path::new("floor", BUBBLE_SPEED, None);
+            anchor_path.new_waypoint("floor", floor_coord);
+            anchor_path.activate(origin);
+
+            // sheen scene: bubble color while floating
+            let bubble_color = bubble_palette[(rng.next_u32() as usize) % bubble_palette.len()];
+            {
+                let chars = terminal.get_characters_mut();
+                for &mi in &members {
+                    let ch = &mut chars[mi];
+                    let sym = ch.input_symbol;
+                    let sheen = ch.animation.new_scene("sheen", true);
+                    sheen.add_frame(sym, 1, Some(ColorPair::fg_only(bubble_color)));
+                }
+            }
+
+            let activation_tick = bubbles.len() * BUBBLE_DELAY;
             bubbles.push(Bubble {
-                members: chunk.to_vec(),
-                path,
-                anchor: start,
+                member_indices: members,
+                anchor_path,
+                anchor_coord: origin,
                 radius,
-                color,
-                popped: false,
+                activation_tick,
+                active: false,
+                landed: false,
             });
         }
 
-        let mut stage: Vec<u8> = vec![STAGE_FLOATING; char_count];
-        let mut frames_out: Vec<String> = Vec::new();
-        let mut launched_count = 0usize;
-        let mut frame_idx = 0usize;
+        // --- frame loop ---
+        let mut states = vec![CharState::InBubble; char_count];
+        let mut frames: Vec<String> = Vec::new();
+        frames.push(terminal.render_frame());
+        let mut tick_count: usize = 0;
 
         loop {
-            // Launch bubbles on a fixed cadence.
-            while launched_count < bubbles.len()
-                && frame_idx >= launched_count * LAUNCH_INTERVAL
-            {
-                for &id in &bubbles[launched_count].members {
-                    terminal.characters[id].is_visible = true;
+            // activate bubbles once their delay has elapsed
+            for bubble in bubbles.iter_mut() {
+                if !bubble.active && tick_count >= bubble.activation_tick {
+                    bubble.active = true;
+                    let chars = terminal.get_characters_mut();
+                    let coords = find_coords_on_circle(
+                        bubble.anchor_coord,
+                        bubble.radius,
+                        bubble.member_indices.len(),
+                    );
+                    for (k, &mi) in bubble.member_indices.iter().enumerate() {
+                        chars[mi].is_visible = true;
+                        chars[mi].animation.activate_scene("sheen");
+                        chars[mi].motion.current_coord = coords[k];
+                    }
                 }
-                launched_count += 1;
             }
 
-            // Advance floating bubbles and position their members.
-            for bubble in bubbles.iter_mut().take(launched_count) {
-                if bubble.popped {
+            // move anchors and keep members on the bubble circle; pop on landing
+            for bubble in bubbles.iter_mut() {
+                if !bubble.active || bubble.landed {
                     continue;
                 }
-                if let Some(coord) = bubble.path.step() {
-                    bubble.anchor = coord;
+                bubble.anchor_coord = bubble.anchor_path.step();
+                let coords = find_coords_on_circle(
+                    bubble.anchor_coord,
+                    bubble.radius,
+                    bubble.member_indices.len(),
+                );
+                {
+                    let chars = terminal.get_characters_mut();
+                    for (k, &mi) in bubble.member_indices.iter().enumerate() {
+                        chars[mi].motion.current_coord = coords[k];
+                    }
                 }
-                let n = bubble.members.len().max(1);
-                for (k, &id) in bubble.members.iter().enumerate() {
-                    let angle = 2.0 * PI * (k as f64) / (n as f64);
-                    let dc = (bubble.radius as f64 * angle.cos()).round() as i32;
-                    let dr = (bubble.radius as f64 * angle.sin()).round() as i32;
-                    let ch = &mut terminal.characters[id];
-                    ch.motion.current_coord =
-                        Coord::new(bubble.anchor.column + dc, bubble.anchor.row + dr);
-                    ch.animation.current_visual = CharacterVisual::new(
-                        ch.input_symbol,
-                        false,
-                        ColorPair::fg(bubble.color),
+                if bubble.anchor_path.is_complete() {
+                    bubble.landed = true;
+                    // pop: scatter members outward, then send them home
+                    let pop_coords = find_coords_on_circle(
+                        bubble.anchor_coord,
+                        bubble.radius + 3,
+                        bubble.member_indices.len(),
                     );
-                }
-
-                // Pop the bubble when it reaches the floor.
-                if bubble.path.is_complete() {
-                    bubble.popped = true;
-                    let pop_radius = (bubble.radius + 3) as f64;
-                    for (k, &id) in bubble.members.iter().enumerate() {
-                        let angle = 2.0 * PI * (k as f64) / (n as f64);
-                        let pop_coord = Coord::new(
-                            bubble.anchor.column + (pop_radius * angle.cos()).round() as i32,
-                            bubble.anchor.row + (pop_radius * angle.sin()).round() as i32,
-                        );
-                        let final_color = final_colors[id];
-                        let ch = &mut terminal.characters[id];
-                        let start_coord = ch.motion.current_coord;
-                        let input_coord = ch.input_coord;
-                        let input_symbol = ch.input_symbol;
-
-                        let pop_path =
-                            ch.motion.new_path("pop_out", POP_OUT_SPEED, Some(easing::out_expo));
-                        pop_path.add_waypoint(start_coord);
-                        pop_path.add_waypoint(pop_coord);
-
-                        let final_path = ch.motion.new_path(
-                            "final",
-                            MOVEMENT_SPEED,
-                            Some(easing::in_out_sine),
-                        );
-                        final_path.add_waypoint(pop_coord);
-                        final_path.add_waypoint(input_coord);
-
+                    let chars = terminal.get_characters_mut();
+                    for (k, &mi) in bubble.member_indices.iter().enumerate() {
+                        let ch = &mut chars[mi];
+                        let pop_out =
+                            ch.motion
+                                .new_path("pop_out", POP_OUT_SPEED, Some(easing::out_expo));
+                        pop_out.new_waypoint("pop_out", pop_coords[k]);
                         ch.motion.activate_path("pop_out");
-
-                        let scn = ch.animation.new_scene("pop", false);
-                        scn.add_frame('*', 3, ColorPair::fg(pop_color), false);
-                        scn.add_frame('\'', 3, ColorPair::fg(pop_color), false);
-                        scn.add_frame(input_symbol, 1, ColorPair::fg(final_color), false);
                         ch.animation.activate_scene("pop");
-
-                        stage[id] = STAGE_POPPING;
+                        states[mi] = CharState::PopOut;
                     }
                 }
             }
 
-            // Tick popped characters through pop-out and homing motion.
-            for id in 0..char_count {
-                match stage[id] {
-                    STAGE_POPPING => {
-                        let ch = &mut terminal.characters[id];
-                        ch.tick();
-                        if ch.motion.movement_is_complete() {
-                            ch.motion.activate_path("final");
-                            stage[id] = STAGE_FINAL;
+            // advance all characters one tick
+            terminal.tick();
+
+            // state transitions after movement
+            {
+                let chars = terminal.get_characters_mut();
+                for i in 0..chars.len() {
+                    match states[i] {
+                        CharState::PopOut => {
+                            if chars[i].motion.movement_is_complete() {
+                                chars[i].motion.activate_path("final");
+                                chars[i].animation.activate_scene("final");
+                                states[i] = CharState::Final;
+                            }
                         }
+                        CharState::Final => {
+                            if chars[i].motion.movement_is_complete() {
+                                states[i] = CharState::Done;
+                            }
+                        }
+                        _ => {}
                     }
-                    STAGE_FINAL => {
-                        terminal.characters[id].tick();
-                    }
-                    _ => {}
                 }
             }
 
-            frames_out.push(terminal.get_formatted_output_string());
-            frame_idx += 1;
+            frames.push(terminal.render_frame());
+            tick_count += 1;
 
-            let all_done = launched_count == bubbles.len()
-                && bubbles.iter().all(|b| b.popped)
-                && (0..char_count).all(|id| {
-                    stage[id] == STAGE_FINAL
-                        && terminal.characters[id].motion.movement_is_complete()
-                        && terminal.characters[id].animation.active_scene_is_complete()
-                });
-            if all_done || frames_out.len() >= MAX_FRAMES {
+            let all_done = states.iter().all(|s| *s == CharState::Done);
+            if all_done || tick_count >= MAX_FRAMES {
                 break;
             }
         }
 
-        frames_out
+        frames
     }
 }

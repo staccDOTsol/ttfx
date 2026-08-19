@@ -1,96 +1,93 @@
-//! Swarm effect: characters spawn off-canvas in swarms, drift between random
-//! "swarm areas" while flashing, then settle onto their input coordinates.
-//!
-//! Port of terminaltexteffects/effects/effect_swarm.py, adapted to the
-//! simplified engine in this crate (no event handlers: path chaining and
-//! scene activation are driven from the frame loop).
+//! Swarm: characters are grouped into swarms that chaotically move between
+//! random focus areas on the canvas before settling into their input
+//! coordinates. Port of terminaltexteffects/effects/effect_swarm.py, adapted
+//! to this engine (path chaining and flash scenes are driven from the effect
+//! loop instead of event handlers).
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
-use crate::utils::geometry::{find_length_of_line, Coord};
+use crate::utils::geometry::{find_coords_on_circle, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
 const BASE_COLOR: &str = "31a0d4";
 const FLASH_COLOR: &str = "f2ea79";
 const FINAL_GRADIENT_STOPS: [&str; 3] = ["8A008A", "00D1FF", "FFFFFF"];
-const SWARM_SIZE_FRACTION: f64 = 0.1;
-const MAX_FRAMES: usize = 10_000;
+const FINAL_GRADIENT_STEPS: usize = 12;
+const SWARM_SIZE: f64 = 0.1;
+const SWARM_AREA_COUNT_MIN: i32 = 2;
+const SWARM_AREA_COUNT_MAX: i32 = 4;
+const WAYPOINTS_PER_AREA: usize = 3;
+const SWARM_START_STAGGER: usize = 25;
+const MAX_TICKS: usize = 4000;
 
-/// Minimal deterministic xorshift64 PRNG (the crate has no rand dependency).
+/// Small deterministic PRNG (splitmix64-flavored) so runs are reproducible
+/// for a given input. The crate has no rng module, so it lives here.
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(if seed == 0 { 0x5EED_5EED_5EED_5EED } else { seed })
+        Self(seed | 1)
     }
 
-    fn next(&mut self) -> u64 {
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
+        x = (x ^ (x >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+        ((x ^ (x >> 33)) >> 32) as u32
     }
 
-    /// Uniform float in [lo, hi).
-    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * ((self.next() >> 11) as f64 / (1u64 << 53) as f64)
-    }
-
-    /// Uniform integer in [lo, hi] (inclusive).
-    fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
+    /// Inclusive range [lo, hi].
+    fn gen_range(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;
         }
-        lo + (self.next() % ((hi - lo + 1) as u64)) as i32
+        let span = (hi - lo + 1) as u32;
+        lo + (self.next_u32() % span) as i32
     }
 
-    fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[(self.next() % items.len() as u64) as usize]
+    fn gen_f64(&mut self) -> f64 {
+        self.next_u32() as f64 / u32::MAX as f64
     }
-}
 
-/// All grid coords within `radius` of `center` (may extend past the canvas;
-/// the renderer skips out-of-canvas coords).
-fn coords_in_circle(center: Coord, radius: i32) -> Vec<Coord> {
-    let mut out = Vec::new();
-    for column in (center.column - radius)..=(center.column + radius) {
-        for row in (center.row - radius)..=(center.row + radius) {
-            let coord = Coord::new(column, row);
-            if find_length_of_line(center, coord) <= radius as f64 {
-                out.push(coord);
-            }
+    fn shuffle<T>(&mut self, v: &mut [T]) {
+        if v.len() < 2 {
+            return;
+        }
+        for i in (1..v.len()).rev() {
+            let j = self.gen_range(0, i as i32) as usize;
+            v.swap(i, j);
         }
     }
-    if out.is_empty() {
-        out.push(center);
-    }
-    out
 }
 
-/// A random coordinate just outside the canvas (swarm spawn point).
-fn random_outside_coord(rng: &mut Rng, width: i32, height: i32) -> Coord {
-    match rng.range_i32(0, 3) {
-        0 => Coord::new(-3, rng.range_i32(1, height)),
-        1 => Coord::new(width + 3, rng.range_i32(1, height)),
-        2 => Coord::new(rng.range_i32(1, width), -3),
-        _ => Coord::new(rng.range_i32(1, width), height + 3),
-    }
+/// Per-character schedule: which paths to run, in order, and when to start.
+#[derive(Clone)]
+struct Plan {
+    start_tick: usize,
+    stages: Vec<String>,
+    next_stage: usize,
+    started: bool,
+}
+
+fn clamp_to_canvas(coord: Coord, width: i32, height: i32) -> Coord {
+    Coord::new(coord.column.clamp(1, width), coord.row.clamp(1, height))
 }
 
 pub struct Swarm;
 
 impl Swarm {
     pub fn new() -> Self {
-        Swarm
+        Self
     }
 }
 
 impl Default for Swarm {
     fn default() -> Self {
-        Swarm::new()
+        Self::new()
     }
 }
 
@@ -101,223 +98,182 @@ impl Effect for Swarm {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let n = terminal.characters.len();
-        if n == 0 {
-            return vec![terminal.get_formatted_output_string()];
-        }
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
 
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
-        let mut rng = Rng::new(
-            0x5EED ^ (input.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        );
+        let seed = input
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |acc, b| (acc ^ b as u64).wrapping_mul(0x100000001b3));
+        let mut rng = Rng::new(seed);
 
-        // --- final gradient: horizontal mapping across the canvas ---
+        let base_color = Color::from_hex(BASE_COLOR).expect("valid base color");
+        let flash_color = Color::from_hex(FLASH_COLOR).expect("valid flash color");
         let final_stops: Vec<Color> = FINAL_GRADIENT_STOPS
             .iter()
-            .map(|h| Color::from_hex(h).expect("valid hex"))
+            .map(|hex| Color::from_hex(hex).expect("valid gradient stop"))
             .collect();
-        let final_gradient = Gradient::new(&final_stops, 12);
-        let final_colors: Vec<Color> = terminal
-            .characters
-            .iter()
-            .map(|c| {
-                let fraction = if width > 1 {
-                    (c.input_coord.column - 1) as f64 / (width - 1) as f64
-                } else {
-                    0.0
+        let final_gradient = Gradient::new(&final_stops, FINAL_GRADIENT_STEPS);
+        let swarm_gradient = Gradient::new(&[base_color, flash_color], 7);
+
+        let n = terminal.get_characters().len();
+        if n == 0 {
+            return vec![terminal.render_frame()];
+        }
+
+        let mut plans: Vec<Plan> = vec![
+            Plan {
+                start_tick: 0,
+                stages: Vec::new(),
+                next_stage: 0,
+                started: false,
+            };
+            n
+        ];
+
+        // Group shuffled characters into swarms.
+        let mut indices: Vec<usize> = (0..n).collect();
+        rng.shuffle(&mut indices);
+        let swarm_char_count = ((n as f64 * SWARM_SIZE).round() as usize).max(1);
+        let max_radius = (width.min(height) / 4).max(2);
+
+        {
+            let characters = terminal.get_characters_mut();
+            for (swarm_index, swarm) in indices.chunks(swarm_char_count).enumerate() {
+                // Swarm spawns just outside the canvas.
+                let spawn = match rng.gen_range(0, 3) {
+                    0 => Coord::new(-3, rng.gen_range(1, height)),
+                    1 => Coord::new(width + 3, rng.gen_range(1, height)),
+                    2 => Coord::new(rng.gen_range(1, width), height + 3),
+                    _ => Coord::new(rng.gen_range(1, width), -3),
                 };
-                final_gradient
-                    .get_color_at_fraction(fraction)
-                    .expect("non-empty gradient")
-            })
-            .collect();
 
-        let base_color = Color::from_hex(BASE_COLOR).expect("valid hex");
-        let flash_color = Color::from_hex(FLASH_COLOR).expect("valid hex");
-
-        // --- group characters into swarms (last swarm activates first,
-        //     matching the Python `self.swarms.pop()` order) ---
-        let swarm_size = ((n as f64 * SWARM_SIZE_FRACTION).round() as usize).max(1);
-        let indices: Vec<usize> = (0..n).collect();
-        let mut swarm_groups: Vec<Vec<usize>> =
-            indices.chunks(swarm_size).map(|c| c.to_vec()).collect();
-        swarm_groups.reverse();
-
-        // Per-character queue of path ids to traverse in order.
-        let mut plans: Vec<Vec<String>> = vec![Vec::new(); n];
-
-        for group in &swarm_groups {
-            // Mirrored base->flash gradient for this swarm's flash scene.
-            let swarm_gradient = Gradient::new(&[base_color, flash_color], 7);
-            let mut mirror: Vec<Color> = swarm_gradient.spectrum.clone();
-            let mut back: Vec<Color> = swarm_gradient.spectrum.clone();
-            back.reverse();
-            mirror.extend(back);
-
-            let spawn = random_outside_coord(&mut rng, width, height);
-
-            // Random swarm areas within the inner 10%..90% of the canvas.
-            let area_count = rng.range_i32(2, 4) as usize;
-            let col_lo = ((width as f64 * 0.1).round() as i32).max(1);
-            let col_hi = ((width as f64 * 0.9).round() as i32).max(col_lo);
-            let row_lo = ((height as f64 * 0.1).round() as i32).max(1);
-            let row_hi = ((height as f64 * 0.9).round() as i32).max(row_lo);
-            let mut areas: Vec<Coord> = Vec::new();
-            for _ in 0..100 {
-                if areas.len() >= area_count {
-                    break;
-                }
-                let coord = Coord::new(
-                    rng.range_i32(col_lo, col_hi),
-                    rng.range_i32(row_lo, row_hi),
-                );
-                if !areas.contains(&coord) {
-                    areas.push(coord);
-                }
-            }
-            if areas.is_empty() {
-                areas.push(terminal.canvas.center());
-            }
-
-            let radius = ((width.min(height)) as f64 * 0.25).round().max(2.0) as i32;
-            let area_coords: Vec<Vec<Coord>> =
-                areas.iter().map(|a| coords_in_circle(*a, radius)).collect();
-
-            for &ci in group {
-                // Pick per-character targets inside each swarm area first so the
-                // rng borrow does not overlap the character borrow.
-                let targets: Vec<Coord> = area_coords
-                    .iter()
-                    .map(|coords| *rng.choice(coords))
-                    .collect();
-                let area_speeds: Vec<f64> = targets
-                    .iter()
-                    .map(|_| rng.uniform(0.5, 0.9))
+                // Random focus areas the swarm visits before dispersing.
+                let area_count = rng.gen_range(SWARM_AREA_COUNT_MIN, SWARM_AREA_COUNT_MAX);
+                let area_origins: Vec<Coord> = (0..area_count)
+                    .map(|_| Coord::new(rng.gen_range(1, width), rng.gen_range(1, height)))
                     .collect();
 
-                let character = &mut terminal.characters[ci];
-                let symbol = character.input_symbol;
-                let input_coord = character.input_coord;
-                character.motion.current_coord = spawn;
+                for &char_index in swarm {
+                    let character = &mut characters[char_index];
+                    let symbol = character.input_symbol;
+                    let input_coord = character.input_coord;
+                    character.motion.current_coord = spawn;
 
-                // "flash" scene: base -> flash -> base; holds base when complete.
-                {
-                    let scene = character.animation.new_scene("flash", false);
-                    for color in &mirror {
-                        scene.add_frame(symbol, 2, ColorPair::fg(*color), false);
-                    }
-                }
-                // "final" scene: one last flash ending on the final gradient color.
-                {
-                    let scene = character.animation.new_scene("final", false);
-                    for color in &mirror {
-                        scene.add_frame(symbol, 2, ColorPair::fg(*color), false);
-                    }
-                    scene.add_frame(symbol, 1, ColorPair::fg(final_colors[ci]), false);
-                }
+                    let mut stages: Vec<String> = Vec::new();
 
-                // Chain paths: spawn -> area 0 -> area 1 -> ... -> input coord.
-                // Each path starts where the previous one ends because this
-                // engine has no automatic origin segment.
-                let mut prev = spawn;
-                let mut ids: Vec<String> = Vec::new();
-                for (i, target) in targets.iter().enumerate() {
-                    let id = i.to_string();
-                    let path = character.motion.new_path(
-                        &id,
-                        area_speeds[i],
-                        Some(easing::out_sine),
-                    );
-                    path.add_waypoint(prev);
-                    path.add_waypoint(*target);
-                    prev = *target;
-                    ids.push(id);
-                }
-                let input_path =
-                    character
+                    // One path per swarm area, wandering around its origin.
+                    for (area_index, origin) in area_origins.iter().enumerate() {
+                        let path_id = area_index.to_string();
+                        let speed = 0.3 + rng.gen_f64() * 0.4;
+                        let radius_picks: Vec<Coord> = (0..WAYPOINTS_PER_AREA)
+                            .map(|_| {
+                                let radius = rng.gen_range(1, max_radius);
+                                let ring = find_coords_on_circle(*origin, radius, 16);
+                                let pick = ring[rng.gen_range(0, ring.len() as i32 - 1) as usize];
+                                clamp_to_canvas(pick, width, height)
+                            })
+                            .collect();
+                        let path = character
+                            .motion
+                            .new_path(&path_id, speed, Some(easing::out_sine));
+                        for (k, coord) in radius_picks.iter().enumerate() {
+                            path.new_waypoint(&k.to_string(), *coord);
+                        }
+                        stages.push(path_id);
+                    }
+
+                    // Final path home to the input coordinate.
+                    let input_speed = 0.3 + rng.gen_f64() * 0.15;
+                    let input_path = character
                         .motion
-                        .new_path("input_path", 0.6, Some(easing::in_out_quad));
-                input_path.add_waypoint(prev);
-                input_path.add_waypoint(input_coord);
-                ids.push("input_path".to_string());
+                        .new_path("input", input_speed, Some(easing::in_out_quad));
+                    input_path.new_waypoint("input", input_coord);
+                    stages.push("input".to_string());
 
-                plans[ci] = ids;
+                    // Looping swarm scene: base color pulsing toward the flash color.
+                    let swarm_scene = character.animation.new_scene("swarm", true);
+                    for color in swarm_gradient.spectrum.iter() {
+                        swarm_scene.add_frame(symbol, 2, Some(ColorPair::fg_only(*color)));
+                    }
+                    for color in swarm_gradient.spectrum.iter().rev().skip(1) {
+                        swarm_scene.add_frame(symbol, 2, Some(ColorPair::fg_only(*color)));
+                    }
+
+                    // Final scene: settle on the final gradient color (horizontal).
+                    let fraction = if width > 1 {
+                        (input_coord.column - 1) as f64 / (width - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    let final_color = final_gradient
+                        .get_color_at_fraction(fraction)
+                        .unwrap_or(Color::new(255, 255, 255));
+                    let final_scene = character.animation.new_scene("final", false);
+                    final_scene.add_frame(symbol, 1, Some(ColorPair::fg_only(final_color)));
+
+                    plans[char_index] = Plan {
+                        start_tick: swarm_index * SWARM_START_STAGGER,
+                        stages,
+                        next_stage: 0,
+                        started: false,
+                    };
+                }
             }
         }
 
-        // --- frame loop ---
-        let mut cursor: Vec<usize> = vec![0; n];
-        let mut activated: Vec<bool> = vec![false; n];
-        let mut reached: Vec<bool> = vec![false; n];
-        let mut active_swarm: Option<Vec<usize>> = None;
-        let mut next_swarm = 0usize;
-
-        let mut frames_out: Vec<String> = Vec::new();
-        frames_out.push(terminal.get_formatted_output_string());
+        // Drive the simulation: swarms start staggered; each character chains
+        // through its area paths and finally the "input" path home.
+        let mut frames: Vec<String> = Vec::new();
+        frames.push(terminal.render_frame());
+        let mut tick: usize = 0;
 
         loop {
-            // Activate the next swarm once the current swarm's characters are
-            // all on (or past) their input path — mirrors the Python gating.
-            let ready = match &active_swarm {
-                None => true,
-                Some(group) => group
-                    .iter()
-                    .all(|&ci| reached[ci] || cursor[ci] + 1 >= plans[ci].len()),
-            };
-            if next_swarm < swarm_groups.len() && ready {
-                let group = swarm_groups[next_swarm].clone();
-                for &ci in &group {
-                    let character = &mut terminal.characters[ci];
-                    character.is_visible = true;
-                    character.animation.activate_scene("flash");
-                    let first = plans[ci][0].clone();
-                    character.motion.activate_path(&first);
-                    activated[ci] = true;
-                }
-                active_swarm = Some(group);
-                next_swarm += 1;
-            }
-
-            // Tick every activated character; chain paths on completion.
-            for ci in 0..n {
-                if !activated[ci] {
-                    continue;
-                }
-                let character = &mut terminal.characters[ci];
-                character.tick();
-                if character.motion.movement_is_complete() && !reached[ci] {
-                    if cursor[ci] + 1 < plans[ci].len() {
-                        cursor[ci] += 1;
-                        let next_id = plans[ci][cursor[ci]].clone();
-                        character.motion.activate_path(&next_id);
-                        if next_id != "input_path" {
-                            // Flash on arrival at each swarm area.
-                            character.animation.activate_scene("flash");
+            let mut any_pending = false;
+            {
+                let characters = terminal.get_characters_mut();
+                for (index, plan) in plans.iter_mut().enumerate() {
+                    let character = &mut characters[index];
+                    if plan.stages.is_empty() {
+                        continue;
+                    }
+                    if !plan.started {
+                        if tick >= plan.start_tick {
+                            plan.started = true;
+                            character.is_visible = true;
+                            character.animation.activate_scene("swarm");
+                            let first = plan.stages[0].clone();
+                            character.motion.activate_path(&first);
+                            plan.next_stage = 1;
+                        } else {
+                            any_pending = true;
                         }
-                    } else {
-                        reached[ci] = true;
-                        character.animation.activate_scene("final");
+                    } else if plan.next_stage < plan.stages.len()
+                        && character.motion.movement_is_complete()
+                    {
+                        let stage_id = plan.stages[plan.next_stage].clone();
+                        if stage_id == "input" {
+                            // Dispersing home: drop the swarm pulse, take the
+                            // final gradient color.
+                            character.animation.activate_scene("final");
+                        }
+                        character.motion.activate_path(&stage_id);
+                        plan.next_stage += 1;
+                    }
+                    if plan.next_stage < plan.stages.len() {
+                        any_pending = true;
                     }
                 }
             }
 
-            frames_out.push(terminal.get_formatted_output_string());
+            terminal.tick();
+            frames.push(terminal.render_frame());
+            tick += 1;
 
-            let all_done = next_swarm >= swarm_groups.len()
-                && (0..n).all(|ci| {
-                    reached[ci]
-                        && terminal.characters[ci]
-                            .animation
-                            .query_scene("final")
-                            .map(|s| s.complete)
-                            .unwrap_or(true)
-                });
-            if all_done || frames_out.len() >= MAX_FRAMES {
+            if tick >= MAX_TICKS || (!any_pending && !terminal.is_active()) {
                 break;
             }
         }
 
-        frames_out
+        frames
     }
 }

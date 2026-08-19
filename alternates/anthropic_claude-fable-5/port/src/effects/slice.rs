@@ -1,43 +1,32 @@
-//! Slice effect: the text is sliced horizontally at its vertical center; the
-//! left half of each row slides in from above the canvas while the right half
-//! of the opposite row slides in from below, meeting at the input coordinates.
-//! Port of terminaltexteffects/effects/effect_slice.py (default "vertical"
-//! slice direction) adapted to this engine.
+//! Slice effect: the text is sliced into halves that slide into place from
+//! opposite edges of the canvas.
+//!
+//! Port of `terminaltexteffects/effects/effect_slice.py` using the default
+//! configuration: `slice_direction = "vertical"` (each row is cut at the text
+//! center column; the left half drops in from above the canvas while the
+//! right half rises in from below), `movement_speed = 0.15`, and the default
+//! final gradient (`8A008A -> 00D1FF -> FFFFFF`) applied vertically across
+//! the text. The upstream default easing (`in_out_expo`) is not available in
+//! this engine's easing subset, so the closest available curve
+//! (`in_out_cubic`) is used.
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::easing::EasingFn;
+use crate::utils::easing;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Easing used by the upstream effect (in_out_expo); not provided by
-/// utils::easing, so defined locally.
-fn in_out_expo(t: f64) -> f64 {
-    if t == 0.0 {
-        0.0
-    } else if t >= 1.0 {
-        1.0
-    } else if t < 0.5 {
-        2.0_f64.powf(20.0 * t - 10.0) / 2.0
-    } else {
-        (2.0 - 2.0_f64.powf(-20.0 * t + 10.0)) / 2.0
-    }
-}
-
+/// Default movement speed (upstream `--movement-speed`).
 const MOVEMENT_SPEED: f64 = 0.15;
-const MAX_FRAMES: usize = 5000;
+
+/// Safety bound on the number of simulation ticks.
+const MAX_FRAMES: usize = 2000;
 
 pub struct Slice;
 
 impl Slice {
     pub fn new() -> Self {
-        Slice
-    }
-}
-
-impl Default for Slice {
-    fn default() -> Self {
-        Slice::new()
+        Self
     }
 }
 
@@ -48,119 +37,75 @@ impl Effect for Slice {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let height = terminal.canvas.height as i32;
-        let width = terminal.canvas.width as i32;
-        let top = height;
-        let bottom = 1;
-        let center_column = (width + 1) / 2;
 
-        // Final gradient (upstream defaults: 8A008A -> 00D1FF -> FFFFFF, vertical).
+        if terminal.get_characters().is_empty() {
+            return vec![terminal.render_frame()];
+        }
+
+        // Final gradient stops (Python defaults), 12 steps between stops.
         let stops = [
-            Color::from_hex("8A008A").unwrap_or(Color::new(0x8A, 0x00, 0x8A)),
-            Color::from_hex("00D1FF").unwrap_or(Color::new(0x00, 0xD1, 0xFF)),
-            Color::from_hex("FFFFFF").unwrap_or(Color::new(0xFF, 0xFF, 0xFF)),
+            Color::from_hex("8A008A").expect("valid hex literal"),
+            Color::from_hex("00D1FF").expect("valid hex literal"),
+            Color::from_hex("FFFFFF").expect("valid hex literal"),
         ];
-        let gradient = Gradient::new(&stops, 12);
+        let final_gradient = Gradient::new(&stops, 12);
 
-        // Apply the final gradient color to every character via a one-frame scene.
+        // Text bounds, used for the gradient mapping (vertical direction) and
+        // for the text center column where each row is sliced.
+        let mut min_row = i32::MAX;
+        let mut max_row = i32::MIN;
+        let mut min_col = i32::MAX;
+        let mut max_col = i32::MIN;
+        for character in terminal.get_characters() {
+            min_row = min_row.min(character.input_coord.row);
+            max_row = max_row.max(character.input_coord.row);
+            min_col = min_col.min(character.input_coord.column);
+            max_col = max_col.max(character.input_coord.column);
+        }
+        // Mirrors `canvas.text_center_column` upstream.
+        let text_center_column = min_col + (max_col - min_col) / 2;
+
+        let canvas_top = terminal.canvas.height;
+        let canvas_bottom = 1;
+
         for character in terminal.get_characters_mut() {
-            let fraction = if height > 1 {
-                (character.input_coord.row - 1) as f64 / (height - 1) as f64
+            // Style the character with its final gradient color (mapped by
+            // row, bottom to top, as in the upstream vertical gradient
+            // direction). This keeps SGR color codes on every rendered cell.
+            let fraction = if max_row > min_row {
+                (character.input_coord.row - min_row) as f64 / (max_row - min_row) as f64
             } else {
-                0.0
+                1.0
             };
-            let color = gradient.get_color_at_fraction(fraction);
-            let scene = character.animation.new_scene("final_color", false);
-            scene.add_frame(
-                character.input_symbol,
-                1,
-                ColorPair::new(color, None),
-                false,
-            );
-            character.animation.activate_scene("final_color");
+            let color = final_gradient
+                .get_color_at_fraction(fraction)
+                .expect("gradient spectrum is non-empty");
+            character
+                .animation
+                .set_appearance(character.input_symbol, Some(ColorPair::fg_only(color)));
+
+            // Python (vertical slice): characters left of the text center
+            // start at Coord(column, canvas.top + 1); characters right of the
+            // center start at Coord(column, canvas.bottom - 1). Both slide to
+            // their input coordinates along an eased path.
+            let start_row = if character.input_coord.column <= text_center_column {
+                canvas_top + 1
+            } else {
+                canvas_bottom - 1
+            };
+            character.motion.current_coord =
+                Coord::new(character.input_coord.column, start_row);
+
+            let input_coord = character.input_coord;
+            let path = character
+                .motion
+                .new_path("input_coord", MOVEMENT_SPEED, Some(easing::in_out_cubic));
+            path.new_waypoint("input_coord", input_coord);
+            character.motion.activate_path("input_coord");
+
+            character.is_visible = true;
         }
 
-        // Group characters into rows, top to bottom (ids only, to avoid borrows).
-        let mut rows: Vec<Vec<usize>> = Vec::new();
-        for row in (1..=height).rev() {
-            let ids: Vec<usize> = terminal
-                .get_characters()
-                .iter()
-                .filter(|c| c.input_coord.row == row)
-                .map(|c| c.character_id)
-                .collect();
-            if !ids.is_empty() {
-                rows.push(ids);
-            }
-        }
-        let num_rows = rows.len();
-
-        let ease: EasingFn = in_out_expo;
-
-        // Configure a character: move it to `start`, path it back to input_coord.
-        let mut configure = |terminal: &mut Terminal, id: usize, start: Coord| {
-            if let Some(character) = terminal
-                .get_characters_mut()
-                .iter_mut()
-                .find(|c| c.character_id == id)
-            {
-                character.motion.current_coord = start;
-                let input_coord = character.input_coord;
-                let path = character
-                    .motion
-                    .new_path("input_coord", MOVEMENT_SPEED, Some(ease));
-                path.add_waypoint(start);
-                path.add_waypoint(input_coord);
-                character.motion.activate_path("input_coord");
-                character.is_visible = true;
-            }
-        };
-
-        for row_index in 0..num_rows {
-            // Left half of this row slides in from one row above the top.
-            let left_half: Vec<(usize, i32)> = rows[row_index]
-                .iter()
-                .filter_map(|&id| {
-                    terminal
-                        .get_characters()
-                        .iter()
-                        .find(|c| c.character_id == id)
-                        .filter(|c| c.input_coord.column <= center_column)
-                        .map(|c| (id, c.input_coord.column))
-                })
-                .collect();
-            for (id, column) in left_half {
-                configure(&mut terminal, id, Coord::new(column, top + 1));
-            }
-
-            // Right half of the opposite row slides in from one row below the bottom.
-            let opposite_index = num_rows - 1 - row_index;
-            let right_half: Vec<(usize, i32)> = rows[opposite_index]
-                .iter()
-                .filter_map(|&id| {
-                    terminal
-                        .get_characters()
-                        .iter()
-                        .find(|c| c.character_id == id)
-                        .filter(|c| c.input_coord.column > center_column)
-                        .map(|c| (id, c.input_coord.column))
-                })
-                .collect();
-            for (id, column) in right_half {
-                configure(&mut terminal, id, Coord::new(column, bottom - 1));
-            }
-        }
-
-        // Run the effect to completion, collecting frames.
-        let mut frames = Vec::new();
-        frames.push(terminal.get_formatted_output_string());
-        for _ in 0..MAX_FRAMES {
-            let active = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
-            if active == 0 {
-                break;
-            }
-        }
-        frames
+        terminal.run(MAX_FRAMES)
     }
 }

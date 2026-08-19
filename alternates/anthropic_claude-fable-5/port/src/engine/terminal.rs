@@ -1,78 +1,70 @@
-//! Terminal: owns the canvas and the character arena; produces frame strings.
+//! Terminal: owns the character arena and the canvas, produces frames.
 
 use crate::engine::canvas::Canvas;
 use crate::engine::character::EffectCharacter;
 use crate::utils::geometry::Coord;
 
-#[derive(Clone, Debug)]
+/// Terminal configuration.
+#[derive(Debug, Clone)]
 pub struct TerminalConfig {
-    /// 0 means "size to input".
-    pub canvas_width: usize,
-    /// 0 means "size to input".
-    pub canvas_height: usize,
-    pub frame_rate: u64,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        TerminalConfig {
-            canvas_width: 0,
-            canvas_height: 0,
-            frame_rate: 60,
-        }
+        Self { width: 80, height: 24 }
     }
 }
 
+/// The simulation terminal: character arena plus render canvas.
+#[derive(Debug, Clone)]
 pub struct Terminal {
     pub config: TerminalConfig,
     pub canvas: Canvas,
-    pub characters: Vec<EffectCharacter>,
+    characters: Vec<EffectCharacter>,
+    next_character_id: u32,
 }
 
 impl Terminal {
-    /// Parse input text into a character arena placed at the top of the canvas.
+    /// Build a terminal from input text. The top line of the input is placed
+    /// on the top row of the canvas; row 1 is the bottom row.
     pub fn new(input: &str, config: TerminalConfig) -> Self {
         let lines: Vec<&str> = input.lines().collect();
-        let width = if config.canvas_width > 0 {
-            config.canvas_width
-        } else {
-            lines
-                .iter()
-                .map(|l| l.chars().count())
-                .max()
-                .unwrap_or(1)
-                .max(1)
+        let width = config
+            .width
+            .max(lines.iter().map(|l| l.chars().count() as i32).max().unwrap_or(1))
+            .max(1);
+        let height = config.height.max(lines.len() as i32).max(1);
+        let mut terminal = Self {
+            config: TerminalConfig { width, height },
+            canvas: Canvas::new(width, height),
+            characters: Vec::new(),
+            next_character_id: 0,
         };
-        let height = if config.canvas_height > 0 {
-            config.canvas_height
-        } else {
-            lines.len().max(1)
-        };
-
-        let canvas = Canvas::new(width, height);
-        let mut characters = Vec::new();
-        let mut next_id = 0usize;
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            let row = height as i32 - line_idx as i32;
+        for (line_index, line) in lines.iter().enumerate() {
+            let row = height - line_index as i32;
             if row < 1 {
                 break;
             }
-            for (col_idx, symbol) in line.chars().take(width).enumerate() {
-                if symbol == ' ' {
-                    continue;
+            for (col_index, symbol) in line.chars().enumerate() {
+                let column = col_index as i32 + 1;
+                if column > width {
+                    break;
                 }
-                let coord = Coord::new(col_idx as i32 + 1, row);
-                characters.push(EffectCharacter::new(next_id, symbol, coord));
-                next_id += 1;
+                if symbol != ' ' {
+                    terminal.add_character(symbol, Coord::new(column, row));
+                }
             }
         }
+        terminal
+    }
 
-        Terminal {
-            config,
-            canvas,
-            characters,
-        }
+    pub fn add_character(&mut self, symbol: char, coord: Coord) -> u32 {
+        let id = self.next_character_id;
+        self.next_character_id += 1;
+        self.characters.push(EffectCharacter::new(id, symbol, coord));
+        id
     }
 
     pub fn get_characters(&self) -> &[EffectCharacter] {
@@ -83,7 +75,7 @@ impl Terminal {
         &mut self.characters
     }
 
-    pub fn set_character_visibility(&mut self, character_id: usize, is_visible: bool) {
+    pub fn set_character_visibility(&mut self, character_id: u32, is_visible: bool) {
         if let Some(character) = self
             .characters
             .iter_mut()
@@ -93,29 +85,41 @@ impl Terminal {
         }
     }
 
-    /// Step every character one tick; returns the number still active.
-    pub fn tick(&mut self) -> usize {
-        let mut active = 0;
-        for character in &mut self.characters {
-            character.tick();
-            if character.is_active() {
-                active += 1;
-            }
-        }
-        active
+    /// True while any character still has work remaining.
+    pub fn is_active(&self) -> bool {
+        self.characters.iter().any(EffectCharacter::is_active)
     }
 
-    /// Blit visible characters onto the canvas and render a frame string.
-    pub fn get_formatted_output_string(&mut self) -> String {
+    /// Advance every character by one tick.
+    pub fn tick(&mut self) {
+        for character in &mut self.characters {
+            character.tick();
+        }
+    }
+
+    /// Composite visible characters onto the canvas and render a frame string.
+    pub fn render_frame(&mut self) -> String {
         self.canvas.clear();
         for character in &self.characters {
-            if character.is_visible
-                && self.canvas.coord_is_in_canvas(character.motion.current_coord)
-            {
+            if character.is_visible {
                 self.canvas
-                    .set_cell(character.motion.current_coord, character.current_visual());
+                    .set_cell(character.motion.current_coord, character.animation.current_visual.clone());
             }
         }
         self.canvas.to_frame_string()
+    }
+
+    /// Run the frame-stepping loop to completion (bounded by `max_frames`),
+    /// collecting one rendered frame per tick.
+    pub fn run(&mut self, max_frames: usize) -> Vec<String> {
+        let mut frames = Vec::new();
+        frames.push(self.render_frame());
+        let mut count = 0;
+        while self.is_active() && count < max_frames {
+            self.tick();
+            frames.push(self.render_frame());
+            count += 1;
+        }
+        frames
     }
 }

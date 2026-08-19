@@ -1,62 +1,30 @@
-//! Laser etch: a laser beam sweeps across the text, etching each character
-//! into place with a shower of cooling sparks.
+//! Laser etch effect (port of terminaltexteffects/effects/effect_laseretch.py).
 //!
-//! Port of TTE's `laseretch` effect adapted to this engine: the laser head
-//! travels serpentine, row by row from the top of the text. As it passes a
-//! character's input coordinate the character is revealed white-hot and
-//! cools through a spark gradient down to its final gradient color, while a
-//! few spark particles arc away from the etch point and fade out.
+//! A laser emitter in the top-right corner of the canvas fires a beam at each
+//! character position in turn (top row to bottom row, left to right). As the
+//! beam strikes, the character is etched: it sparks white-hot, cools through
+//! an ember gradient, and settles on its final color taken from a vertical
+//! final gradient across the text.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
-use crate::engine::character::EffectCharacter;
 use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::easing;
-use crate::utils::geometry::Coord;
+use crate::utils::geometry::{find_length_of_line, lerp_coord, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Cells the laser head advances per tick.
-const ETCH_SPEED: usize = 2;
-/// Hard safety cap on emitted frames.
-const MAX_FRAMES: usize = 20_000;
-
-/// Small deterministic xorshift RNG (no external rand dependency).
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Rng(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// Inclusive integer range.
-    fn range(&mut self, lo: i32, hi: i32) -> i32 {
-        if hi <= lo {
-            return lo;
-        }
-        lo + (self.next() % ((hi - lo + 1) as u64)) as i32
-    }
-
-    fn f64(&mut self) -> f64 {
-        (self.next() % 10_000) as f64 / 10_000.0
-    }
-}
-
+/// The `laseretch` effect.
 pub struct Laseretch;
 
 impl Laseretch {
     pub fn new() -> Self {
-        Laseretch
+        Self
+    }
+}
+
+impl Default for Laseretch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -67,232 +35,141 @@ impl Effect for Laseretch {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
-        let mut rng = Rng::new(0x1a5e_e7c4_51ab_77d3);
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
 
-        let num_input = terminal.characters.len();
-        if num_input == 0 {
-            return vec![terminal.get_formatted_output_string()];
-        }
-
-        // Palette (mirrors the upstream defaults in spirit).
-        let white = Color::from_hex("FFFFFF").expect("valid hex");
-        let beam_color = Color::from_hex("376CFF").expect("valid hex");
-        let beam_dim = Color::from_hex("1F3C8C").expect("valid hex");
-        let hot_orange = Color::from_hex("FF9600").expect("valid hex");
-        let ember = Color::from_hex("8A2B00").expect("valid hex");
+        // --- palette (mirrors the Python defaults) -------------------------
+        let spark_color = Color::from_hex("ffffff").expect("valid hex");
+        let cool_a = Color::from_hex("ffe680").expect("valid hex");
+        let cool_b = Color::from_hex("ff9100").expect("valid hex");
+        let laser_gradient = Gradient::new(
+            &[
+                Color::from_hex("ffffff").expect("valid hex"),
+                Color::from_hex("ff0000").expect("valid hex"),
+            ],
+            12,
+        );
         let final_stops = [
             Color::from_hex("8A008A").expect("valid hex"),
             Color::from_hex("00D1FF").expect("valid hex"),
-            white,
+            Color::from_hex("ffffff").expect("valid hex"),
         ];
-        let final_gradient = Gradient::new(&final_stops, 12);
-        let spark_gradient = Gradient::new(&[white, hot_orange, ember], 3);
+        let final_gradient = Gradient::new(&final_stops, 10);
 
-        // Build each input character's etch scene: white-hot block, then a
-        // cooling ramp that lands on the character's final gradient color.
-        for idx in 0..num_input {
-            let ch = &mut terminal.characters[idx];
-            let frac = if height > 1 {
-                (height - ch.input_coord.row) as f64 / (height - 1) as f64
+        // --- final gradient mapping across the text's row extent -----------
+        let (min_row, max_row) = {
+            let mut min_row = i32::MAX;
+            let mut max_row = i32::MIN;
+            for character in terminal.get_characters() {
+                min_row = min_row.min(character.input_coord.row);
+                max_row = max_row.max(character.input_coord.row);
+            }
+            if min_row > max_row {
+                (1, 1)
             } else {
+                (min_row, max_row)
+            }
+        };
+
+        // --- etch order: top row to bottom row, left to right --------------
+        let mut order: Vec<(u32, Coord)> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| (c.character_id, c.input_coord))
+            .collect();
+        order.sort_by(|a, b| b.1.row.cmp(&a.1.row).then(a.1.column.cmp(&b.1.column)));
+
+        // --- build the spark -> cool -> final scene for every character ----
+        for (id, coord) in &order {
+            let t = if max_row == min_row {
                 0.0
-            };
-            let final_color = final_gradient.get_color_at_fraction(frac).unwrap_or(white);
-            let sym = ch.input_symbol;
-            let cooling = Gradient::new(&[hot_orange, ember, final_color], 4);
-            let scene = ch.animation.new_scene("etch", false);
-            scene.add_frame('█', 3, ColorPair::fg(white), true);
-            scene.add_frame('▓', 3, ColorPair::fg(hot_orange), true);
-            for color in &cooling.spectrum {
-                scene.add_frame(sym, 2, ColorPair::fg(*color), false);
-            }
-            scene.add_frame(sym, 1, ColorPair::fg(final_color), false);
-        }
-
-        // Coord -> input character index, plus the traversal span.
-        let mut coord_map: HashMap<Coord, usize> = HashMap::new();
-        let mut min_col = i32::MAX;
-        let mut max_col = i32::MIN;
-        let mut row_has = vec![false; (height as usize) + 1];
-        for (idx, ch) in terminal.get_characters().iter().enumerate() {
-            coord_map.insert(ch.input_coord, idx);
-            min_col = min_col.min(ch.input_coord.column);
-            max_col = max_col.max(ch.input_coord.column);
-            row_has[ch.input_coord.row as usize] = true;
-        }
-
-        // Serpentine visit order: rows top to bottom, alternating direction.
-        let mut visit: Vec<Coord> = Vec::new();
-        let mut serp = 0usize;
-        for row in (1..=height).rev() {
-            if !row_has[row as usize] {
-                continue;
-            }
-            if serp % 2 == 0 {
-                for col in min_col..=max_col {
-                    visit.push(Coord::new(col, row));
-                }
             } else {
-                for col in (min_col..=max_col).rev() {
-                    visit.push(Coord::new(col, row));
-                }
+                (max_row - coord.row) as f64 / (max_row - min_row) as f64
+            };
+            let final_color = final_gradient
+                .get_color_at_fraction(t)
+                .unwrap_or(final_stops[2]);
+            let cool = Gradient::new(&[spark_color, cool_a, cool_b, final_color], 3);
+            let character = &mut terminal.get_characters_mut()[*id as usize];
+            let symbol = character.input_symbol;
+            let scene = character.animation.new_scene("etch", false);
+            for color in &cool.spectrum {
+                scene.add_frame(symbol, 2, Some(ColorPair::fg_only(*color)));
             }
-            serp += 1;
         }
 
-        // Extra arena characters: the laser head and a vertical beam feeding
-        // it from the top of the canvas. Driven manually each tick.
-        let mut next_id = 1_000_000usize;
-        let head_idx = terminal.characters.len();
-        terminal
-            .characters
-            .push(EffectCharacter::new(next_id, '█', Coord::new(1, height)));
-        next_id += 1;
-        let beam_start = terminal.characters.len();
-        let beam_capacity = terminal.canvas.height;
-        for _ in 0..beam_capacity {
-            terminal
-                .characters
-                .push(EffectCharacter::new(next_id, '│', Coord::new(1, height)));
-            next_id += 1;
+        // --- pool of characters used to draw the beam ----------------------
+        let emitter = Coord::new(width, height);
+        let beam_len = (width + height) as usize + 2;
+        let mut beam_ids: Vec<u32> = Vec::with_capacity(beam_len);
+        for _ in 0..beam_len {
+            beam_ids.push(terminal.add_character(' ', emitter));
         }
 
-        let spark_symbols = ['*', '.', '+', '\''];
-        let mut spark_indices: Vec<usize> = Vec::new();
-        let mut etched = vec![false; num_input];
-        let mut visit_idx = 0usize;
-        let mut tick: u64 = 0;
-        let mut frames_out: Vec<String> = Vec::new();
+        let mut pending: VecDeque<(u32, Coord)> = order.into_iter().collect();
+
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+        let max_frames = 20_000usize;
 
         loop {
-            // Advance the laser head and etch anything it passes over.
-            let laser_pos = if visit_idx < visit.len() {
-                let mut last = visit[visit_idx];
-                for _ in 0..ETCH_SPEED {
-                    if visit_idx >= visit.len() {
-                        break;
-                    }
-                    let coord = visit[visit_idx];
-                    visit_idx += 1;
-                    last = coord;
-                    if let Some(&ci) = coord_map.get(&coord) {
-                        if !etched[ci] {
-                            etched[ci] = true;
-                            terminal.characters[ci].is_visible = true;
-                            terminal.characters[ci].animation.activate_scene("etch");
+            // Etch the next character, if any remain.
+            let target = pending.pop_front();
+            if let Some((id, _coord)) = target {
+                let character = &mut terminal.get_characters_mut()[id as usize];
+                character.is_visible = true;
+                character.animation.activate_scene("etch");
+            }
 
-                            // Spawn a small burst of sparks arcing away.
-                            let count = rng.range(1, 3);
-                            for _ in 0..count {
-                                let sym =
-                                    spark_symbols[(rng.next() % spark_symbols.len() as u64) as usize];
-                                let mut spark = EffectCharacter::new(next_id, sym, coord);
-                                next_id += 1;
-                                spark.is_visible = true;
-                                let dx = rng.range(-3, 3);
-                                let apex = Coord::new(
-                                    (coord.column + dx).clamp(1, width),
-                                    (coord.row + rng.range(1, 2)).min(height),
-                                );
-                                let land = Coord::new(
-                                    (apex.column + rng.range(-1, 1)).clamp(1, width),
-                                    (coord.row - rng.range(2, 5)).max(1),
-                                );
-                                let speed = 0.3 + rng.f64() * 0.4;
-                                {
-                                    let path =
-                                        spark.motion.new_path("arc", speed, Some(easing::out_quad));
-                                    path.add_waypoint(coord);
-                                    path.add_waypoint(apex);
-                                    path.add_waypoint(land);
-                                }
-                                spark.motion.activate_path("arc");
-                                {
-                                    let scene = spark.animation.new_scene("cool", false);
-                                    for (i, color) in spark_gradient.spectrum.iter().enumerate() {
-                                        scene.add_frame(sym, 3, ColorPair::fg(*color), i < 2);
-                                    }
-                                }
-                                spark.animation.activate_scene("cool");
-                                spark_indices.push(terminal.characters.len());
-                                terminal.characters.push(spark);
-                            }
-                        }
+            // Hide all beam segments, then redraw the beam toward the target.
+            for &bid in &beam_ids {
+                terminal.get_characters_mut()[bid as usize].is_visible = false;
+            }
+            if let Some((_id, coord)) = target {
+                let distance = find_length_of_line(emitter, coord);
+                let steps = (distance.round() as i32).max(1);
+                let dx = coord.column - emitter.column;
+                let dy = coord.row - emitter.row;
+                let symbol = if dx == 0 {
+                    '|'
+                } else if dy == 0 {
+                    '_'
+                } else if (dx as i64) * (dy as i64) > 0 {
+                    '/'
+                } else {
+                    '\\'
+                };
+                for i in 0..steps {
+                    let frac = i as f64 / steps as f64;
+                    let point = lerp_coord(emitter, coord, frac);
+                    if point == coord {
+                        // Never cover the cell currently being etched.
+                        continue;
                     }
-                }
-                Some(last)
-            } else {
-                None
-            };
-
-            // Draw (or hide) the laser head and its beam.
-            match laser_pos {
-                Some(pos) => {
-                    let head_color = if tick % 2 == 0 { white } else { beam_color };
-                    let head = &mut terminal.characters[head_idx];
-                    head.is_visible = true;
-                    head.motion.current_coord = pos;
-                    head.animation.current_visual =
-                        CharacterVisual::new('█', true, ColorPair::fg(head_color));
-                    let beam_len = (height - pos.row).max(0) as usize;
-                    for i in 0..beam_capacity {
-                        let bc = &mut terminal.characters[beam_start + i];
-                        if i < beam_len {
-                            bc.is_visible = true;
-                            bc.motion.current_coord =
-                                Coord::new(pos.column, pos.row + 1 + i as i32);
-                            let color = if (tick + i as u64) % 2 == 0 {
-                                beam_color
-                            } else {
-                                beam_dim
-                            };
-                            bc.animation.current_visual =
-                                CharacterVisual::new('│', false, ColorPair::fg(color));
-                        } else {
-                            bc.is_visible = false;
-                        }
-                    }
-                }
-                None => {
-                    terminal.characters[head_idx].is_visible = false;
-                    for i in 0..beam_capacity {
-                        terminal.characters[beam_start + i].is_visible = false;
-                    }
+                    let color = laser_gradient
+                        .get_color_at_fraction(frac)
+                        .unwrap_or(spark_color);
+                    let idx = (i as usize).min(beam_ids.len() - 1);
+                    let beam = &mut terminal.get_characters_mut()[beam_ids[idx] as usize];
+                    beam.motion.current_coord = point;
+                    let glyph = if i == 0 { '▼' } else { symbol };
+                    beam.animation
+                        .set_appearance(glyph, Some(ColorPair::fg_only(color)));
+                    beam.is_visible = true;
                 }
             }
 
             terminal.tick();
+            frames.push(terminal.render_frame());
 
-            // Extinguish sparks that have finished cooling and landing.
-            for &si in &spark_indices {
-                if !terminal.characters[si].is_active() {
-                    terminal.characters[si].is_visible = false;
-                }
+            if frames.len() >= max_frames {
+                break;
             }
-
-            tick += 1;
-            frames_out.push(terminal.get_formatted_output_string());
-
-            if visit_idx >= visit.len() {
-                let any_active = terminal.characters.iter().any(|c| c.is_active());
-                if !any_active {
-                    break;
-                }
-            }
-            if frames_out.len() >= MAX_FRAMES {
+            if pending.is_empty() && target.is_none() && !terminal.is_active() {
                 break;
             }
         }
 
-        // Hold the finished etch briefly.
-        if let Some(last) = frames_out.last().cloned() {
-            for _ in 0..10 {
-                frames_out.push(last.clone());
-            }
-        }
-
-        frames_out
+        frames
     }
 }

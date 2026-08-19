@@ -1,77 +1,62 @@
-//! Fireworks effect: characters are gathered into shells, launched from the
-//! bottom of the canvas to a random apex, exploded outward into a ring, then
-//! fall to their input coordinates while fading to the final gradient color.
-//!
-//! Port of terminaltexteffects/effects/effect_fireworks.py, adapted to the
-//! reduced engine (no event handlers), so the phase transitions are driven
-//! explicitly by a per-character state machine.
+//! Fireworks: characters are gathered into shells, launched from the bottom of the
+//! canvas, exploded outward on a circle, then fall to their input coordinates while
+//! fading from the shell color to their final gradient color.
+//! Port of terminaltexteffects/effects/effect_fireworks.py adapted to this engine's
+//! explicit state-machine driving (no event handlers).
 
-use std::f64::consts::PI;
+use std::collections::HashMap;
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
-use crate::utils::geometry::Coord;
+use crate::utils::geometry::{find_coords_on_circle, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const FIREWORK_SYMBOL: char = 'o';
 const FIREWORK_COLORS: [&str; 5] = ["88F7E2", "44D492", "F5EB67", "FFA15C", "FA233E"];
 const FINAL_GRADIENT_STOPS: [&str; 3] = ["8A008A", "00D1FF", "FFFFFF"];
-/// Fraction of total characters per firework shell.
+const FIREWORK_SYMBOL: char = 'o';
 const FIREWORK_VOLUME: f64 = 0.02;
-/// Explosion ring radius as a fraction of the canvas width.
-const EXPLODE_DISTANCE: f64 = 0.1;
-/// Ticks between successive shell launches.
 const LAUNCH_DELAY: usize = 30;
-/// Hard cap on simulated ticks (safety net).
-const MAX_TICKS: usize = 20_000;
+const EXPLODE_DISTANCE: f64 = 0.1;
+const LAUNCH_SPEED: f64 = 0.2;
+const EXPLODE_SPEED: f64 = 0.3;
+const FALL_SPEED: f64 = 0.4;
+const MAX_FRAMES: usize = 5000;
 
-/// Small deterministic PRNG (splitmix-style) so the effect needs no deps.
+/// Small deterministic xorshift PRNG so the effect needs no external crates.
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed | 1)
+        Self(seed | 1)
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
     }
 
-    /// Random i32 in `lo..=hi`; returns `lo` when the range is empty.
+    /// Inclusive integer range; returns `lo` when the range is degenerate.
     fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;
         }
-        let span = (hi - lo) as u64 + 1;
-        lo + (self.next_u64() % span) as i32
+        lo + (self.next_u64() % ((hi - lo + 1) as u64)) as i32
     }
 
-    fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
-        if hi <= lo {
-            return lo;
-        }
-        let span = (hi - lo) as u64 + 1;
-        lo + (self.next_u64() % span) as usize
+    fn choice_hex(&mut self, items: &[&'static str]) -> &'static str {
+        items[(self.next_u64() % items.len() as u64) as usize]
     }
 
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
+    fn shuffle<T>(&mut self, v: &mut [T]) {
+        for i in (1..v.len()).rev() {
+            let j = (self.next_u64() % (i as u64 + 1)) as usize;
+            v.swap(i, j);
         }
-        for i in (1..items.len()).rev() {
-            let j = self.range_usize(0, i);
-            items.swap(i, j);
-        }
-    }
-
-    fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        let idx = self.range_usize(0, items.len().saturating_sub(1));
-        &items[idx]
     }
 }
 
@@ -84,34 +69,20 @@ enum Phase {
     Done,
 }
 
-/// Evenly spaced coords on a circle around `center`.
-fn coords_on_circle(center: Coord, radius: i32, count: usize) -> Vec<Coord> {
-    let count = count.max(1);
-    (0..count)
-        .map(|i| {
-            let angle = 2.0 * PI * (i as f64) / (count as f64);
-            Coord::new(
-                center.column + (radius as f64 * angle.cos()).round() as i32,
-                center.row + (radius as f64 * angle.sin()).round() as i32,
-            )
-        })
-        .collect()
-}
-
-fn seed_from_input(input: &str) -> u64 {
-    let mut seed: u64 = 0x1234_5678_9ABC_DEF1;
-    for b in input.bytes() {
-        seed = seed.rotate_left(7) ^ (b as u64);
-        seed = seed.wrapping_mul(0x100_0000_01B3);
-    }
-    seed
+struct CharState {
+    phase: Phase,
+    launch_tick: usize,
+    launch_coord: Coord,
+    shell_color: Color,
+    final_color: Color,
+    fall_gradient: Gradient,
 }
 
 pub struct Fireworks;
 
 impl Fireworks {
     pub fn new() -> Self {
-        Fireworks
+        Self
     }
 }
 
@@ -128,159 +99,175 @@ impl Effect for Fireworks {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let char_count = terminal.characters.len();
-        if char_count == 0 {
-            return vec![terminal.get_formatted_output_string()];
-        }
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
+        let mut rng = Rng::new(0x5eed_f14e_u64 ^ ((input.len() as u64) << 7).wrapping_add(0x9e37_79b9));
 
-        let mut rng = Rng::new(seed_from_input(input));
-
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
-        let explode_radius = ((width as f64 * EXPLODE_DISTANCE).round() as i32).max(1);
-
-        let white = Color::new(255, 255, 255);
-        let firework_colors: Vec<Color> = FIREWORK_COLORS
-            .iter()
-            .filter_map(|hex| Color::from_hex(hex))
-            .collect();
         let final_stops: Vec<Color> = FINAL_GRADIENT_STOPS
             .iter()
-            .filter_map(|hex| Color::from_hex(hex))
+            .map(|hex| Color::from_hex(hex).expect("valid hex"))
             .collect();
-        let final_gradient = Gradient::new(&final_stops, 12);
+        let final_gradient = Gradient::new(&final_stops, height.max(2) as usize);
+        let fallback_final = *final_stops.last().expect("non-empty stops");
 
-        // Group characters into shells.
-        let mut indices: Vec<usize> = (0..char_count).collect();
-        rng.shuffle(&mut indices);
-        let shell_size = ((char_count as f64 * FIREWORK_VOLUME).round() as usize).max(1);
-        let shells: Vec<Vec<usize>> = indices
-            .chunks(shell_size)
-            .map(|chunk| chunk.to_vec())
+        let mut ids: Vec<u32> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| c.character_id)
             .collect();
+        let total = ids.len();
+        if total == 0 {
+            return vec![terminal.render_frame()];
+        }
+        rng.shuffle(&mut ids);
 
-        let mut launch_tick = vec![0usize; char_count];
+        let shell_size = ((FIREWORK_VOLUME * total as f64).round() as usize).max(1);
+        let radius = ((EXPLODE_DISTANCE * width as f64).round() as i32).max(2);
 
-        for (shell_index, shell) in shells.iter().enumerate() {
-            let shell_color = *rng.choice(&firework_colors);
+        let mut states: HashMap<u32, CharState> = HashMap::new();
 
-            let apex_lo = (1 + explode_radius).min(width);
-            let apex_hi = (width - explode_radius).max(apex_lo);
-            let apex_col = rng.range_i32(apex_lo, apex_hi);
-            let row_lo = ((height / 2) + 1).clamp(1, height);
-            let apex_row = rng.range_i32(row_lo, height);
-            let apex = Coord::new(apex_col, apex_row);
-            let origin = Coord::new(apex_col, 1);
-            let ring = coords_on_circle(apex, explode_radius, shell.len());
+        for (shell_index, shell) in ids.chunks(shell_size).enumerate() {
+            // Pick an apex for this shell, kept inside the canvas with room to burst.
+            let col_lo = (1 + radius).min(width);
+            let col_hi = (width - radius).max(col_lo);
+            let row_lo = (height / 2).max(1);
+            let row_hi = (height - radius).max(row_lo);
+            let apex = Coord::new(rng.range_i32(col_lo, col_hi), rng.range_i32(row_lo, row_hi));
 
-            for (member_index, &idx) in shell.iter().enumerate() {
-                launch_tick[idx] = shell_index * LAUNCH_DELAY;
+            let shell_color =
+                Color::from_hex(rng.choice_hex(&FIREWORK_COLORS)).expect("valid hex");
+            let burst_coords = find_coords_on_circle(apex, radius, shell.len());
+            let launch_tick =
+                shell_index * LAUNCH_DELAY + rng.range_i32(0, LAUNCH_DELAY as i32) as usize;
 
-                let input_coord = terminal.characters[idx].input_coord;
-                let input_symbol = terminal.characters[idx].input_symbol;
-                let ring_coord = ring[member_index];
+            for (i, &id) in shell.iter().enumerate() {
+                let character = &mut terminal.get_characters_mut()[id as usize];
+                let input_coord = character.input_coord;
 
-                let final_fraction = if height > 1 {
+                let launch_path =
+                    character
+                        .motion
+                        .new_path("launch", LAUNCH_SPEED, Some(easing::out_expo));
+                launch_path.new_waypoint("apex", apex);
+
+                let explode_path =
+                    character
+                        .motion
+                        .new_path("explode", EXPLODE_SPEED, Some(easing::out_quad));
+                explode_path.new_waypoint("burst", burst_coords[i]);
+
+                let fall_path =
+                    character
+                        .motion
+                        .new_path("fall", FALL_SPEED, Some(easing::in_out_cubic));
+                fall_path.new_waypoint("home", input_coord);
+
+                let row_fraction = if height > 1 {
                     (input_coord.row - 1) as f64 / (height - 1) as f64
                 } else {
                     0.0
                 };
                 let final_color = final_gradient
-                    .get_color_at_fraction(final_fraction)
-                    .unwrap_or(white);
+                    .get_color_at_fraction(row_fraction)
+                    .unwrap_or(fallback_final);
+                let fall_gradient = Gradient::new(&[shell_color, final_color], 12);
 
-                let character = &mut terminal.characters[idx];
-                character.motion.current_coord = origin;
-
-                // Motion paths for the three phases.
-                let path = character
-                    .motion
-                    .new_path("launch", 0.5, Some(easing::out_expo));
-                path.add_waypoint(origin);
-                path.add_waypoint(apex);
-
-                let path = character
-                    .motion
-                    .new_path("explode", 0.4, Some(easing::out_quad));
-                path.add_waypoint(apex);
-                path.add_waypoint(ring_coord);
-
-                let path = character
-                    .motion
-                    .new_path("input", 0.3, Some(easing::in_out_cubic));
-                path.add_waypoint(ring_coord);
-                path.add_waypoint(input_coord);
-
-                // Launch: twinkling shell rising to the apex.
-                let scene = character.animation.new_scene("launch", true);
-                scene.add_frame(FIREWORK_SYMBOL, 2, ColorPair::fg(shell_color), true);
-                scene.add_frame(FIREWORK_SYMBOL, 2, ColorPair::fg(white), true);
-
-                // Explode: bright flash fading into the shell color.
-                let explode_gradient = Gradient::new(&[white, shell_color], 8);
-                let scene = character.animation.new_scene("explode", false);
-                for color in &explode_gradient.spectrum {
-                    scene.add_frame(FIREWORK_SYMBOL, 3, ColorPair::fg(*color), false);
-                }
-
-                // Fall: input symbol fading from shell color to the final color.
-                let fall_gradient = Gradient::new(&[shell_color, final_color], 10);
-                let scene = character.animation.new_scene("fall", false);
-                for color in &fall_gradient.spectrum {
-                    scene.add_frame(input_symbol, 4, ColorPair::fg(*color), false);
-                }
+                states.insert(
+                    id,
+                    CharState {
+                        phase: Phase::Waiting,
+                        launch_tick,
+                        launch_coord: Coord::new(apex.column, 1),
+                        shell_color,
+                        final_color,
+                        fall_gradient,
+                    },
+                );
             }
         }
 
-        // Simulate.
-        let mut phases = vec![Phase::Waiting; char_count];
-        let mut frames_out: Vec<String> = Vec::new();
+        let mut frames = vec![terminal.render_frame()];
+        let mut tick = 0usize;
 
-        for tick in 0..MAX_TICKS {
-            // Launch shells whose time has arrived.
-            for idx in 0..char_count {
-                if phases[idx] == Phase::Waiting && tick >= launch_tick[idx] {
-                    let character = &mut terminal.characters[idx];
-                    character.is_visible = true;
-                    character.animation.activate_scene("launch");
-                    character.motion.activate_path("launch");
-                    phases[idx] = Phase::Launching;
+        loop {
+            let mut all_done = true;
+
+            for character in terminal.get_characters_mut() {
+                let state = match states.get_mut(&character.character_id) {
+                    Some(state) => state,
+                    None => continue,
+                };
+                match state.phase {
+                    Phase::Waiting => {
+                        all_done = false;
+                        if tick >= state.launch_tick {
+                            character.motion.current_coord = state.launch_coord;
+                            character.is_visible = true;
+                            character.animation.set_appearance(
+                                FIREWORK_SYMBOL,
+                                Some(ColorPair::fg_only(state.shell_color)),
+                            );
+                            character.motion.activate_path("launch");
+                            state.phase = Phase::Launching;
+                        }
+                    }
+                    Phase::Launching => {
+                        all_done = false;
+                        if character.motion.movement_is_complete() {
+                            character.motion.activate_path("explode");
+                            state.phase = Phase::Exploding;
+                        }
+                    }
+                    Phase::Exploding => {
+                        all_done = false;
+                        if character.motion.movement_is_complete() {
+                            character.motion.activate_path("fall");
+                            state.phase = Phase::Falling;
+                        }
+                    }
+                    Phase::Falling => {
+                        all_done = false;
+                        if character.motion.movement_is_complete() {
+                            character.animation.set_appearance(
+                                character.input_symbol,
+                                Some(ColorPair::fg_only(state.final_color)),
+                            );
+                            state.phase = Phase::Done;
+                        } else {
+                            let progress = character
+                                .motion
+                                .query_path("fall")
+                                .map(|p| {
+                                    if p.max_steps > 0 {
+                                        p.current_step as f64 / p.max_steps as f64
+                                    } else {
+                                        1.0
+                                    }
+                                })
+                                .unwrap_or(1.0);
+                            let color = state
+                                .fall_gradient
+                                .get_color_at_fraction(progress)
+                                .unwrap_or(state.final_color);
+                            character.animation.set_appearance(
+                                character.input_symbol,
+                                Some(ColorPair::fg_only(color)),
+                            );
+                        }
+                    }
+                    Phase::Done => {}
                 }
+            }
+
+            if all_done || tick >= MAX_FRAMES {
+                break;
             }
 
             terminal.tick();
-
-            // Phase transitions once a path finishes.
-            for idx in 0..char_count {
-                let character = &mut terminal.characters[idx];
-                match phases[idx] {
-                    Phase::Launching if character.motion.movement_is_complete() => {
-                        character.animation.activate_scene("explode");
-                        character.motion.activate_path("explode");
-                        phases[idx] = Phase::Exploding;
-                    }
-                    Phase::Exploding if character.motion.movement_is_complete() => {
-                        character.animation.activate_scene("fall");
-                        character.motion.activate_path("input");
-                        phases[idx] = Phase::Falling;
-                    }
-                    Phase::Falling
-                        if character.motion.movement_is_complete()
-                            && character.animation.active_scene_is_complete() =>
-                    {
-                        phases[idx] = Phase::Done;
-                    }
-                    _ => {}
-                }
-            }
-
-            frames_out.push(terminal.get_formatted_output_string());
-
-            if phases.iter().all(|phase| *phase == Phase::Done) {
-                break;
-            }
+            frames.push(terminal.render_frame());
+            tick += 1;
         }
 
-        frames_out
+        frames
     }
 }

@@ -3,78 +3,77 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::{cursor, execute, terminal};
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 
-/// ttfx — terminal text effects (Rust port of TTE).
-#[derive(Parser)]
-#[command(name = "ttfx", version, about = "Apply visual effects to text piped over stdin.")]
+use ttfx::effects::registry;
+
+/// ttfx — terminal text effects (Rust port of TerminalTextEffects).
+#[derive(Parser, Debug)]
+#[command(name = "ttfx", version, about)]
 struct Cli {
-    /// Name of the effect to run.
+    /// Name of the effect to run. Omit to list available effects.
     effect: Option<String>,
 
-    /// Frames per second used when playing back effect frames.
-    #[arg(long, default_value_t = 60)]
-    frame_rate: u64,
+    /// Milliseconds between frames.
+    #[arg(long, default_value_t = 40)]
+    frame_delay: u64,
 
-    /// List available effects and exit.
-    #[arg(long)]
-    list: bool,
+    /// Print frames without clearing the screen between them.
+    #[arg(long, default_value_t = false)]
+    no_clear: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
-    let effects = ttfx::effects::registry();
-
-    if cli.list || cli.effect.is_none() {
-        println!("available effects:");
-        if effects.is_empty() {
-            println!("  (none registered yet)");
-        }
-        for effect in &effects {
-            println!("  {}", effect.name());
-        }
-        return;
-    }
-
-    let name = cli.effect.unwrap();
 
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() || input.trim().is_empty() {
         input = String::from("ttfx");
     }
 
-    match effects.iter().find(|e| e.name() == name) {
-        Some(effect) => {
-            let frames = effect.frames(&input);
-            if let Err(err) = play(&frames, cli.frame_rate) {
-                eprintln!("error: {err}");
-                std::process::exit(1);
+    let effects = registry();
+
+    let Some(name) = cli.effect else {
+        if effects.is_empty() {
+            eprintln!("no effects registered yet");
+        } else {
+            eprintln!("available effects:");
+            for effect in &effects {
+                eprintln!("  {}", effect.name());
             }
         }
-        None => {
-            eprintln!("unknown effect: {name}");
-            eprintln!("run with --list to see available effects");
-            std::process::exit(1);
+        std::process::exit(1);
+    };
+
+    let Some(effect) = effects.iter().find(|e| e.name() == name) else {
+        eprintln!("unknown effect: {name}");
+        if effects.is_empty() {
+            eprintln!("(no effects registered yet)");
+        } else {
+            eprintln!("available effects:");
+            for effect in &effects {
+                eprintln!("  {}", effect.name());
+            }
         }
-    }
-}
+        std::process::exit(1);
+    };
 
-fn play(frames: &[String], frame_rate: u64) -> io::Result<()> {
-    let mut out = io::stdout();
-    let delay = Duration::from_millis(1000 / frame_rate.max(1));
-
-    execute!(out, cursor::Hide)?;
+    let frames = effect.frames(&input);
+    let mut stdout = io::stdout();
     for frame in frames {
-        execute!(
-            out,
-            terminal::Clear(terminal::ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-        write!(out, "{frame}")?;
-        out.flush()?;
-        thread::sleep(delay);
+        if !cli.no_clear {
+            let _ = execute!(stdout, Clear(ClearType::All), MoveTo(0, 0));
+        }
+        let _ = write!(stdout, "{frame}");
+        if cli.no_clear {
+            let _ = writeln!(stdout);
+        }
+        let _ = stdout.flush();
+        thread::sleep(Duration::from_millis(cli.frame_delay));
     }
-    execute!(out, cursor::Show)?;
-    writeln!(out)?;
-    Ok(())
+    let _ = writeln!(stdout);
 }

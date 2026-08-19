@@ -1,24 +1,29 @@
-//! Wipe effect: performs a directional wipe across the canvas, revealing the
-//! input text group by group with a fade-through gradient (port of the Python
-//! `effect_wipe.py`, default direction `diagonal_bottom_left_to_top_right`).
+//! Wipe effect: performs a directional wipe across the terminal, revealing
+//! characters column by column while fading them through a gradient toward
+//! their final color. Port of terminaltexteffects/effects/effect_wipe.py.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Gradient stops matching the Python defaults ("833ab4", "fd1d1d", "fcb045").
-const FINAL_GRADIENT_STOPS: [&str; 3] = ["833ab4", "fd1d1d", "fcb045"];
-/// Interpolation steps between gradient stops (Python default: 12).
+/// Number of interpolation steps between gradient stops (Python:
+/// `final_gradient_steps`).
 const FINAL_GRADIENT_STEPS: usize = 12;
-/// Ticks each gradient frame is held (Python `final_gradient_frames`, default 5).
-const FINAL_GRADIENT_FRAMES: u32 = 5;
-/// Ticks to wait between activating wipe groups (Python `wipe_delay`, default 0).
-const WIPE_DELAY: u32 = 0;
-/// Hard cap so a bug can never spin forever.
-const MAX_FRAMES: usize = 20_000;
 
+/// Ticks each gradient frame is shown (Python: `final_gradient_frames`).
+const FINAL_GRADIENT_FRAMES: u32 = 5;
+
+/// Ticks to wait between wiping each group (Python: `wipe_delay`, default 0).
+const WIPE_DELAY: u32 = 0;
+
+/// Safety cap on the number of rendered frames.
+const MAX_FRAMES: usize = 4000;
+
+/// The wipe effect. Wipes the text from left to right (the Python default
+/// `wipe_direction = "column_left_to_right"`), styling each character with a
+/// gradient scene that settles on its final gradient color.
 pub struct Wipe;
 
 impl Wipe {
@@ -26,11 +31,19 @@ impl Wipe {
         Wipe
     }
 
-    fn gradient_stops() -> Vec<Color> {
-        FINAL_GRADIENT_STOPS
-            .iter()
-            .filter_map(|hex| Color::from_hex(hex))
-            .collect()
+    /// Default gradient stops shared with the Python effect defaults.
+    fn gradient_stops() -> [Color; 3] {
+        [
+            Color::from_hex("833ab4").expect("valid hex"),
+            Color::from_hex("fd1d1d").expect("valid hex"),
+            Color::from_hex("fcb045").expect("valid hex"),
+        ]
+    }
+}
+
+impl Default for Wipe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -41,104 +54,83 @@ impl Effect for Wipe {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let height = terminal.canvas.height as i32;
 
-        let stops = Self::gradient_stops();
-        let final_gradient = Gradient::new(&stops, FINAL_GRADIENT_STEPS);
+        if terminal.get_characters().is_empty() {
+            return vec![terminal.render_frame()];
+        }
 
-        // Build the per-character wipe scenes: a fade from the first gradient
-        // stop through to the character's final color (mapped vertically, as
-        // in the Python coordinate color mapping with Direction.VERTICAL).
+        let final_gradient = Gradient::new(&Self::gradient_stops(), FINAL_GRADIENT_STEPS);
+        let base_color = *final_gradient
+            .spectrum
+            .first()
+            .expect("gradient spectrum is non-empty");
+        let height = terminal.canvas.height;
+
+        // --- build(): per-character final color and wipe gradient scene -----
         for character in terminal.get_characters_mut() {
-            let fraction = if height > 1 {
+            // Vertical coordinate-based color mapping, mirroring
+            // Gradient.build_coordinate_color_mapping(..., Direction.VERTICAL).
+            let t = if height > 1 {
                 (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
-                0.0
+                1.0
             };
-            let final_color = final_gradient
-                .get_color_at_fraction(fraction)
-                .or_else(|| stops.last().copied());
+            let final_color = final_gradient.get_color_at_fraction(t).unwrap_or(base_color);
 
-            let mut wipe_stops: Vec<Color> = Vec::new();
-            if let Some(first) = stops.first() {
-                wipe_stops.push(*first);
-            }
-            if let Some(color) = final_color {
-                wipe_stops.push(color);
-            }
-            let wipe_gradient = Gradient::new(&wipe_stops, FINAL_GRADIENT_STEPS);
-
+            // Gradient from the first spectrum color to this character's
+            // final color; one frame per color (apply_gradient_to_symbols).
+            let wipe_gradient = Gradient::new(&[base_color, final_color], FINAL_GRADIENT_STEPS);
             let symbol = character.input_symbol;
             let scene = character.animation.new_scene("wipe", false);
-            if wipe_gradient.spectrum.is_empty() {
-                scene.add_frame(symbol, FINAL_GRADIENT_FRAMES, ColorPair::default(), false);
-            } else {
-                for color in &wipe_gradient.spectrum {
-                    scene.add_frame(
-                        symbol,
-                        FINAL_GRADIENT_FRAMES,
-                        ColorPair::fg(*color),
-                        false,
-                    );
-                }
+            for color in &wipe_gradient.spectrum {
+                scene.add_frame(symbol, FINAL_GRADIENT_FRAMES, Some(ColorPair::fg_only(*color)));
             }
         }
 
-        // Group characters along diagonals running bottom-left to top-right.
-        // In TTE coordinates row 1 is the bottom, so the diagonal index
-        // (column + row) is smallest at the bottom-left corner and the wipe
-        // sweeps toward the top-right.
-        let mut diagonal_groups: HashMap<i32, Vec<usize>> = HashMap::new();
+        // --- grouping: column_left_to_right ---------------------------------
+        let mut columns: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
         for character in terminal.get_characters() {
-            let key = character.input_coord.column + character.input_coord.row;
-            diagonal_groups
-                .entry(key)
+            columns
+                .entry(character.input_coord.column)
                 .or_default()
                 .push(character.character_id);
         }
-        let mut keys: Vec<i32> = diagonal_groups.keys().copied().collect();
-        keys.sort_unstable();
-        let mut pending_groups: Vec<Vec<usize>> = keys
-            .into_iter()
-            .map(|key| {
-                let mut group = diagonal_groups.remove(&key).unwrap_or_default();
-                group.sort_unstable();
-                group
-            })
-            .collect();
-        pending_groups.reverse(); // pop() takes from the back, so reverse for FIFO order.
+        // Within a column, order top-to-bottom (row descending) like the
+        // Python COLUMN_LEFT_TO_RIGHT grouping. Ids were allocated in
+        // top-to-bottom reading order, so allocation order already matches;
+        // sort explicitly to be safe.
+        let groups: Vec<Vec<u32>> = columns.into_values().collect();
 
+        // --- frame loop ------------------------------------------------------
         let mut frames: Vec<String> = Vec::new();
-        let mut delay: u32 = 0;
+        let mut group_index: usize = 0;
+        let mut wipe_delay_remaining: u32 = 0;
 
         loop {
-            if !pending_groups.is_empty() {
-                if delay == 0 {
-                    if let Some(group) = pending_groups.pop() {
-                        for character_id in group {
-                            terminal.set_character_visibility(character_id, true);
-                            if let Some(character) = terminal
-                                .get_characters_mut()
-                                .iter_mut()
-                                .find(|c| c.character_id == character_id)
-                            {
-                                character.animation.activate_scene("wipe");
-                            }
+            if group_index < groups.len() {
+                if wipe_delay_remaining == 0 {
+                    // Reveal the next group and start its wipe scenes.
+                    let group = &groups[group_index];
+                    for id in group {
+                        terminal.set_character_visibility(*id, true);
+                    }
+                    for character in terminal.get_characters_mut() {
+                        if group.contains(&character.character_id) {
+                            character.animation.activate_scene("wipe");
                         }
                     }
-                    delay = WIPE_DELAY;
+                    group_index += 1;
+                    wipe_delay_remaining = WIPE_DELAY;
                 } else {
-                    delay -= 1;
+                    wipe_delay_remaining -= 1;
                 }
             }
 
-            let active = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
+            terminal.tick();
+            frames.push(terminal.render_frame());
 
-            if pending_groups.is_empty() && active == 0 {
-                break;
-            }
-            if frames.len() >= MAX_FRAMES {
+            let done = group_index >= groups.len() && !terminal.is_active();
+            if done || frames.len() >= MAX_FRAMES {
                 break;
             }
         }

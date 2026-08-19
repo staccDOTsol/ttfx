@@ -1,12 +1,17 @@
-//! EffectCharacter: one input character with animation + motion state.
+//! EffectCharacter: one input character with animation and motion state.
 
-use crate::engine::animation::{Animation, CharacterVisual};
+use crate::engine::animation::Animation;
 use crate::engine::motion::Motion;
 use crate::utils::geometry::Coord;
 
-#[derive(Clone, Debug)]
+/// Stable identifier for a character; allocation order matches input order.
+pub type CharacterId = u32;
+
+/// A single character from the input, with its home coordinate,
+/// visibility, animation, and motion state.
+#[derive(Debug, Clone)]
 pub struct EffectCharacter {
-    pub character_id: usize,
+    pub character_id: CharacterId,
     pub input_symbol: char,
     pub input_coord: Coord,
     pub is_visible: bool,
@@ -15,8 +20,8 @@ pub struct EffectCharacter {
 }
 
 impl EffectCharacter {
-    pub fn new(character_id: usize, input_symbol: char, input_coord: Coord) -> Self {
-        EffectCharacter {
+    pub fn new(character_id: CharacterId, input_symbol: char, input_coord: Coord) -> Self {
+        Self {
             character_id,
             input_symbol,
             input_coord,
@@ -26,18 +31,14 @@ impl EffectCharacter {
         }
     }
 
-    /// Advance animation and motion by one tick.
-    pub fn tick(&mut self) {
-        self.animation.step_animation();
-        self.motion.move_char();
-    }
-
-    /// A character is active while it still has animation or motion pending.
+    /// True while the character has motion or animation work remaining.
     pub fn is_active(&self) -> bool {
-        !(self.animation.active_scene_is_complete() && self.motion.movement_is_complete())
+        !self.motion.movement_is_complete() || !self.animation.active_scene_is_complete()
     }
 
-    pub fn current_visual(&self) -> CharacterVisual {
-        self.animation.current_visual.clone()
+    /// Advance motion and animation by one tick.
+    pub fn tick(&mut self) {
+        self.motion.move_();
+        self.animation.step_animation();
     }
 }

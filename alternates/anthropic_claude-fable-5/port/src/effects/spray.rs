@@ -1,97 +1,80 @@
-//! Spray effect: characters are sprayed onto the canvas from a single origin
-//! point, travelling to their input coordinates while shifting color from a
-//! random spray color to their final gradient color.
+//! Spray effect (port of terminaltexteffects/effects/effect_spray.py).
 //!
-//! Port of terminaltexteffects/effects/effect_spray.py (defaults: east spray
-//! position, movement speed uniform in [0.4, 1.0], out_expo easing, final
-//! gradient 8A008A -> 00D1FF -> FFFFFF with 12 steps, vertical direction,
-//! spray volume 0.005).
+//! Characters are sprayed from a single point on the canvas edge toward their
+//! input coordinates at varying speeds. Each droplet cycles through a short
+//! highlight gradient before settling on its final gradient color.
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
-use crate::utils::easing;
+use crate::utils::easing::{self, EasingFunction};
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Small deterministic xorshift64 PRNG (the crate has no rand dependency).
-struct Rng {
-    state: u64,
-}
+/// Default final gradient stops from the Python original.
+const FINAL_GRADIENT_STOPS: [&str; 3] = ["8A008A", "00D1FF", "FFFFFF"];
+const FINAL_GRADIENT_STEPS: usize = 12;
+/// Highlight color applied to characters while they are in flight.
+const HIGHLIGHT_COLOR: &str = "88F7E2";
+/// Fraction of the character count released (at most) per tick.
+const SPRAY_VOLUME: f64 = 0.005;
+/// Movement speed range (cells per tick), as in the Python defaults.
+const MOVEMENT_SPEED: (f64, f64) = (0.4, 1.0);
+/// Droplet gradient steps between highlight and final color.
+const DROPLET_GRADIENT_STEPS: usize = 7;
+/// Ticks each droplet gradient frame is held.
+const DROPLET_FRAME_DURATION: u32 = 3;
+/// Safety bound on total rendered frames.
+const MAX_FRAMES: usize = 5000;
+/// Fixed seed so effect output is deterministic run-to-run.
+const SEED: u64 = 0x5EED_5EED_1234_ABCD;
 
-impl Rng {
+/// Small deterministic PRNG (LCG) standing in for Python's `random` module.
+struct Lcg(u64);
+
+impl Lcg {
     fn new(seed: u64) -> Self {
-        Rng {
-            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
-        }
+        Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
     }
 
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// Uniform float in [lo, hi), mirroring Python's random.uniform.
+    /// Uniform float in `[lo, hi)`.
     fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.next_f64()
+        lo + (hi - lo) * (self.next_u32() as f64 / (u32::MAX as f64 + 1.0))
     }
 
-    /// Inclusive integer range, mirroring Python's random.randint.
-    fn randint(&mut self, lo: usize, hi: usize) -> usize {
+    /// Uniform integer in `[lo, hi]` (inclusive), like Python's `randint`.
+    fn randint(&mut self, lo: u32, hi: u32) -> u32 {
         if hi <= lo {
-            lo
-        } else {
-            lo + (self.next_u64() % (hi - lo + 1) as u64) as usize
+            return lo;
         }
+        lo + self.next_u32() % (hi - lo + 1)
     }
 
-    /// Mirror of Python's random.choice.
-    fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[self.randint(0, items.len() - 1)]
-    }
-
-    /// Fisher-Yates, mirroring Python's random.shuffle.
+    /// Fisher-Yates shuffle, like Python's `random.shuffle`.
     fn shuffle<T>(&mut self, items: &mut [T]) {
         if items.len() < 2 {
             return;
         }
         for i in (1..items.len()).rev() {
-            let j = self.randint(0, i);
+            let j = self.randint(0, i as u32) as usize;
             items.swap(i, j);
         }
     }
 }
 
-/// Sprays the characters from a single point (east edge by default).
-pub struct Spray {
-    /// Fraction of total characters that may spawn per frame (min 1).
-    spray_volume: f64,
-    /// Range for per-character movement speed.
-    movement_speed: (f64, f64),
-    /// Interpolation steps between the final gradient stops.
-    final_gradient_steps: usize,
-}
+/// The spray effect.
+pub struct Spray;
 
 impl Spray {
     pub fn new() -> Self {
-        Spray {
-            spray_volume: 0.005,
-            movement_speed: (0.4, 1.0),
-            final_gradient_steps: 12,
-        }
-    }
-}
-
-impl Default for Spray {
-    fn default() -> Self {
-        Spray::new()
+        Spray
     }
 }
 
@@ -102,85 +85,91 @@ impl Effect for Spray {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut rng = Rng::new(0x5EED_5EED_5EED_5EED);
+        let mut rng = Lcg::new(SEED);
 
-        let stops = [
-            Color::from_hex("8A008A").expect("valid hex"),
-            Color::from_hex("00D1FF").expect("valid hex"),
-            Color::from_hex("FFFFFF").expect("valid hex"),
-        ];
-        let final_gradient = Gradient::new(&stops, self.final_gradient_steps);
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
+        // Default spray position "e": the east edge at the vertical center,
+        // matching the Python spray_position default.
+        let spray_origin = Coord::new(width, (height + 1) / 2);
 
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
-        // Default spray position: east edge, vertically centered
-        // (Python: Coord(canvas.right - 1, canvas.top // 2)).
-        let origin = Coord::new((width - 1).max(1), (height / 2).max(1));
+        let stops: Vec<Color> = FINAL_GRADIENT_STOPS
+            .iter()
+            .filter_map(|hex| Color::from_hex(hex))
+            .collect();
+        let final_gradient = Gradient::new(&stops, FINAL_GRADIENT_STEPS);
+        let highlight =
+            Color::from_hex(HIGHLIGHT_COLOR).unwrap_or(Color::new(0x88, 0xF7, 0xE2));
 
-        // --- build: give every character a path from the origin to its input
-        // coord plus a droplet color scene; activation is deferred to spawn
-        // time so unspawned characters stay inert.
-        let mut pending: Vec<usize> = Vec::new();
+        // --- build(): place every character at the spray origin, give it a
+        // path back to its input coordinate and a droplet gradient scene. ---
+        let mut pending: Vec<u32> = Vec::new();
         for character in terminal.get_characters_mut() {
-            // Vertical final-gradient direction: color by row fraction.
+            // Vertical final-gradient direction: color chosen by row fraction.
             let fraction = if height > 1 {
                 (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
-                1.0
+                0.0
             };
             let final_color = final_gradient
                 .get_color_at_fraction(fraction)
-                .unwrap_or(stops[stops.len() - 1]);
+                .unwrap_or(highlight);
 
-            character.motion.current_coord = origin;
+            character.motion.current_coord = spray_origin;
 
-            let speed = rng.uniform(self.movement_speed.0, self.movement_speed.1);
-            let path = character
-                .motion
-                .new_path("input_coord", speed, Some(easing::out_expo));
-            path.add_waypoint(character.input_coord);
+            let speed = rng.uniform(MOVEMENT_SPEED.0, MOVEMENT_SPEED.1);
+            let path = character.motion.new_path(
+                "input_coord",
+                speed,
+                Some(easing::out_expo as EasingFunction),
+            );
+            path.new_waypoint("input_coord", character.input_coord);
 
-            // Droplet scene: random spectrum color fading into the final color.
-            let start_color = *rng.choice(&final_gradient.spectrum);
-            let spray_gradient = Gradient::new(&[start_color, final_color], 25);
+            // Droplet scene: highlight -> final color; the scene's last frame
+            // (the final gradient color) persists once the scene completes,
+            // so settled characters remain styled.
+            let symbol = character.input_symbol;
+            let droplet_gradient =
+                Gradient::new(&[highlight, final_color], DROPLET_GRADIENT_STEPS);
             let scene = character.animation.new_scene("droplet", false);
-            for color in &spray_gradient.spectrum {
-                scene.add_frame(character.input_symbol, 3, ColorPair::fg(*color), false);
+            for color in &droplet_gradient.spectrum {
+                scene.add_frame(
+                    symbol,
+                    DROPLET_FRAME_DURATION,
+                    Some(ColorPair::fg_only(*color)),
+                );
             }
 
             pending.push(character.character_id);
         }
         rng.shuffle(&mut pending);
 
-        let volume = ((pending.len() as f64 * self.spray_volume) as usize).max(1);
+        let volume = ((pending.len() as f64 * SPRAY_VOLUME) as u32).max(1);
 
-        // --- run: spawn a random handful each frame, tick, render.
-        let mut frames: Vec<String> = Vec::new();
-        let mut safety = 0usize;
-        loop {
+        // --- frame loop: release a random number of droplets each tick. ---
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+
+        while (!pending.is_empty() || terminal.is_active()) && frames.len() < MAX_FRAMES {
             if !pending.is_empty() {
-                let count = rng.randint(1, volume);
-                for _ in 0..count {
-                    let Some(id) = pending.pop() else { break };
+                let release_count = rng.randint(1, volume) as usize;
+                for _ in 0..release_count {
+                    let Some(id) = pending.pop() else {
+                        break;
+                    };
                     if let Some(character) = terminal
-                        .characters
+                        .get_characters_mut()
                         .iter_mut()
                         .find(|c| c.character_id == id)
                     {
+                        character.is_visible = true;
                         character.animation.activate_scene("droplet");
                         character.motion.activate_path("input_coord");
                     }
-                    terminal.set_character_visibility(id, true);
                 }
             }
-
-            let active = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
-
-            safety += 1;
-            if (pending.is_empty() && active == 0) || safety > 20_000 {
-                break;
-            }
+            terminal.tick();
+            frames.push(terminal.render_frame());
         }
 
         frames

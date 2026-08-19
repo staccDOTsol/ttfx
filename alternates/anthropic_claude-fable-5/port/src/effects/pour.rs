@@ -1,14 +1,10 @@
-//! Pour effect (port of terminaltexteffects/effects/effect_pour.py).
+//! Pour effect: characters pour down from the top of the canvas into place,
+//! row by row in an alternating zig-zag order, shifting from a starting color
+//! to a final vertical gradient color as they fall.
 //!
-//! Characters are grouped by row from the top of the canvas to the bottom.
-//! Each group is poured into place: characters start at the top edge of the
-//! canvas and fall to their input coordinate, released a few at a time with a
-//! configurable gap between releases. Rows alternate pour direction
-//! (left-to-right, then right-to-left) like liquid filling a vessel. While a
-//! character falls it animates through a gradient from the starting color to
-//! its final color, which is drawn from a vertical gradient across the canvas.
+//! Port of terminaltexteffects/effects/effect_pour.py (pour_direction=down).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
@@ -16,47 +12,45 @@ use crate::utils::easing;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
+/// The `pour` effect with upstream default configuration.
 pub struct Pour {
-    /// Number of characters released per pour tick.
+    /// Characters released per pour tick.
     pour_speed: usize,
-    /// Speed of the falling characters along their path.
+    /// Speed of the falling characters (cells per tick).
     movement_speed: f64,
-    /// Frames to wait between character releases.
+    /// Frames to wait between releasing characters.
     gap: u32,
-    /// Color characters start with while pouring.
+    /// Color of characters when they first appear.
     starting_color: Color,
-    /// Stops for the final gradient applied across the canvas (vertical).
+    /// Stops for the final (vertical) gradient across the canvas.
     final_gradient_stops: Vec<Color>,
     /// Interpolation steps between final gradient stops.
     final_gradient_steps: usize,
-    /// Steps used for each character's pour (starting -> final) gradient.
-    pour_gradient_steps: usize,
-    /// Frame duration for each pour gradient step.
-    pour_frame_duration: u32,
+    /// Ticks each pour-gradient step is displayed.
+    final_gradient_frames: u32,
 }
 
 impl Pour {
     pub fn new() -> Self {
-        Pour {
+        Self {
             pour_speed: 1,
             movement_speed: 0.2,
             gap: 1,
-            starting_color: Color::new(0xFF, 0xFF, 0xFF),
+            starting_color: Color::from_hex("ffffff").expect("valid hex"),
             final_gradient_stops: vec![
-                Color::new(0x8A, 0x00, 0x8A),
-                Color::new(0x00, 0xD1, 0xFF),
-                Color::new(0xFF, 0xFF, 0xFF),
+                Color::from_hex("8A008A").expect("valid hex"),
+                Color::from_hex("00D1FF").expect("valid hex"),
+                Color::from_hex("FFFFFF").expect("valid hex"),
             ],
             final_gradient_steps: 12,
-            pour_gradient_steps: 10,
-            pour_frame_duration: 5,
+            final_gradient_frames: 10,
         }
     }
 }
 
 impl Default for Pour {
     fn default() -> Self {
-        Pour::new()
+        Self::new()
     }
 }
 
@@ -67,119 +61,117 @@ impl Effect for Pour {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let height = terminal.canvas.height as i32;
-        let top_row = height;
+        let height = terminal.canvas.height;
+        let top = height;
 
+        // Final gradient mapped vertically across the canvas rows.
         let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
-
-        // Group characters by row, top-to-bottom, columns ascending; alternate
-        // the pour direction on every other row.
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        {
-            let characters = terminal.get_characters();
-            for (group_index, row) in (1..=height).rev().enumerate() {
-                let mut members: Vec<(i32, usize)> = characters
-                    .iter()
-                    .filter(|c| c.input_coord.row == row)
-                    .map(|c| (c.input_coord.column, c.character_id))
-                    .collect();
-                members.sort_by_key(|(column, _)| *column);
-                let mut ids: Vec<usize> = members.into_iter().map(|(_, id)| id).collect();
-                if group_index % 2 == 1 {
-                    ids.reverse();
-                }
-                if !ids.is_empty() {
-                    groups.push(ids);
-                }
-            }
-        }
-
-        // Prepare each character: hidden, positioned at the top of its column,
-        // with a path to its input coordinate and a pour gradient scene.
-        for character in terminal.get_characters_mut() {
-            character.is_visible = false;
-            let input_coord = character.input_coord;
-            let symbol = character.input_symbol;
-
+        let mut final_color_map: HashMap<u32, Color> = HashMap::new();
+        for character in terminal.get_characters() {
             let fraction = if height > 1 {
-                (height - input_coord.row) as f64 / (height - 1) as f64
+                (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
-                0.0
+                1.0
             };
-            let final_color = final_gradient
+            let color = final_gradient
                 .get_color_at_fraction(fraction)
                 .unwrap_or(self.starting_color);
+            final_color_map.insert(character.character_id, color);
+        }
 
-            let start_coord = Coord::new(input_coord.column, top_row);
-            character.motion.current_coord = start_coord;
+        // Group characters by row, top to bottom; columns ascending within a row.
+        let mut placements: Vec<(u32, i32, i32)> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| (c.character_id, c.input_coord.row, c.input_coord.column))
+            .collect();
+        placements.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut current_row: Option<i32> = None;
+        for (id, row, _col) in placements {
+            if current_row != Some(row) {
+                groups.push(Vec::new());
+                current_row = Some(row);
+            }
+            groups.last_mut().expect("group exists").push(id);
+        }
+        // Alternate pour direction per row (odd-indexed rows pour right-to-left).
+        let mut pending_groups: VecDeque<Vec<u32>> = VecDeque::new();
+        for (i, mut group) in groups.into_iter().enumerate() {
+            if i % 2 != 0 {
+                group.reverse();
+            }
+            pending_groups.push_back(group);
+        }
+
+        // Per-character setup: start at the top, path to home, pour gradient scene.
+        for character in terminal.get_characters_mut() {
+            character.motion.current_coord = Coord::new(character.input_coord.column, top);
 
             let path = character
                 .motion
                 .new_path("input_coord", self.movement_speed, Some(easing::in_quad));
-            path.add_waypoint(start_coord);
-            path.add_waypoint(input_coord);
+            path.new_waypoint("input_coord", character.input_coord);
 
-            let pour_gradient =
-                Gradient::new(&[self.starting_color, final_color], self.pour_gradient_steps);
+            let final_color = final_color_map
+                .get(&character.character_id)
+                .copied()
+                .unwrap_or(self.starting_color);
+            let pour_gradient = Gradient::new(&[self.starting_color, final_color], 10);
             let scene = character.animation.new_scene("pour", false);
-            let last = pour_gradient.spectrum.len().saturating_sub(1);
-            for (idx, color) in pour_gradient.spectrum.iter().enumerate() {
-                let duration = if idx == last {
-                    1
-                } else {
-                    self.pour_frame_duration
-                };
-                scene.add_frame(symbol, duration, ColorPair::fg(*color), false);
+            for color in &pour_gradient.spectrum {
+                scene.add_frame(
+                    character.input_symbol,
+                    self.final_gradient_frames,
+                    Some(ColorPair::fg_only(*color)),
+                );
             }
         }
 
-        // Run the effect: release characters group by group with a gap between
-        // releases, ticking the terminal and capturing a frame each iteration.
+        // Frame loop: release characters with the configured gap, then tick.
         let mut frames: Vec<String> = Vec::new();
-        let mut pending_groups: VecDeque<Vec<usize>> = groups.into();
-        let mut current_group: VecDeque<usize> = VecDeque::new();
-        let mut gap_timer: u32 = 0;
+        let mut current_group: Vec<u32> = Vec::new();
+        let mut gap_remaining: u32 = 0;
         let max_frames = 20_000usize;
 
         loop {
+            let has_pending = !pending_groups.is_empty() || !current_group.is_empty();
+            if (!has_pending && !terminal.is_active()) || frames.len() >= max_frames {
+                break;
+            }
+
             if current_group.is_empty() {
                 if let Some(group) = pending_groups.pop_front() {
-                    current_group = group.into();
+                    current_group = group;
                 }
             }
 
             if !current_group.is_empty() {
-                if gap_timer == 0 {
+                if gap_remaining == 0 {
                     for _ in 0..self.pour_speed.max(1) {
-                        let Some(id) = current_group.pop_front() else {
+                        if current_group.is_empty() {
                             break;
-                        };
+                        }
+                        let id = current_group.remove(0);
                         terminal.set_character_visibility(id, true);
                         if let Some(character) = terminal
                             .get_characters_mut()
                             .iter_mut()
                             .find(|c| c.character_id == id)
                         {
-                            character.motion.activate_path("input_coord");
                             character.animation.activate_scene("pour");
+                            character.motion.activate_path("input_coord");
                         }
                     }
-                    gap_timer = self.gap;
+                    gap_remaining = self.gap;
                 } else {
-                    gap_timer -= 1;
+                    gap_remaining -= 1;
                 }
             }
 
             terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
-
-            let any_active = terminal.get_characters().iter().any(|c| c.is_active());
-            if current_group.is_empty() && pending_groups.is_empty() && !any_active {
-                break;
-            }
-            if frames.len() >= max_frames {
-                break;
-            }
+            frames.push(terminal.render_frame());
         }
 
         frames

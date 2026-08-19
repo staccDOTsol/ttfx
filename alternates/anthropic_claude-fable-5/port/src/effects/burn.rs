@@ -1,96 +1,69 @@
-//! Burn: the text ignites from the bottom of each column and burns upward,
-//! each character cycling through fire symbols and colors before cooling
-//! into its final gradient color.
+//! Burn effect (port of terminaltexteffects/effects/effect_burn.py).
 //!
-//! Port of terminaltexteffects/effects/effect_burn.py. The Python effect
-//! sets every character visible in the starting color, orders characters by
-//! popping the bottom-most character from a randomly chosen column, then per
-//! frame releases a few characters whose "burn" scene (fire gradient over the
-//! vertical build symbols) is followed — on scene completion — by a "burned"
-//! scene fading from the ember color to the character's final gradient color.
-//! The engine here has no event handler, so the scene-complete transition is
-//! driven directly from the frame loop.
-
-use std::collections::{HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+//! Characters start visible in a dim "unburned" color, then ignite one after
+//! another from the bottom of each column upward, left to right. Each burning
+//! character cycles through a vertical build order of block symbols colored by
+//! a fire gradient, then cools from the last fire color into its final
+//! gradient color.
 
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Symbols a character cycles through while burning (Python: vertical_build_order).
+/// Color of the text before it ignites (Python: `starting_color`).
+const STARTING_COLOR: &str = "837373";
+
+/// Fire gradient stops, white-hot through ember (Python: `burn_colors`).
+const BURN_COLORS: [&str; 5] = ["ffffff", "fff75d", "fe650d", "8A003C", "510100"];
+
+/// Final gradient stops applied vertically (Python: `final_gradient_stops`).
+const FINAL_GRADIENT_STOPS: [&str; 2] = ["00c3ff", "ffff1c"];
+
+/// Symbols the character passes through while burning
+/// (Python: `vertical_build_order`).
 const VERTICAL_BUILD_ORDER: [char; 9] = ['\'', '.', '▖', '▙', '█', '▜', '▀', '▝', '.'];
 
-/// Ticks each burn-scene frame is held.
-const BURN_FRAME_DURATION: u32 = 2;
-/// Ticks each burned-scene (cool-down) frame is held.
-const BURNED_FRAME_DURATION: u32 = 5;
-/// Interpolation steps between burned ember color and the final color.
-const BURNED_GRADIENT_STEPS: usize = 8;
+/// Ticks each burn frame is held.
+const FRAME_DURATION: u32 = 2;
 
-/// Minimal PRNG (LCG) standing in for Python's `random` module.
-struct Rng(u64);
+/// Small deterministic PRNG standing in for Python's `random.randint`,
+/// used to stagger how many characters ignite per tick.
+struct Lcg(u64);
 
-impl Rng {
-    fn new() -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9e37_79b9_7f4a_7c15);
-        Rng(seed | 1)
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn next_u32(&mut self) -> u32 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        self.0 >> 11
+        (self.0 >> 33) as u32
     }
 
-    /// Uniform value in `0..n` (n >= 1).
-    fn gen_range(&mut self, n: usize) -> usize {
-        (self.next_u64() % n.max(1) as u64) as usize
-    }
-
-    /// Python-style inclusive randint.
-    fn randint(&mut self, lo: usize, hi: usize) -> usize {
-        lo + self.gen_range(hi - lo + 1)
+    /// Uniform value in `lo..=hi`.
+    fn range_inclusive(&mut self, lo: u32, hi: u32) -> u32 {
+        if hi <= lo {
+            return lo;
+        }
+        lo + self.next_u32() % (hi - lo + 1)
     }
 }
 
-pub struct Burn {
-    starting_color: Color,
-    burn_colors: Vec<Color>,
-    final_gradient_stops: Vec<Color>,
-    final_gradient_steps: usize,
-}
+/// The burn effect.
+pub struct Burn;
 
 impl Burn {
     pub fn new() -> Self {
-        Burn {
-            // Defaults from BurnConfig.
-            starting_color: Color::from_hex("837373").expect("valid hex"),
-            burn_colors: vec![
-                Color::from_hex("ffffff").expect("valid hex"),
-                Color::from_hex("fff75d").expect("valid hex"),
-                Color::from_hex("fe650d").expect("valid hex"),
-                Color::from_hex("8a003c").expect("valid hex"),
-                Color::from_hex("510100").expect("valid hex"),
-            ],
-            final_gradient_stops: vec![
-                Color::from_hex("00c3ff").expect("valid hex"),
-                Color::from_hex("ffff1c").expect("valid hex"),
-            ],
-            final_gradient_steps: 12,
-        }
+        Burn
     }
 }
 
 impl Default for Burn {
     fn default() -> Self {
-        Burn::new()
+        Self::new()
     }
 }
 
@@ -101,168 +74,108 @@ impl Effect for Burn {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut rng = Rng::new();
+        let height = terminal.canvas.height;
 
-        if terminal.get_characters().is_empty() {
-            return vec![terminal.get_formatted_output_string()];
-        }
-
-        // Text bounds for the vertical final-gradient mapping
-        // (Python: final_gradient.build_coordinate_color_mapping over the text extents).
-        let text_bottom = terminal
-            .get_characters()
+        let starting_color =
+            Color::from_hex(STARTING_COLOR).expect("valid starting color hex");
+        let burn_stops: Vec<Color> = BURN_COLORS
             .iter()
-            .map(|c| c.input_coord.row)
-            .min()
-            .expect("non-empty");
-        let text_top = terminal
-            .get_characters()
+            .map(|hex| Color::from_hex(hex).expect("valid burn color hex"))
+            .collect();
+        let final_stops: Vec<Color> = FINAL_GRADIENT_STOPS
             .iter()
-            .map(|c| c.input_coord.row)
-            .max()
-            .expect("non-empty");
+            .map(|hex| Color::from_hex(hex).expect("valid final gradient hex"))
+            .collect();
 
-        let fire_gradient = Gradient::new(&self.burn_colors, 12);
-        let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
-        let ember_color = *self.burn_colors.last().expect("burn colors non-empty");
+        let fire_gradient = Gradient::new(&burn_stops, 12);
+        let final_gradient = Gradient::new(&final_stops, 12);
+        let last_fire_color = *fire_gradient
+            .spectrum
+            .last()
+            .expect("fire gradient has stops");
 
-        // Group characters by column; within a column, the bottom-most character
-        // burns first (fire climbs upward).
-        let mut groups: HashMap<i32, Vec<(i32, usize)>> = HashMap::new();
-        for character in terminal.get_characters() {
-            groups
-                .entry(character.input_coord.column)
-                .or_default()
-                .push((character.input_coord.row, character.character_id));
-        }
-        let mut columns: Vec<i32> = groups.keys().copied().collect();
-        columns.sort_unstable();
-        for column in groups.values_mut() {
-            // Descending row order so pop() removes the bottom-most character.
-            column.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        }
-
-        // Python: while groups remain, pop the next character from a random
-        // non-empty column to build the pending order.
-        let mut pending: VecDeque<usize> = VecDeque::new();
-        loop {
-            let nonempty: Vec<i32> = columns
-                .iter()
-                .copied()
-                .filter(|c| !groups[c].is_empty())
-                .collect();
-            if nonempty.is_empty() {
-                break;
-            }
-            let col = nonempty[rng.gen_range(nonempty.len())];
-            if let Some((_, id)) = groups.get_mut(&col).and_then(|v| v.pop()) {
-                pending.push_back(id);
-            }
-        }
-
-        // Build scenes and set the starting appearance for every character.
-        let fire_spectrum_len = fire_gradient.spectrum.len();
+        // Build the burn scene for every character. The Python effect chains a
+        // "burn" scene into a "burned" cool-down scene via an event handler;
+        // here the cool-down frames are appended to the same scene so the
+        // whole sequence plays through in one activation.
         for character in terminal.get_characters_mut() {
-            let fraction = if text_top == text_bottom {
-                0.0
+            // Final color mapped by vertical position (bottom row -> first stop).
+            let row_fraction = if height > 1 {
+                (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
-                (character.input_coord.row - text_bottom) as f64
-                    / (text_top - text_bottom) as f64
+                0.0
             };
             let final_color = final_gradient
-                .get_color_at_fraction(fraction)
-                .unwrap_or(ember_color);
+                .get_color_at_fraction(row_fraction)
+                .unwrap_or(starting_color);
 
-            // Python: set_appearance(input_symbol, starting_color) + visible in build().
+            // Everything is visible in the unburned color from the start.
             character.is_visible = true;
-            character.animation.current_visual = CharacterVisual::new(
-                character.input_symbol,
-                false,
-                ColorPair::fg(self.starting_color),
-            );
+            character
+                .animation
+                .set_appearance(character.input_symbol, Some(ColorPair::fg_only(starting_color)));
 
             let input_symbol = character.input_symbol;
+            let scene = character.animation.new_scene("burn", false);
 
-            // "burn" scene: fire gradient swept across the vertical build symbols.
-            {
-                let burn_scn = character.animation.new_scene("burn", false);
-                for (i, color) in fire_gradient.spectrum.iter().enumerate() {
-                    let t = if fire_spectrum_len > 1 {
-                        i as f64 / (fire_spectrum_len - 1) as f64
-                    } else {
-                        0.0
-                    };
-                    let symbol_index =
-                        (t * (VERTICAL_BUILD_ORDER.len() - 1) as f64).round() as usize;
-                    burn_scn.add_frame(
-                        VERTICAL_BUILD_ORDER[symbol_index],
-                        BURN_FRAME_DURATION,
-                        ColorPair::fg(*color),
-                        false,
-                    );
-                }
+            // Fire phase: distribute the fire gradient across the vertical
+            // build order symbols (mirrors apply_gradient_to_symbols).
+            let n_colors = fire_gradient.spectrum.len();
+            for (i, color) in fire_gradient.spectrum.iter().enumerate() {
+                let symbol_index =
+                    (i * VERTICAL_BUILD_ORDER.len() / n_colors).min(VERTICAL_BUILD_ORDER.len() - 1);
+                scene.add_frame(
+                    VERTICAL_BUILD_ORDER[symbol_index],
+                    FRAME_DURATION,
+                    Some(ColorPair::fg_only(*color)),
+                );
             }
 
-            // "burned" scene: cool from the ember color to the final gradient color.
-            {
-                let burned_gradient =
-                    Gradient::new(&[ember_color, final_color], BURNED_GRADIENT_STEPS);
-                let burned_scn = character.animation.new_scene("burned", false);
-                for color in &burned_gradient.spectrum {
-                    burned_scn.add_frame(
-                        input_symbol,
-                        BURNED_FRAME_DURATION,
-                        ColorPair::fg(*color),
-                        false,
-                    );
-                }
+            // Cool-down phase: fade from the last ember color to the
+            // character's final gradient color on its own symbol.
+            let cooled = Gradient::new(&[last_fire_color, final_color], 12);
+            for color in &cooled.spectrum {
+                scene.add_frame(input_symbol, FRAME_DURATION, Some(ColorPair::fg_only(*color)));
             }
         }
 
-        // Frame loop. Python __next__: release a random 2..=4 pending characters
-        // per frame, activating their burn scene; the event handler chains the
-        // burned scene on SCENE_COMPLETE (done inline here).
-        let mut frames = vec![terminal.get_formatted_output_string()];
-        let mut safety = 0usize;
-        loop {
-            let animating = terminal
-                .get_characters()
-                .iter()
-                .any(|c| !c.animation.active_scene_is_complete());
-            if (pending.is_empty() && !animating) || safety > 40_000 {
-                break;
-            }
-            safety += 1;
+        // Ignition order: column left-to-right, row bottom-to-top.
+        let mut order: Vec<(i32, i32, u32)> = terminal
+            .get_characters()
+            .iter()
+            .map(|c| (c.input_coord.column, c.input_coord.row, c.character_id))
+            .collect();
+        order.sort();
+        // Reverse so `pop()` yields the front of the ignition order.
+        let mut pending: Vec<u32> = order.into_iter().rev().map(|(_, _, id)| id).collect();
 
-            let releases = rng.randint(2, 4);
-            for _ in 0..releases {
-                if let Some(id) = pending.pop_front() {
-                    if let Some(character) = terminal
-                        .get_characters_mut()
-                        .iter_mut()
-                        .find(|c| c.character_id == id)
-                    {
-                        character.animation.activate_scene("burn");
+        let mut rng = Lcg::new(0x5eed_0bad_c0ff_ee11);
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+
+        let max_frames = 10_000usize;
+        let mut count = 0usize;
+        while (!pending.is_empty() || terminal.is_active()) && count < max_frames {
+            // Ignite a few characters per tick (Python: random.randint(2, 4)).
+            let ignite_count = rng.range_inclusive(2, 4);
+            for _ in 0..ignite_count {
+                match pending.pop() {
+                    Some(id) => {
+                        if let Some(character) = terminal
+                            .get_characters_mut()
+                            .iter_mut()
+                            .find(|c| c.character_id == id)
+                        {
+                            character.is_visible = true;
+                            character.animation.activate_scene("burn");
+                        }
                     }
+                    None => break,
                 }
             }
-
             terminal.tick();
-
-            // SCENE_COMPLETE(burn) -> ACTIVATE_SCENE(burned)
-            for character in terminal.get_characters_mut() {
-                if character.animation.active_scene.as_deref() == Some("burn")
-                    && character
-                        .animation
-                        .query_scene("burn")
-                        .map(|s| s.complete)
-                        .unwrap_or(false)
-                {
-                    character.animation.activate_scene("burned");
-                }
-            }
-
-            frames.push(terminal.get_formatted_output_string());
+            frames.push(terminal.render_frame());
+            count += 1;
         }
 
         frames

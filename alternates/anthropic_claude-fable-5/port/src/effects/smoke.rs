@@ -1,62 +1,54 @@
-//! Smoke: characters rise from the bottom of the canvas as drifting wisps of
-//! smoke, meandering upward before condensing into the input text.
+//! Smoke effect: characters rise from the bottom of the canvas as drifting
+//! wisps of smoke, wandering upward along jittered paths while cycling
+//! through smoke symbols and a gray gradient, before condensing into their
+//! final, gradient-colored form at their input coordinates.
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
-use crate::utils::geometry::Coord;
+use crate::utils::geometry::{find_length_of_line, Coord};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Symbols cycled while a character is in its "smoke" state.
-const SMOKE_SYMBOLS: [char; 7] = ['.', ':', '*', 'o', '~', '°', '·'];
-
-/// Small deterministic PRNG (splitmix-style LCG) so the effect needs no
-/// external crates while still looking organic.
-struct Lcg {
-    state: u64,
-}
+/// Small deterministic PRNG (LCG) so the effect is reproducible without an
+/// external rng module.
+struct Lcg(u64);
 
 impl Lcg {
     fn new(seed: u64) -> Self {
-        Lcg {
-            state: seed | 1, // never zero
-        }
+        Lcg(seed | 1)
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self
-            .state
+        self.0 = self
+            .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        (self.state >> 33) as u32
+        (self.0 >> 33) as u32
     }
 
-    fn next_f64(&mut self) -> f64 {
-        self.next_u32() as f64 / u32::MAX as f64
-    }
-
-    /// Inclusive integer range.
-    fn range_i32(&mut self, lo: i32, hi: i32) -> i32 {
+    /// Inclusive range [lo, hi].
+    fn gen_range(&mut self, lo: i32, hi: i32) -> i32 {
         if hi <= lo {
             return lo;
         }
-        lo + (self.next_u32() % ((hi - lo + 1) as u32)) as i32
+        let span = (hi - lo + 1) as u32;
+        lo + (self.next_u32() % span) as i32
     }
 
-    fn range_usize(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next_u32() as usize) % n
-        }
+    fn gen_f64(&mut self) -> f64 {
+        self.next_u32() as f64 / u32::MAX as f64
     }
 
-    fn shuffle(&mut self, items: &mut [usize]) {
+    fn choice<T: Copy>(&mut self, items: &[T]) -> T {
+        items[(self.next_u32() as usize) % items.len()]
+    }
+
+    fn shuffle<T>(&mut self, items: &mut [T]) {
         if items.len() < 2 {
             return;
         }
         for i in (1..items.len()).rev() {
-            let j = self.range_usize(i + 1);
+            let j = (self.next_u32() as usize) % (i + 1);
             items.swap(i, j);
         }
     }
@@ -70,11 +62,7 @@ impl Smoke {
     }
 }
 
-impl Default for Smoke {
-    fn default() -> Self {
-        Smoke::new()
-    }
-}
+const SMOKE_SYMBOLS: [char; 10] = ['\'', '.', ':', ';', '~', '*', '░', '▒', '▓', '░'];
 
 impl Effect for Smoke {
     fn name(&self) -> &str {
@@ -83,78 +71,36 @@ impl Effect for Smoke {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
+        let mut rng = Lcg::new(0x5EED_C0DE_5EED_C0DE);
 
-        // Seed the PRNG deterministically from the input so runs are repeatable.
-        let seed = input
-            .bytes()
-            .fold(0xC0FFEE_5EEDu64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        let mut rng = Lcg::new(seed);
-
-        // Grays for the rising smoke, and a final gradient for the settled text.
+        // Final colors: a vertical gradient across the canvas rows.
+        let final_gradient = Gradient::new(
+            &[
+                Color::from_hex("8A008A").expect("valid hex"),
+                Color::from_hex("00D1FF").expect("valid hex"),
+                Color::from_hex("FFFFFF").expect("valid hex"),
+            ],
+            12,
+        );
+        // Smoke colors: dark gray thickening into pale gray.
         let smoke_gradient = Gradient::new(
             &[
-                Color::new(0x3B, 0x3B, 0x3B),
-                Color::new(0x7F, 0x7F, 0x7F),
-                Color::new(0xBF, 0xBF, 0xBF),
-                Color::new(0xEE, 0xEE, 0xEE),
+                Color::from_hex("434343").expect("valid hex"),
+                Color::from_hex("767676").expect("valid hex"),
+                Color::from_hex("B2B2B2").expect("valid hex"),
             ],
             8,
         );
-        let final_gradient = Gradient::new(
-            &[
-                Color::from_hex("8A008A").unwrap_or(Color::new(0x8A, 0x00, 0x8A)),
-                Color::from_hex("00D1FF").unwrap_or(Color::new(0x00, 0xD1, 0xFF)),
-                Color::from_hex("FFFFFF").unwrap_or(Color::new(0xFF, 0xFF, 0xFF)),
-            ],
-            10,
-        );
-        let settle_gray = Color::new(0xD0, 0xD0, 0xD0);
+        let fallback_gray = Color::new(120, 120, 120);
+        let fallback_final = Color::new(255, 255, 255);
 
-        // --- build: motion paths and animation scenes for every character ---
+        // Configure each character: a wandering upward path plus a smoke scene.
         for character in terminal.get_characters_mut() {
             let input_coord = character.input_coord;
+            let input_symbol = character.input_symbol;
 
-            // Smoke starts near the bottom of the canvas, jittered horizontally.
-            let jitter = rng.range_i32(-2, 2);
-            let start_col = (input_coord.column + jitter).clamp(1, width);
-            let start = Coord::new(start_col, 1);
-            character.motion.current_coord = start;
-
-            // Rising path with a few horizontal drift waypoints on the way up.
-            let speed = 0.25 + rng.next_f64() * 0.45;
-            let drift_count = rng.range_i32(2, 4);
-            {
-                let path = character.motion.new_path("rise", speed, Some(easing::out_cubic));
-                path.add_waypoint(start);
-                for i in 1..=drift_count {
-                    let t = i as f64 / (drift_count + 1) as f64;
-                    let row = start.row
-                        + ((input_coord.row - start.row) as f64 * t).round() as i32;
-                    let col =
-                        (input_coord.column + rng.range_i32(-3, 3)).clamp(1, width);
-                    path.add_waypoint(Coord::new(col, row.clamp(1, height)));
-                }
-                path.add_waypoint(input_coord);
-            }
-
-            // Looping smoke scene: cycle wispy symbols through the gray gradient.
-            let symbol_offset = rng.range_usize(SMOKE_SYMBOLS.len());
-            {
-                let scene = character.animation.new_scene("smoke", true);
-                let last = SMOKE_SYMBOLS.len() - 1;
-                for i in 0..SMOKE_SYMBOLS.len() {
-                    let symbol = SMOKE_SYMBOLS[(i + symbol_offset) % SMOKE_SYMBOLS.len()];
-                    let fraction = if last == 0 { 0.0 } else { i as f64 / last as f64 };
-                    let color = smoke_gradient
-                        .get_color_at_fraction(fraction)
-                        .unwrap_or(settle_gray);
-                    scene.add_frame(symbol, 3, ColorPair::fg(color), false);
-                }
-            }
-
-            // Settle scene: the smoke condenses into the real character.
             let row_fraction = if height > 1 {
                 (input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
@@ -162,59 +108,99 @@ impl Effect for Smoke {
             };
             let final_color = final_gradient
                 .get_color_at_fraction(row_fraction)
-                .unwrap_or(settle_gray);
+                .unwrap_or(fallback_final);
+
+            // Start below/at the bottom row, near the character's column.
+            let start_col = (input_coord.column + rng.gen_range(-3, 3)).clamp(1, width);
+            let start_coord = Coord::new(start_col, 1);
+            character.motion.current_coord = start_coord;
+
+            let speed = 0.3 + rng.gen_f64() * 0.35;
+            let mut est_distance = 0.0;
             {
-                let scene = character.animation.new_scene("settle", false);
-                scene.add_frame(character.input_symbol, 3, ColorPair::fg(settle_gray), false);
-                scene.add_frame(character.input_symbol, 1, ColorPair::fg(final_color), true);
+                let path = character.motion.new_path("rise", speed, Some(easing::out_sine));
+                let mut prev = start_coord;
+                let wander_points = 3;
+                for i in 1..=wander_points {
+                    let t = i as f64 / (wander_points + 1) as f64;
+                    let row = (1.0 + (input_coord.row - 1) as f64 * t).round() as i32;
+                    let row = row.clamp(1, height);
+                    let col = (input_coord.column + rng.gen_range(-4, 4)).clamp(1, width);
+                    let coord = Coord::new(col, row);
+                    est_distance += find_length_of_line(prev, coord);
+                    path.new_waypoint(&format!("wander_{i}"), coord);
+                    prev = coord;
+                }
+                est_distance += find_length_of_line(prev, input_coord);
+                path.new_waypoint("input_coord", input_coord);
+            }
+
+            // Size the smoke animation to roughly match the travel time.
+            let est_steps = ((est_distance / speed).ceil() as u32).max(4);
+            let frame_duration = 3u32;
+            let smoke_frame_count = ((est_steps / frame_duration).max(4)).min(48) as usize;
+
+            {
+                let scene = character.animation.new_scene("smoke", false);
+                for k in 0..smoke_frame_count {
+                    let frac = if smoke_frame_count > 1 {
+                        k as f64 / (smoke_frame_count - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    let color = smoke_gradient
+                        .get_color_at_fraction(frac)
+                        .unwrap_or(fallback_gray);
+                    let symbol = rng.choice(&SMOKE_SYMBOLS);
+                    scene.add_frame(symbol, frame_duration, Some(ColorPair::fg_only(color)));
+                }
+                // Condense into the final, gradient-colored character.
+                scene.add_frame(input_symbol, 1, Some(ColorPair::fg_only(final_color)));
             }
         }
 
-        // Release order: shuffled so the smoke billows up unevenly.
-        let mut pending: Vec<usize> = (0..terminal.characters.len()).collect();
-        rng.shuffle(&mut pending);
-        let release_per_tick = (pending.len() / 25).max(1);
+        // Staggered activation: characters begin rising in shuffled order,
+        // a few per tick, like wisps peeling off a smoldering source.
+        let total = terminal.get_characters().len();
+        let mut order: Vec<usize> = (0..total).collect();
+        rng.shuffle(&mut order);
 
-        // --- run: release, tick, condense, render ---
-        let mut frames_out: Vec<String> = Vec::new();
+        let per_tick = (total / 40).max(1);
+        let max_frames = 1200usize;
+
+        let mut frames = Vec::new();
+        frames.push(terminal.render_frame());
+
+        let mut activated = 0usize;
+        let mut tick_count = 0usize;
         loop {
-            // Release the next batch of smoke wisps.
-            for _ in 0..release_per_tick {
-                if let Some(idx) = pending.pop() {
-                    let character = &mut terminal.characters[idx];
+            if activated < total {
+                for _ in 0..per_tick {
+                    if activated >= total {
+                        break;
+                    }
+                    let idx = order[activated];
+                    let characters = terminal.get_characters_mut();
+                    let character = &mut characters[idx];
                     character.is_visible = true;
                     character.motion.activate_path("rise");
                     character.animation.activate_scene("smoke");
-                } else {
-                    break;
+                    activated += 1;
                 }
             }
 
-            let active = terminal.tick();
+            terminal.tick();
+            frames.push(terminal.render_frame());
+            tick_count += 1;
 
-            // Characters that finished rising condense into their input symbol.
-            for character in terminal.get_characters_mut() {
-                if character.is_visible
-                    && character.motion.movement_is_complete()
-                    && character.animation.active_scene.as_deref() == Some("smoke")
-                {
-                    character.motion.current_coord = character.input_coord;
-                    character.animation.activate_scene("settle");
-                }
-            }
-
-            frames_out.push(terminal.get_formatted_output_string());
-
-            if pending.is_empty() && active == 0 {
+            if activated >= total && !terminal.is_active() {
                 break;
             }
-            if frames_out.len() > 20_000 {
-                break; // safety guard against runaway loops
+            if tick_count >= max_frames {
+                break;
             }
         }
 
-        // One final frame with everything settled at rest.
-        frames_out.push(terminal.get_formatted_output_string());
-        frames_out
+        frames
     }
 }

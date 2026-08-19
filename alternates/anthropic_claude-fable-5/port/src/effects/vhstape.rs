@@ -1,186 +1,59 @@
-//! vhstape: lines of text glitch horizontally like a worn VHS tape, the
-//! glitching intensifies into full waves, the screen dissolves into static
-//! snow, then the text is redrawn row by row in the final gradient.
-//!
-//! Port of terminaltexteffects/effects/effect_vhstape.py, adapted to the
-//! simplified engine in this crate.
+//! VHS tape glitch effect: rows of text glitch horizontally with tracking-line
+//! colors, a glitch wave sweeps the text, everything degrades to color noise,
+//! and finally the text restores row by row (port of effect_vhstape.py).
 
 use super::Effect;
-use crate::engine::motion::Motion;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const GLITCH_COLORS: [&str; 5] = ["ffffff", "ff0000", "00ff00", "0000ff", "ffffff"];
-const NOISE_COLORS: [&str; 6] = ["1e1e1f", "3c3b3d", "6d6c70", "a2a1a6", "cbc9cf", "ffffff"];
-const FINAL_STOPS: [&str; 3] = ["ab48ff", "e7b2b2", "fffebd"];
-const NOISE_SYMBOLS: [char; 4] = ['#', '*', '.', ':'];
+use std::collections::BTreeMap;
 
-/// Small deterministic xorshift PRNG so the effect is self-contained.
-struct Rng(u64);
+/// Small deterministic PRNG (LCG) so the effect needs no external crates.
+struct Lcg(u64);
 
-impl Rng {
+impl Lcg {
     fn new(seed: u64) -> Self {
-        Rng(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+        Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// Random usize in `[lo, hi)`.
-    fn gen_range(&mut self, lo: usize, hi: usize) -> usize {
-        if hi <= lo {
-            return lo;
-        }
-        lo + (self.next_u64() as usize) % (hi - lo)
-    }
-
-    /// True with probability `p`.
-    fn chance(&mut self, p: f64) -> bool {
-        ((self.next_u64() % 10_000) as f64 / 10_000.0) < p
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
     }
 }
 
-#[derive(Clone, Copy)]
-enum LineState {
-    Idle,
-    Out { left: bool, ticks: u32 },
-    Hold { left: bool, ticks: u32 },
-    Back { ticks: u32 },
-}
-
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaveState {
-    Waiting,
-    Mid(u32),
-    End(u32),
-    Home(u32),
+    Pending(u32),
+    Mid,
+    End,
+    Restoring,
     Done,
-}
-
-fn add_path(motion: &mut Motion, id: &str, speed: f64, coords: &[Coord]) {
-    let path = motion.new_path(id, speed, None);
-    for c in coords {
-        path.add_waypoint(*c);
-    }
-}
-
-fn render(terminal: &mut Terminal, frames: &mut Vec<String>) {
-    terminal.tick();
-    frames.push(terminal.get_formatted_output_string());
-}
-
-fn advance_lines(
-    states: &mut [LineState],
-    rows: &[Vec<usize>],
-    terminal: &mut Terminal,
-    rng: &mut Rng,
-) {
-    for i in 0..states.len() {
-        states[i] = match states[i] {
-            LineState::Idle => LineState::Idle,
-            LineState::Out { left, ticks } => {
-                if ticks <= 1 {
-                    LineState::Hold {
-                        left,
-                        ticks: 1 + (rng.next_u64() % 5) as u32,
-                    }
-                } else {
-                    LineState::Out {
-                        left,
-                        ticks: ticks - 1,
-                    }
-                }
-            }
-            LineState::Hold { left, ticks } => {
-                if ticks <= 1 {
-                    for &ci in &rows[i] {
-                        let ch = &mut terminal.characters[ci];
-                        ch.motion.activate_path(if left {
-                            "glitch_left_home"
-                        } else {
-                            "glitch_right_home"
-                        });
-                    }
-                    LineState::Back { ticks: 3 }
-                } else {
-                    LineState::Hold {
-                        left,
-                        ticks: ticks - 1,
-                    }
-                }
-            }
-            LineState::Back { ticks } => {
-                if ticks <= 1 {
-                    for &ci in &rows[i] {
-                        terminal.characters[ci].animation.activate_scene("base");
-                    }
-                    LineState::Idle
-                } else {
-                    LineState::Back { ticks: ticks - 1 }
-                }
-            }
-        };
-    }
-}
-
-fn advance_wave(states: &mut [WaveState], rows: &[Vec<usize>], terminal: &mut Terminal) {
-    for i in 0..states.len() {
-        states[i] = match states[i] {
-            WaveState::Waiting => WaveState::Waiting,
-            WaveState::Done => WaveState::Done,
-            WaveState::Mid(t) => {
-                if t <= 1 {
-                    for &ci in &rows[i] {
-                        terminal.characters[ci].motion.activate_path("wave_end");
-                    }
-                    WaveState::End(4)
-                } else {
-                    WaveState::Mid(t - 1)
-                }
-            }
-            WaveState::End(t) => {
-                if t <= 1 {
-                    for &ci in &rows[i] {
-                        terminal.characters[ci].motion.activate_path("wave_home");
-                    }
-                    WaveState::Home(3)
-                } else {
-                    WaveState::End(t - 1)
-                }
-            }
-            WaveState::Home(t) => {
-                if t <= 1 {
-                    for &ci in &rows[i] {
-                        terminal.characters[ci].animation.activate_scene("base");
-                    }
-                    WaveState::Done
-                } else {
-                    WaveState::Home(t - 1)
-                }
-            }
-        };
-    }
 }
 
 pub struct Vhstape;
 
 impl Vhstape {
     pub fn new() -> Self {
-        Vhstape
+        Self
     }
 }
 
-impl Default for Vhstape {
-    fn default() -> Self {
-        Vhstape::new()
-    }
+fn activate_scene(term: &mut Terminal, idx: usize, scene_id: &str) {
+    term.get_characters_mut()[idx].animation.activate_scene(scene_id);
+}
+
+fn activate_path(term: &mut Terminal, idx: usize, path_id: &str) {
+    term.get_characters_mut()[idx].motion.activate_path(path_id);
+}
+
+fn row_motion_done(term: &Terminal, row: &[usize]) -> bool {
+    row.iter()
+        .all(|&i| term.get_characters()[i].motion.movement_is_complete())
 }
 
 impl Effect for Vhstape {
@@ -189,208 +62,232 @@ impl Effect for Vhstape {
     }
 
     fn frames(&self, input: &str) -> Vec<String> {
-        let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut rng = Rng::new(0x5eed_cafe_1234_5678);
+        let mut term = Terminal::new(input, TerminalConfig::default());
         let mut frames: Vec<String> = Vec::new();
 
-        let glitch_colors: Vec<Color> = GLITCH_COLORS
+        // --- palettes (mirroring the Python defaults) -----------------------
+        let glitch_line_colors: Vec<Color> = ["ffffff", "ff0000", "00ff00", "0000ff", "ffffff"]
             .iter()
             .filter_map(|h| Color::from_hex(h))
             .collect();
-        let noise_colors: Vec<Color> = NOISE_COLORS
+        let noise_colors: Vec<Color> = ["1e1e1f", "3c3b3d", "6d6c70", "a2a1a6", "cb0003"]
             .iter()
             .filter_map(|h| Color::from_hex(h))
             .collect();
-        let stops: Vec<Color> = FINAL_STOPS
+        let final_stops: Vec<Color> = ["ab48ff", "ea551f", "82f2ff"]
             .iter()
             .filter_map(|h| Color::from_hex(h))
             .collect();
-        let final_gradient = Gradient::new(&stops, 12);
-        let height = terminal.canvas.height;
+        let final_gradient = Gradient::new(&final_stops, 12);
+        let noise_symbols = ['#', '*', '.', ':'];
         let white = Color::new(255, 255, 255);
 
-        // ---------- build: scenes and paths for every character ----------
-        for i in 0..terminal.characters.len() {
-            let (symbol, home) = {
-                let ch = &terminal.characters[i];
-                (ch.input_symbol, ch.input_coord)
-            };
-            let fraction = if height > 1 {
-                (home.row - 1) as f64 / (height - 1) as f64
-            } else {
-                0.0
-            };
-            let final_color = final_gradient.get_color_at_fraction(fraction).unwrap_or(white);
-
-            let ch = &mut terminal.characters[i];
-
-            {
-                let base = ch.animation.new_scene("base", false);
-                base.add_frame(symbol, 1, ColorPair::fg(final_color), false);
-            }
-            {
-                let glitch = ch.animation.new_scene("glitch", true);
-                for c in &glitch_colors {
-                    glitch.add_frame(symbol, 1, ColorPair::fg(*c), false);
-                }
-            }
-            {
-                let wave = ch.animation.new_scene("wave", true);
-                for c in &glitch_colors {
-                    wave.add_frame(symbol, 2, ColorPair::fg(*c), true);
-                }
-            }
-            {
-                let noise = ch.animation.new_scene("noise", true);
-                for _ in 0..25 {
-                    let s = NOISE_SYMBOLS[rng.gen_range(0, NOISE_SYMBOLS.len())];
-                    let c = noise_colors[rng.gen_range(0, noise_colors.len())];
-                    noise.add_frame(s, 2, ColorPair::fg(c), false);
-                }
-            }
-
-            let right = Coord::new(home.column + 4, home.row);
-            let left = Coord::new(home.column - 4, home.row);
-            let mid = Coord::new(home.column + 8, home.row);
-            let end = Coord::new(home.column + 14, home.row);
-            add_path(&mut ch.motion, "glitch_right", 2.0, &[home, right]);
-            add_path(&mut ch.motion, "glitch_right_home", 2.0, &[right, home]);
-            add_path(&mut ch.motion, "glitch_left", 2.0, &[home, left]);
-            add_path(&mut ch.motion, "glitch_left_home", 2.0, &[left, home]);
-            add_path(&mut ch.motion, "wave_mid", 2.0, &[home, mid]);
-            add_path(&mut ch.motion, "wave_end", 2.0, &[mid, end]);
-            add_path(&mut ch.motion, "wave_home", 7.0, &[end, home]);
-
-            ch.is_visible = true;
-            ch.animation.activate_scene("base");
-        }
-
-        // Group character indices by row, top row first.
-        let mut row_values: Vec<i32> = terminal
-            .characters
+        // --- gather character info ------------------------------------------
+        let infos: Vec<(usize, char, Coord)> = term
+            .get_characters()
             .iter()
-            .map(|c| c.input_coord.row)
-            .collect();
-        row_values.sort_unstable();
-        row_values.dedup();
-        row_values.reverse();
-        let rows: Vec<Vec<usize>> = row_values
-            .iter()
-            .map(|&r| {
-                terminal
-                    .characters
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.input_coord.row == r)
-                    .map(|(i, _)| i)
-                    .collect()
-            })
+            .enumerate()
+            .map(|(i, c)| (i, c.input_symbol, c.input_coord))
             .collect();
 
-        if rows.is_empty() {
-            frames.push(terminal.get_formatted_output_string());
+        if infos.is_empty() {
+            frames.push(term.render_frame());
             return frames;
         }
 
-        render(&mut terminal, &mut frames);
+        let min_row = infos.iter().map(|(_, _, c)| c.row).min().unwrap_or(1);
+        let max_row = infos.iter().map(|(_, _, c)| c.row).max().unwrap_or(1);
 
-        // ---------- phase 1: random line glitches ----------
-        let glitch_ticks = 150usize;
-        let mut states: Vec<LineState> = vec![LineState::Idle; rows.len()];
-        for _ in 0..glitch_ticks {
-            if rng.chance(0.06) {
-                let idx = rng.gen_range(0, rows.len());
-                if matches!(states[idx], LineState::Idle) {
-                    let left = rng.chance(0.5);
-                    for &ci in &rows[idx] {
-                        let ch = &mut terminal.characters[ci];
-                        ch.animation.activate_scene("glitch");
-                        ch.motion
-                            .activate_path(if left { "glitch_left" } else { "glitch_right" });
+        // group by row, then order rows top -> bottom
+        let mut by_row: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+        for (idx, _, coord) in &infos {
+            by_row.entry(coord.row).or_default().push(*idx);
+        }
+        let rows: Vec<Vec<usize>> = by_row.values().rev().cloned().collect();
+
+        // --- per-character scenes and paths ----------------------------------
+        for &(idx, symbol, coord) in &infos {
+            let fraction = if max_row == min_row {
+                0.0
+            } else {
+                (max_row - coord.row) as f64 / (max_row - min_row) as f64
+            };
+            let final_color = final_gradient.get_color_at_fraction(fraction).unwrap_or(white);
+
+            let ch = &mut term.get_characters_mut()[idx];
+
+            // stable/base appearance
+            let base = ch.animation.new_scene("base", false);
+            base.add_frame(symbol, 1, Some(ColorPair::fg_only(final_color)));
+
+            // glitch tracking-line flicker (white/red/green/blue/white)
+            let glitch = ch.animation.new_scene("glitch", false);
+            for _ in 0..2 {
+                for color in &glitch_line_colors {
+                    glitch.add_frame(symbol, 1, Some(ColorPair::fg_only(*color)));
+                }
+            }
+
+            // degraded snow/noise (looping)
+            let noise = ch.animation.new_scene("noise", true);
+            for (i, color) in noise_colors.iter().enumerate() {
+                let sym = noise_symbols[(idx + i) % noise_symbols.len()];
+                noise.add_frame(sym, 2, Some(ColorPair::fg_only(*color)));
+            }
+
+            // final restored appearance
+            let fin = ch.animation.new_scene("final", false);
+            fin.add_frame(symbol, 1, Some(ColorPair::fg_only(final_color)));
+
+            // motion paths
+            let p = ch.motion.new_path("glitch_left", 2.0, None);
+            p.new_waypoint("glitch_left", Coord::new(coord.column - 2, coord.row));
+            let p = ch.motion.new_path("glitch_right", 2.0, None);
+            p.new_waypoint("glitch_right", Coord::new(coord.column + 2, coord.row));
+            let p = ch.motion.new_path("glitch_wave_mid", 2.0, None);
+            p.new_waypoint("glitch_wave_mid", Coord::new(coord.column + 8, coord.row));
+            let p = ch.motion.new_path("glitch_wave_end", 2.0, None);
+            p.new_waypoint("glitch_wave_end", Coord::new(coord.column + 14, coord.row));
+            let p = ch.motion.new_path("restore", 2.0, None);
+            p.new_waypoint("restore", coord);
+
+            ch.animation.activate_scene("base");
+            ch.is_visible = true;
+        }
+
+        frames.push(term.render_frame());
+
+        let mut rng = Lcg::new(0x5644_5354_4150_4531);
+
+        // --- phase 1: intermittent row glitches -------------------------------
+        let mut active_glitches: Vec<(usize, u32)> = Vec::new();
+        for tick in 0..90u32 {
+            if tick % 12 == 0 && !rows.is_empty() {
+                let count = 1 + (rng.next_u32() % 2) as usize;
+                for _ in 0..count {
+                    let r = (rng.next_u32() as usize) % rows.len();
+                    if active_glitches.iter().any(|(rr, _)| *rr == r) {
+                        continue;
                     }
-                    states[idx] = LineState::Out { left, ticks: 3 };
-                }
-            }
-            advance_lines(&mut states, &rows, &mut terminal, &mut rng);
-            render(&mut terminal, &mut frames);
-        }
-        // Drain: let every glitching line return home.
-        let mut guard = 0;
-        while states.iter().any(|s| !matches!(s, LineState::Idle)) && guard < 200 {
-            advance_lines(&mut states, &rows, &mut terminal, &mut rng);
-            render(&mut terminal, &mut frames);
-            guard += 1;
-        }
-
-        // ---------- phase 2: glitch waves sweeping the rows ----------
-        for _wave in 0..2 {
-            let mut wstates = vec![WaveState::Waiting; rows.len()];
-            let mut front = 0usize;
-            let mut ticks = 0usize;
-            loop {
-                if front < rows.len() && ticks % 2 == 0 {
-                    for &ci in &rows[front] {
-                        let ch = &mut terminal.characters[ci];
-                        ch.animation.activate_scene("wave");
-                        ch.motion.activate_path("wave_mid");
+                    let path_id = if rng.next_u32() % 2 == 0 {
+                        "glitch_left"
+                    } else {
+                        "glitch_right"
+                    };
+                    for &ci in &rows[r] {
+                        activate_scene(&mut term, ci, "glitch");
+                        activate_path(&mut term, ci, path_id);
                     }
-                    wstates[front] = WaveState::Mid(5);
-                    front += 1;
-                }
-                advance_wave(&mut wstates, &rows, &mut terminal);
-                render(&mut terminal, &mut frames);
-                ticks += 1;
-                if front >= rows.len()
-                    && wstates.iter().all(|s| matches!(s, WaveState::Done))
-                {
-                    break;
-                }
-                if ticks > 2000 {
-                    break;
+                    active_glitches.push((r, 6));
                 }
             }
+            let mut restored: Vec<usize> = Vec::new();
+            for entry in &mut active_glitches {
+                if entry.1 > 0 {
+                    entry.1 -= 1;
+                }
+                if entry.1 == 0 {
+                    restored.push(entry.0);
+                }
+            }
+            active_glitches.retain(|e| e.1 > 0);
+            for r in restored {
+                for &ci in &rows[r] {
+                    activate_path(&mut term, ci, "restore");
+                    activate_scene(&mut term, ci, "base");
+                }
+            }
+            term.tick();
+            frames.push(term.render_frame());
+        }
+        // force-restore anything still glitching
+        for (r, _) in active_glitches.drain(..) {
+            for &ci in &rows[r] {
+                activate_path(&mut term, ci, "restore");
+                activate_scene(&mut term, ci, "base");
+            }
+        }
+        for _ in 0..6 {
+            term.tick();
+            frames.push(term.render_frame());
         }
 
-        // ---------- phase 3: dissolve into static snow ----------
-        let char_count = terminal.characters.len();
-        let mut snowing = vec![false; char_count];
-        let mut ticks = 0usize;
-        loop {
-            for i in 0..char_count {
-                if !snowing[i] && rng.chance(0.08) {
-                    terminal.characters[i].animation.activate_scene("noise");
-                    snowing[i] = true;
+        // --- phase 2: glitch wave sweeping top -> bottom ----------------------
+        let mut states: Vec<WaveState> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, _)| WaveState::Pending(i as u32 * 3))
+            .collect();
+        let mut safety = 0u32;
+        while states.iter().any(|s| *s != WaveState::Done) && safety < 2000 {
+            for r in 0..rows.len() {
+                match states[r] {
+                    WaveState::Pending(0) => {
+                        for &ci in &rows[r] {
+                            activate_scene(&mut term, ci, "glitch");
+                            activate_path(&mut term, ci, "glitch_wave_mid");
+                        }
+                        states[r] = WaveState::Mid;
+                    }
+                    WaveState::Pending(t) => {
+                        states[r] = WaveState::Pending(t - 1);
+                    }
+                    WaveState::Mid => {
+                        if row_motion_done(&term, &rows[r]) {
+                            for &ci in &rows[r] {
+                                activate_path(&mut term, ci, "glitch_wave_end");
+                            }
+                            states[r] = WaveState::End;
+                        }
+                    }
+                    WaveState::End => {
+                        if row_motion_done(&term, &rows[r]) {
+                            for &ci in &rows[r] {
+                                activate_path(&mut term, ci, "restore");
+                            }
+                            states[r] = WaveState::Restoring;
+                        }
+                    }
+                    WaveState::Restoring => {
+                        if row_motion_done(&term, &rows[r]) {
+                            for &ci in &rows[r] {
+                                activate_scene(&mut term, ci, "base");
+                            }
+                            states[r] = WaveState::Done;
+                        }
+                    }
+                    WaveState::Done => {}
                 }
             }
-            render(&mut terminal, &mut frames);
-            ticks += 1;
-            if snowing.iter().all(|&s| s) || ticks > 120 {
-                break;
-            }
-        }
-        for i in 0..char_count {
-            if !snowing[i] {
-                terminal.characters[i].animation.activate_scene("noise");
-            }
-        }
-        for _ in 0..40 {
-            render(&mut terminal, &mut frames);
+            term.tick();
+            frames.push(term.render_frame());
+            safety += 1;
         }
 
-        // ---------- phase 4: redraw rows bottom-to-top in the final gradient ----------
-        for row in rows.iter().rev() {
-            for &ci in row {
-                let ch = &mut terminal.characters[ci];
-                ch.motion.current_coord = ch.input_coord;
-                ch.animation.activate_scene("base");
-            }
-            render(&mut terminal, &mut frames);
-            render(&mut terminal, &mut frames);
+        // --- phase 3: full-screen tape noise ----------------------------------
+        let all_indices: Vec<usize> = infos.iter().map(|(i, _, _)| *i).collect();
+        for &ci in &all_indices {
+            activate_scene(&mut term, ci, "noise");
+        }
+        for _ in 0..30 {
+            term.tick();
+            frames.push(term.render_frame());
         }
 
-        // Hold the final image briefly.
-        for _ in 0..10 {
-            render(&mut terminal, &mut frames);
+        // --- phase 4: staggered restore, top -> bottom ------------------------
+        let mut started = vec![false; rows.len()];
+        let total_ticks = rows.len() * 2 + 6;
+        for tick in 0..total_ticks {
+            for (r, row) in rows.iter().enumerate() {
+                if !started[r] && tick >= r * 2 {
+                    started[r] = true;
+                    for &ci in row {
+                        activate_scene(&mut term, ci, "final");
+                    }
+                }
+            }
+            term.tick();
+            frames.push(term.render_frame());
         }
 
         frames

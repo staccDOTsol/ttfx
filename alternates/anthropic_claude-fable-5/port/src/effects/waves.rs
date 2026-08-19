@@ -1,49 +1,62 @@
-//! Waves effect: a wave of block symbols sweeps across the text column by
-//! column, leaving characters behind it fading into a final gradient color.
+//! Waves effect: waves of block symbols sweep across the text column by
+//! column, after which each character fades to its final gradient color.
 //!
-//! Port of terminaltexteffects/effects/effect_waves.py. The Python version
-//! chains a "wave" scene into a "final" scene via the event handler; this
-//! port concatenates both into a single scene per character, which yields the
-//! same visible sequence (wave symbols cycling `wave_count` times, then a fade
-//! from the last wave color to the character's final gradient color).
+//! Port of terminaltexteffects/effects/effect_waves.py.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Default wave symbols from the Python effect (rising then falling blocks).
-const WAVE_SYMBOLS: [char; 15] = [
-    '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂', '▁',
-];
-
-/// Number of times the wave symbol cycle repeats per character.
-const WAVE_COUNT: usize = 7;
-
-/// Ticks each wave frame is held (Python `wave_length`).
-const WAVE_LENGTH: u32 = 2;
-
-/// Interpolation steps for the wave gradient (Python `wave_gradient_steps`).
-const WAVE_GRADIENT_STEPS: usize = 6;
-
-/// Interpolation steps for the final gradient (Python `final_gradient_steps`).
-const FINAL_GRADIENT_STEPS: usize = 12;
-
-/// Steps in the per-character fade from wave color to final color.
-const FADE_STEPS: usize = 10;
-
-/// Ticks each fade frame is held.
-const FADE_FRAME_DURATION: u32 = 3;
-
-/// Safety cap so a pathological input can never loop forever.
-const MAX_FRAMES: usize = 20_000;
-
-pub struct Waves;
+/// Characters overlaid with waves that travel across the terminal, leaving
+/// behind the character colored with the final gradient.
+pub struct Waves {
+    /// Symbols used to build the wave (mirrors the Python default).
+    wave_symbols: Vec<char>,
+    /// Number of waves that pass over each character.
+    wave_count: usize,
+    /// Duration (ticks) of each wave frame.
+    wave_length: u32,
+    /// Gradient stops for the wave itself.
+    wave_gradient_stops: Vec<Color>,
+    /// Interpolation steps between wave gradient stops.
+    wave_gradient_steps: usize,
+    /// Gradient stops for the final character colors.
+    final_gradient_stops: Vec<Color>,
+    /// Interpolation steps between final gradient stops.
+    final_gradient_steps: usize,
+    /// Safety cap on the number of rendered frames.
+    max_frames: usize,
+}
 
 impl Waves {
     pub fn new() -> Self {
-        Waves
+        let hex = |s: &str| Color::from_hex(s).expect("valid hex color");
+        Self {
+            wave_symbols: vec![
+                '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '▇', '▆', '▅', '▄', '▃', '▂', '▁',
+            ],
+            wave_count: 7,
+            wave_length: 2,
+            wave_gradient_stops: vec![
+                hex("f0ff65"),
+                hex("ffb102"),
+                hex("31a0d4"),
+                hex("ffb102"),
+                hex("f0ff65"),
+            ],
+            wave_gradient_steps: 6,
+            final_gradient_stops: vec![hex("ffb102"), hex("31a0d4"), hex("f0ff65")],
+            final_gradient_steps: 12,
+            max_frames: 5000,
+        }
+    }
+}
+
+impl Default for Waves {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -57,117 +70,115 @@ impl Effect for Waves {
         let width = terminal.canvas.width;
         let height = terminal.canvas.height;
 
-        // Wave gradient (Python default stops: f0ff65 -> ffb102 -> 31a0d4 -> ffb102 -> f0ff65).
-        let wave_stops = [
-            Color::from_hex("f0ff65").expect("valid hex"),
-            Color::from_hex("ffb102").expect("valid hex"),
-            Color::from_hex("31a0d4").expect("valid hex"),
-            Color::from_hex("ffb102").expect("valid hex"),
-            Color::from_hex("f0ff65").expect("valid hex"),
-        ];
-        let wave_gradient = Gradient::new(&wave_stops, WAVE_GRADIENT_STEPS);
-        let wave_last_color = *wave_gradient
+        let wave_gradient = Gradient::new(&self.wave_gradient_stops, self.wave_gradient_steps);
+        let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
+        let wave_last_color = wave_gradient
             .spectrum
             .last()
-            .unwrap_or(&wave_stops[wave_stops.len() - 1]);
+            .copied()
+            .unwrap_or(Color::new(255, 255, 255));
 
-        // Final gradient (Python default stops: 833ab4 -> fd1d1d -> fcb045, diagonal direction).
-        let final_stops = [
-            Color::from_hex("833ab4").expect("valid hex"),
-            Color::from_hex("fd1d1d").expect("valid hex"),
-            Color::from_hex("fcb045").expect("valid hex"),
-        ];
-        let final_gradient = Gradient::new(&final_stops, FINAL_GRADIENT_STEPS);
-
-        // Build one scene per character: wave cycles followed by the fade to the
-        // character's final color (diagonal gradient mapping across the canvas).
-        let diagonal_denominator =
-            (width.saturating_sub(1) + height.saturating_sub(1)).max(1) as f64;
-        for character in terminal.get_characters_mut() {
-            let coord = character.input_coord;
-            let fraction = ((coord.column - 1).max(0) as f64 + (coord.row - 1).max(0) as f64)
-                / diagonal_denominator;
-            let final_color = final_gradient
-                .get_color_at_fraction(fraction)
-                .unwrap_or(final_stops[final_stops.len() - 1]);
-
-            let input_symbol = character.input_symbol;
-            let scene = character.animation.new_scene("wave", false);
-
-            // Wave frames: the wave gradient is spread across the symbol
-            // sequence (Python apply_gradient_to_symbols).
-            let symbol_count = WAVE_SYMBOLS.len();
-            for _ in 0..WAVE_COUNT {
-                for (index, symbol) in WAVE_SYMBOLS.iter().enumerate() {
-                    let symbol_fraction = if symbol_count > 1 {
-                        index as f64 / (symbol_count - 1) as f64
-                    } else {
-                        0.0
-                    };
-                    let color = wave_gradient
-                        .get_color_at_fraction(symbol_fraction)
-                        .unwrap_or(wave_last_color);
-                    scene.add_frame(*symbol, WAVE_LENGTH, ColorPair::fg(color), false);
-                }
-            }
-
-            // Fade frames: last wave color -> this character's final color.
-            let fade_gradient = Gradient::new(&[wave_last_color, final_color], FADE_STEPS);
-            for color in &fade_gradient.spectrum {
-                scene.add_frame(input_symbol, FADE_FRAME_DURATION, ColorPair::fg(*color), false);
-            }
+        // Map each character to a final color using a diagonal gradient
+        // direction across the canvas (Python default: DIAGONAL).
+        let mut final_color_map: HashMap<u32, Color> = HashMap::new();
+        let denom = (((width - 1) + (height - 1)).max(1)) as f64;
+        for character in terminal.get_characters() {
+            let t = ((character.input_coord.column - 1) + (character.input_coord.row - 1)) as f64
+                / denom;
+            let color = final_gradient
+                .get_color_at_fraction(t)
+                .unwrap_or(wave_last_color);
+            final_color_map.insert(character.character_id, color);
         }
 
-        // Group character ids into columns, left to right (Python
-        // CharacterGroup.COLUMN_LEFT_TO_RIGHT).
-        let mut column_indices: Vec<i32> = terminal
-            .get_characters()
-            .iter()
-            .map(|c| c.input_coord.column)
-            .collect();
-        column_indices.sort_unstable();
-        column_indices.dedup();
+        // Build the "wave" and "final" scenes for every character.
+        let symbol_count = self.wave_symbols.len();
+        for character in terminal.get_characters_mut() {
+            let input_symbol = character.input_symbol;
+            let final_color = final_color_map
+                .get(&character.character_id)
+                .copied()
+                .unwrap_or(wave_last_color);
 
-        let mut pending_columns: VecDeque<Vec<usize>> = column_indices
-            .iter()
-            .map(|column| {
-                terminal
-                    .get_characters()
-                    .iter()
-                    .filter(|c| c.input_coord.column == *column)
-                    .map(|c| c.character_id)
-                    .collect()
-            })
-            .collect();
-
-        // Run loop: release one column per tick, then step everything.
-        let mut frames: Vec<String> = Vec::new();
-        let mut active_count = 0usize;
-
-        while !pending_columns.is_empty() || active_count > 0 {
-            if let Some(column) = pending_columns.pop_front() {
-                for character_id in column {
-                    terminal.set_character_visibility(character_id, true);
-                    if let Some(character) = terminal
-                        .characters
-                        .iter_mut()
-                        .find(|c| c.character_id == character_id)
-                    {
-                        character.animation.activate_scene("wave");
+            // Wave scene: the wave symbols with the wave gradient applied
+            // across them, repeated wave_count times.
+            {
+                let wave_scn = character.animation.new_scene("wave", false);
+                for _ in 0..self.wave_count {
+                    for (i, &symbol) in self.wave_symbols.iter().enumerate() {
+                        let frac = if symbol_count > 1 {
+                            i as f64 / (symbol_count - 1) as f64
+                        } else {
+                            0.0
+                        };
+                        let color = wave_gradient
+                            .get_color_at_fraction(frac)
+                            .unwrap_or(wave_last_color);
+                        wave_scn.add_frame(
+                            symbol,
+                            self.wave_length,
+                            Some(ColorPair::fg_only(color)),
+                        );
                     }
                 }
             }
 
-            active_count = terminal.tick();
-            frames.push(terminal.get_formatted_output_string());
-
-            if frames.len() >= MAX_FRAMES {
-                break;
+            // Final scene: fade from the wave's last color to the
+            // character's final gradient color.
+            {
+                let fade = Gradient::new(&[wave_last_color, final_color], self.final_gradient_steps);
+                let final_scn = character.animation.new_scene("final", false);
+                for &color in &fade.spectrum {
+                    final_scn.add_frame(input_symbol, 10, Some(ColorPair::fg_only(color)));
+                }
             }
         }
 
-        // Hold the final resolved state for one extra frame.
-        frames.push(terminal.get_formatted_output_string());
+        // Group characters into columns, left to right.
+        let mut columns_map: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for character in terminal.get_characters() {
+            columns_map
+                .entry(character.input_coord.column)
+                .or_default()
+                .push(character.character_id);
+        }
+        let mut pending_columns: VecDeque<Vec<u32>> = columns_map.into_values().collect();
+
+        // Phase per character: 0 = pending, 1 = wave running, 2 = final.
+        let mut phase: HashMap<u32, u8> = HashMap::new();
+
+        let mut frames: Vec<String> = Vec::new();
+        while (!pending_columns.is_empty() || terminal.is_active())
+            && frames.len() < self.max_frames
+        {
+            // Activate the next column's wave scenes.
+            if let Some(column) = pending_columns.pop_front() {
+                let ids: HashSet<u32> = column.iter().copied().collect();
+                for character in terminal.get_characters_mut() {
+                    if ids.contains(&character.character_id) {
+                        character.is_visible = true;
+                        character.animation.activate_scene("wave");
+                        phase.insert(character.character_id, 1);
+                    }
+                }
+            }
+
+            terminal.tick();
+
+            // Emulate the Python SCENE_COMPLETE -> ACTIVATE_SCENE event:
+            // when a character's wave scene finishes, start its final fade.
+            for character in terminal.get_characters_mut() {
+                if phase.get(&character.character_id) == Some(&1)
+                    && character.animation.active_scene_id.is_none()
+                {
+                    character.animation.activate_scene("final");
+                    phase.insert(character.character_id, 2);
+                }
+            }
+
+            frames.push(terminal.render_frame());
+        }
+
         frames
     }
 }

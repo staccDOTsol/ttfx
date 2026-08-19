@@ -1,85 +1,90 @@
-//! Crumble: characters weaken into dust, crumble to the canvas floor, then the
-//! dust is vacuumed up through the center of the canvas and each character is
-//! restored to its input position with a strengthening flash.
+//! Crumble: characters weaken (fading through a gradient), crumble and fall
+//! to the canvas bottom as dust, are vacuumed into a ball at the canvas
+//! center, then flung back home while strengthening to their final color.
 //!
-//! Port of terminaltexteffects/effects/effect_crumble.py, driven manually
-//! (this engine has no event handlers), with phase logic in `frames()`.
+//! Port of terminaltexteffects/effects/effect_crumble.py, adapted to the
+//! simplified engine (no event handlers; the effect drives phases directly).
 
 use super::Effect;
-use crate::engine::animation::CharacterVisual;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
 use crate::utils::geometry::Coord;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-/// Small deterministic xorshift PRNG so the effect needs no external crates.
-struct Rng(u64);
+/// Deterministic little PRNG (replaces Python's `random`) so frames are
+/// reproducible without pulling in an external crate.
+struct Lcg(u64);
 
-impl Rng {
+impl Lcg {
     fn new(seed: u64) -> Self {
-        Rng(if seed == 0 { 0x5CE1FF } else { seed })
+        Self(seed)
     }
 
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
     }
 
-    /// Inclusive range `lo..=hi`.
-    fn gen_range(&mut self, lo: usize, hi: usize) -> usize {
-        if hi <= lo {
-            return lo;
-        }
-        lo + (self.next() as usize) % (hi - lo + 1)
+    fn next_f64(&mut self) -> f64 {
+        self.next_u32() as f64 / u32::MAX as f64
     }
 
-    fn shuffle<T>(&mut self, v: &mut [T]) {
-        if v.len() < 2 {
-            return;
-        }
-        for i in (1..v.len()).rev() {
-            let j = (self.next() as usize) % (i + 1);
-            v.swap(i, j);
+    fn range_f64(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.next_f64()
+    }
+
+    fn range_usize(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next_u32() as usize) % n
         }
     }
 }
 
-/// Per-character lifecycle stage, replacing the Python event-handler chains.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
-    Waiting,
+/// Multiply a color's channels by `factor` (mirrors
+/// `Animation.adjust_color_brightness` used by the Python effect to derive
+/// the weakened/dust colors from the final gradient color).
+fn adjust_brightness(color: Color, factor: f64) -> Color {
+    let f = |v: u8| ((v as f64) * factor).round().clamp(0.0, 255.0) as u8;
+    Color::new(f(color.r), f(color.g), f(color.b))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Idle,
     Weakening,
     Falling,
-    Fallen,
-    Rising,
+    Dust,
+    Gathering,
+    Ball,
     Returning,
-    Flashing,
-    Strengthening,
     Done,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Crumble,
-    Vacuum,
-    Complete,
+    Gather,
+    Hold,
+    Return,
+    End,
 }
 
 pub struct Crumble;
 
 impl Crumble {
     pub fn new() -> Self {
-        Crumble
+        Self
     }
 }
 
 impl Default for Crumble {
     fn default() -> Self {
-        Crumble::new()
+        Self::new()
     }
 }
 
@@ -90,214 +95,208 @@ impl Effect for Crumble {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut rng = Rng::new(0x00C4_0B13_5CE1);
-
-        let width = terminal.canvas.width as i32;
-        let height = terminal.canvas.height as i32;
+        let width = terminal.canvas.width;
+        let height = terminal.canvas.height;
         let center = terminal.canvas.center();
-        let bottom = 1i32;
-        let top = height;
+        let mut rng = Lcg::new(0xC0FF_EE00_5EED);
 
-        let white = Color::new(255, 255, 255);
-        // Upstream default final gradient stops: 5CE1FF -> FFFFFF, 12 steps, diagonal.
-        let final_gradient = Gradient::new(
-            &[Color::from_hex("5CE1FF").unwrap_or(white), white],
-            12,
-        );
-        let dust_colors = [
-            Color::from_hex("7d7d7d").unwrap_or(white),
-            Color::from_hex("766b69").unwrap_or(white),
-            Color::from_hex("848789").unwrap_or(white),
-            Color::from_hex("9E9E8D").unwrap_or(white),
+        // Final gradient (upstream defaults: 8A008A -> 00D1FF -> FFFFFF,
+        // applied diagonally across the canvas).
+        let stops = [
+            Color::from_hex("8A008A").expect("valid hex"),
+            Color::from_hex("00D1FF").expect("valid hex"),
+            Color::from_hex("FFFFFF").expect("valid hex"),
         ];
+        let final_gradient = Gradient::new(&stops, 12);
 
-        let char_count = terminal.get_characters().len();
-        let mut stages = vec![Stage::Waiting; char_count];
+        let n = terminal.get_characters().len();
+        if n == 0 {
+            return vec![terminal.render_frame()];
+        }
+        let mut states = vec![State::Idle; n];
 
-        // --- build: scenes and paths per character (Python __init__/build) ---
+        // Per-character setup: scenes, paths, initial styled appearance.
         {
-            let diagonal_span = ((width - 1) + (height - 1)).max(1) as f64;
-            for character in terminal.get_characters_mut() {
-                let col = character.input_coord.column;
-                let row = character.input_coord.row;
-                let fraction =
-                    (((col - 1) + (row - 1)) as f64 / diagonal_span).clamp(0.0, 1.0);
+            let denom = ((width - 1) + (height - 1)).max(1) as f64;
+            for ch in terminal.get_characters_mut().iter_mut() {
+                let frac =
+                    ((ch.input_coord.column - 1) + (ch.input_coord.row - 1)) as f64 / denom;
                 let final_color = final_gradient
-                    .get_color_at_fraction(fraction)
-                    .unwrap_or(white);
-                let dust_color = dust_colors[rng.gen_range(0, dust_colors.len() - 1)];
+                    .get_color_at_fraction(frac)
+                    .unwrap_or(stops[2]);
+                let weak_color = adjust_brightness(final_color, 0.65);
+                let dust_color = adjust_brightness(final_color, 0.55);
 
-                character.is_visible = true;
-                character.animation.current_visual = CharacterVisual::new(
-                    character.input_symbol,
-                    false,
-                    ColorPair::fg(final_color),
-                );
-
-                // "weaken": fade from the final color down to dust.
-                let weaken_gradient = Gradient::new(&[final_color, dust_color], 9);
-                let symbol = character.input_symbol;
+                // "weaken" scene: fade from the final color down to dust.
                 {
-                    let scene = character.animation.new_scene("weaken", false);
+                    let weaken_gradient =
+                        Gradient::new(&[final_color, weak_color, dust_color], 3);
+                    let scene = ch.animation.new_scene("weaken", false);
                     for color in &weaken_gradient.spectrum {
-                        scene.add_frame(symbol, 4, ColorPair::fg(*color), false);
-                    }
-                }
-                // "dust": resting dust visual while falling / lying on the floor.
-                {
-                    let scene = character.animation.new_scene("dust", false);
-                    scene.add_frame(symbol, 1, ColorPair::fg(dust_color), false);
-                }
-                // "strengthen_flash": quick surge from dust to white.
-                let flash_gradient = Gradient::new(&[dust_color, white], 6);
-                {
-                    let scene = character.animation.new_scene("strengthen_flash", false);
-                    for color in &flash_gradient.spectrum {
-                        scene.add_frame(symbol, 3, ColorPair::fg(*color), false);
-                    }
-                }
-                // "strengthen": settle from white back to the final color.
-                let strengthen_gradient = Gradient::new(&[white, final_color], 9);
-                {
-                    let scene = character.animation.new_scene("strengthen", false);
-                    for color in &strengthen_gradient.spectrum {
-                        scene.add_frame(symbol, 3, ColorPair::fg(*color), false);
+                        scene.add_frame(ch.input_symbol, 3, Some(ColorPair::fg_only(*color)));
                     }
                 }
 
-                // "fall": crumble to the canvas floor (Python: speed 0.2, out_bounce).
+                // "strengthen" scene: bright flash settling on the final color.
                 {
-                    let path = character.motion.new_path("fall", 0.2, Some(easing::out_cubic));
-                    path.add_waypoint(Coord::new(col, row));
-                    path.add_waypoint(Coord::new(col, bottom));
+                    let white = Color::new(0xFF, 0xFF, 0xFF);
+                    let strengthen_gradient = Gradient::new(&[white, final_color], 6);
+                    let scene = ch.animation.new_scene("strengthen", false);
+                    for color in &strengthen_gradient.spectrum {
+                        scene.add_frame(ch.input_symbol, 3, Some(ColorPair::fg_only(*color)));
+                    }
                 }
-                // "top": vacuumed up through the canvas center toward the top
-                // (Python used a bezier control at the center; approximated with
-                // an intermediate waypoint).
-                {
-                    let path = character.motion.new_path("top", 1.0, Some(easing::out_cubic));
-                    path.add_waypoint(Coord::new(col, bottom));
-                    path.add_waypoint(center);
-                    path.add_waypoint(Coord::new(col, top));
-                }
-                // "input": drift back down into the original position.
-                {
-                    let path = character.motion.new_path("input", 0.3, None);
-                    path.add_waypoint(Coord::new(col, top));
-                    path.add_waypoint(Coord::new(col, row));
-                }
+
+                // "fall" path: drop straight down with a bounce.
+                let fall_speed = rng.range_f64(0.2, 0.45);
+                let fall = ch.motion.new_path("fall", fall_speed, Some(easing::out_bounce));
+                fall.new_waypoint("bottom", Coord::new(ch.input_coord.column, 1));
+
+                // "gather" path: vacuumed toward the canvas center.
+                let gather_speed = rng.range_f64(0.3, 0.5);
+                let gather = ch.motion.new_path("gather", gather_speed, Some(easing::in_expo));
+                gather.new_waypoint("center", center);
+
+                // "input" path: flung back to the home coordinate.
+                let home = ch.motion.new_path("input", 0.4, Some(easing::out_cubic));
+                home.new_waypoint("home", ch.input_coord);
+
+                ch.animation
+                    .set_appearance(ch.input_symbol, Some(ColorPair::fg_only(final_color)));
+                ch.is_visible = true;
             }
         }
 
-        let mut pending: Vec<usize> = (0..char_count).collect();
-        rng.shuffle(&mut pending);
-        let mut vacuum_pending: Vec<usize> = Vec::new();
+        // Crumble order is shuffled; the vacuum sweeps left-to-right.
+        let mut crumble_order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = rng.range_usize(i + 1);
+            crumble_order.swap(i, j);
+        }
+        let mut gather_order: Vec<usize> = (0..n).collect();
+        gather_order.sort_by_key(|&i| {
+            let c = &terminal.get_characters()[i];
+            (c.input_coord.column, c.input_coord.row)
+        });
+        let return_order = gather_order.clone();
 
-        let mut phase = if char_count == 0 {
-            Phase::Complete
-        } else {
-            Phase::Crumble
-        };
+        let weaken_per_tick = (n / 40).max(1);
+        let gather_per_tick = (n / 25).max(1);
+        let return_per_tick = (n / 25).max(2);
+
+        let mut phase = Phase::Crumble;
+        let mut next_weaken = 0usize;
+        let mut next_gather = 0usize;
+        let mut next_return = 0usize;
+        let mut hold_ticks: u32 = 15;
 
         let mut frames: Vec<String> = Vec::new();
-        let mut frame_idx: u64 = 0;
-        let max_frames = 20_000usize;
+        frames.push(terminal.render_frame());
+        let max_frames = 3000usize;
 
-        for _ in 0..max_frames {
-            // --- phase logic (activations) ---
+        while phase != Phase::End && frames.len() < max_frames {
             match phase {
                 Phase::Crumble => {
-                    if frame_idx % 2 == 0 && !pending.is_empty() {
-                        let count = rng.gen_range(1, 3);
-                        for _ in 0..count {
-                            if let Some(idx) = pending.pop() {
-                                let character = &mut terminal.get_characters_mut()[idx];
-                                character.animation.activate_scene("weaken");
-                                stages[idx] = Stage::Weakening;
+                    // Stagger weaken activations.
+                    let mut launched = 0usize;
+                    while next_weaken < n && launched < weaken_per_tick {
+                        let idx = crumble_order[next_weaken];
+                        let ch = &mut terminal.get_characters_mut()[idx];
+                        ch.animation.activate_scene("weaken");
+                        states[idx] = State::Weakening;
+                        next_weaken += 1;
+                        launched += 1;
+                    }
+                    // Weakened characters crumble and fall.
+                    for idx in 0..n {
+                        match states[idx] {
+                            State::Weakening => {
+                                let ch = &mut terminal.get_characters_mut()[idx];
+                                if ch.animation.active_scene_is_complete() {
+                                    ch.motion.activate_path("fall");
+                                    states[idx] = State::Falling;
+                                }
+                            }
+                            State::Falling => {
+                                let ch = &terminal.get_characters()[idx];
+                                if ch.motion.movement_is_complete() {
+                                    states[idx] = State::Dust;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if states.iter().all(|s| *s == State::Dust) {
+                        phase = Phase::Gather;
+                    }
+                }
+                Phase::Gather => {
+                    // The vacuum sweeps across, pulling dust to the center.
+                    let mut launched = 0usize;
+                    while next_gather < n && launched < gather_per_tick {
+                        let idx = gather_order[next_gather];
+                        let ch = &mut terminal.get_characters_mut()[idx];
+                        ch.motion.activate_path("gather");
+                        states[idx] = State::Gathering;
+                        next_gather += 1;
+                        launched += 1;
+                    }
+                    for idx in 0..n {
+                        if states[idx] == State::Gathering {
+                            let ch = &terminal.get_characters()[idx];
+                            if ch.motion.movement_is_complete() {
+                                states[idx] = State::Ball;
                             }
                         }
                     }
-                    if pending.is_empty() && stages.iter().all(|s| *s == Stage::Fallen) {
-                        phase = Phase::Vacuum;
-                        vacuum_pending = (0..char_count).collect();
-                        rng.shuffle(&mut vacuum_pending);
+                    if states.iter().all(|s| *s == State::Ball) {
+                        phase = Phase::Hold;
                     }
                 }
-                Phase::Vacuum => {
-                    if !vacuum_pending.is_empty() {
-                        let count = rng.gen_range(1, 5);
-                        for _ in 0..count {
-                            if let Some(idx) = vacuum_pending.pop() {
-                                let character = &mut terminal.get_characters_mut()[idx];
-                                character.motion.activate_path("top");
-                                stages[idx] = Stage::Rising;
+                Phase::Hold => {
+                    if hold_ticks > 0 {
+                        hold_ticks -= 1;
+                    } else {
+                        phase = Phase::Return;
+                    }
+                }
+                Phase::Return => {
+                    let mut launched = 0usize;
+                    while next_return < n && launched < return_per_tick {
+                        let idx = return_order[next_return];
+                        let ch = &mut terminal.get_characters_mut()[idx];
+                        ch.motion.activate_path("input");
+                        ch.animation.activate_scene("strengthen");
+                        states[idx] = State::Returning;
+                        next_return += 1;
+                        launched += 1;
+                    }
+                    for idx in 0..n {
+                        if states[idx] == State::Returning {
+                            let ch = &terminal.get_characters()[idx];
+                            if ch.motion.movement_is_complete()
+                                && ch.animation.active_scene_is_complete()
+                            {
+                                states[idx] = State::Done;
                             }
                         }
                     }
-                    if vacuum_pending.is_empty() && stages.iter().all(|s| *s == Stage::Done) {
-                        phase = Phase::Complete;
+                    if states.iter().all(|s| *s == State::Done) {
+                        phase = Phase::End;
                     }
                 }
-                Phase::Complete => {}
+                Phase::End => {}
             }
 
-            // --- advance the simulation one tick ---
-            let active = terminal.tick();
-
-            // --- per-character stage transitions (event-handler replacement) ---
-            {
-                let characters = terminal.get_characters_mut();
-                for (idx, stage) in stages.iter_mut().enumerate() {
-                    let character = &mut characters[idx];
-                    match *stage {
-                        Stage::Weakening => {
-                            if character.animation.active_scene_is_complete() {
-                                character.animation.activate_scene("dust");
-                                character.motion.activate_path("fall");
-                                *stage = Stage::Falling;
-                            }
-                        }
-                        Stage::Falling => {
-                            if character.motion.movement_is_complete() {
-                                *stage = Stage::Fallen;
-                            }
-                        }
-                        Stage::Rising => {
-                            if character.motion.movement_is_complete() {
-                                character.motion.activate_path("input");
-                                *stage = Stage::Returning;
-                            }
-                        }
-                        Stage::Returning => {
-                            if character.motion.movement_is_complete() {
-                                character.animation.activate_scene("strengthen_flash");
-                                *stage = Stage::Flashing;
-                            }
-                        }
-                        Stage::Flashing => {
-                            if character.animation.active_scene_is_complete() {
-                                character.animation.activate_scene("strengthen");
-                                *stage = Stage::Strengthening;
-                            }
-                        }
-                        Stage::Strengthening => {
-                            if character.animation.active_scene_is_complete() {
-                                *stage = Stage::Done;
-                            }
-                        }
-                        Stage::Waiting | Stage::Fallen | Stage::Done => {}
-                    }
-                }
-            }
-
-            frames.push(terminal.get_formatted_output_string());
-            frame_idx += 1;
-
-            if phase == Phase::Complete && active == 0 {
+            if phase == Phase::End {
                 break;
             }
+            terminal.tick();
+            frames.push(terminal.render_frame());
         }
 
+        // Final settled frame with every character home and fully colored.
+        frames.push(terminal.render_frame());
         frames
     }
 }

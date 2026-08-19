@@ -1,53 +1,24 @@
-//! Beams effect (port of terminaltexteffects/effects/effect_beams.py).
-//!
-//! Light beams travel across rows and columns of the input text, illuminating
-//! each character as they pass and leaving it dimly lit. Once every beam has
-//! finished, a final wipe sweeps from the top row to the bottom, brightening
-//! every character to its final gradient color.
+//! Beams effect: light beams sweep across rows and down columns, illuminating
+//! characters as they pass. Illuminated characters fade to a dim version of
+//! their final color, then a final wipe brightens the text into the final
+//! gradient. Port of terminaltexteffects/effects/effect_beams.py.
 
-use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
 
 use super::Effect;
 use crate::engine::animation::Scene;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-// --- upstream defaults (BeamsConfig) -------------------------------------
-
-const BEAM_ROW_SYMBOLS: &[char] = &['▂', '▁', '_'];
-const BEAM_COLUMN_SYMBOLS: &[char] = &['▌', '▍', '▎', '▏'];
-const BEAM_DELAY: u32 = 10;
-const BEAM_ROW_SPEED_RANGE: (u64, u64) = (10, 40);
-const BEAM_COLUMN_SPEED_RANGE: (u64, u64) = (6, 10);
-const BEAM_GRADIENT_FRAMES: u32 = 2;
-const FINAL_GRADIENT_FRAMES: u32 = 5;
-const FINAL_WIPE_SPEED: usize = 1;
-const MAX_FRAMES: usize = 20_000;
-
-fn white() -> Color {
-    Color::new(0xFF, 0xFF, 0xFF)
-}
-
-fn cyan() -> Color {
-    Color::new(0x00, 0xD1, 0xFF)
-}
-
-fn purple() -> Color {
-    Color::new(0x8A, 0x00, 0x8A)
-}
-
-// --- tiny deterministic-fallback PRNG (no rand crate in this port) --------
+// ---------------------------------------------------------------------------
+// Small deterministic PRNG (xorshift64) — no external rand dependency.
+// ---------------------------------------------------------------------------
 
 struct Rng(u64);
 
 impl Rng {
-    fn new() -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        Rng(seed | 1)
+    fn new(seed: u64) -> Self {
+        Rng(if seed == 0 { 0x9e3779b97f4a7c15 } else { seed })
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -59,100 +30,112 @@ impl Rng {
         x
     }
 
-    /// Inclusive-range integer, mirroring Python's random.randint.
-    fn randint(&mut self, lo: u64, hi: u64) -> u64 {
-        if hi <= lo {
-            return lo;
-        }
-        lo + self.next_u64() % (hi - lo + 1)
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Mirrors Python's random.choice([True, False]).
-    fn coin(&mut self) -> bool {
-        self.next_u64() & 1 == 0
+    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.next_f64()
     }
 
-    /// Fisher-Yates shuffle, mirroring Python's random.shuffle.
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        if items.len() < 2 {
-            return;
-        }
-        for i in (1..items.len()).rev() {
-            let j = (self.next_u64() % (i as u64 + 1)) as usize;
-            items.swap(i, j);
-        }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
     }
 }
 
-// --- helpers ---------------------------------------------------------------
-
-/// Port of Scene.apply_gradient_to_symbols: one frame per gradient color,
-/// progressing through the symbols proportionally to gradient progress.
-fn apply_gradient_to_symbols(scene: &mut Scene, symbols: &[char], duration: u32, gradient: &Gradient) {
-    if symbols.is_empty() || gradient.spectrum.is_empty() {
+fn shuffle<T>(v: &mut [T], rng: &mut Rng) {
+    if v.len() < 2 {
         return;
     }
-    let n = gradient.spectrum.len();
-    for (i, color) in gradient.spectrum.iter().enumerate() {
-        let symbol_index = if n <= 1 {
-            symbols.len() - 1
-        } else {
-            ((i as f64 / (n - 1) as f64) * (symbols.len() - 1) as f64).round() as usize
-        };
-        let symbol = symbols[symbol_index.min(symbols.len() - 1)];
-        scene.add_frame(symbol, duration, ColorPair::fg(*color), false);
+    for i in (1..v.len()).rev() {
+        let j = rng.below(i + 1);
+        v.swap(i, j);
     }
 }
 
-/// Approximation of Animation.adjust_color_brightness(color, factor).
+// ---------------------------------------------------------------------------
+// Beam groups: one per row and one per column of the input text.
+// ---------------------------------------------------------------------------
+
+struct Group {
+    char_ids: Vec<u32>,
+    scene_id: &'static str,
+    next_index: usize,
+    counter: f64,
+    speed: f64,
+}
+
+impl Group {
+    fn complete(&self) -> bool {
+        self.next_index >= self.char_ids.len()
+    }
+
+    /// Advance the beam along its group, lighting up characters it passes.
+    fn tick(&mut self, terminal: &mut Terminal) {
+        self.counter += self.speed;
+        while self.counter >= 1.0 && !self.complete() {
+            self.counter -= 1.0;
+            let id = self.char_ids[self.next_index];
+            self.next_index += 1;
+            if let Some(character) = terminal
+                .get_characters_mut()
+                .iter_mut()
+                .find(|c| c.character_id == id)
+            {
+                character.is_visible = true;
+                character.animation.activate_scene(self.scene_id);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Mirror of Animation.apply_gradient_to_symbols: spread `symbols` evenly
+/// across the gradient spectrum, one frame per spectrum color.
+fn add_gradient_symbols(scene: &mut Scene, gradient: &Gradient, symbols: &[char], duration: u32) {
+    let n = gradient.spectrum.len().max(1);
+    for (i, color) in gradient.spectrum.iter().enumerate() {
+        let idx = (i * symbols.len()) / n;
+        let symbol = symbols[idx.min(symbols.len().saturating_sub(1))];
+        scene.add_frame(symbol, duration, Some(ColorPair::fg_only(*color)));
+    }
+}
+
+/// Mirror of Animation.adjust_color_brightness with a 0..=1 factor.
 fn adjust_brightness(color: Color, factor: f64) -> Color {
-    let scale = |c: u8| (c as f64 * factor).round().clamp(0.0, 255.0) as u8;
+    let scale = |v: u8| -> u8 { (v as f64 * factor).round().clamp(0.0, 255.0) as u8 };
     Color::new(scale(color.r), scale(color.g), scale(color.b))
 }
 
-/// Build the beam gradient with the upstream per-segment steps (2, 8).
-fn beam_gradient() -> Gradient {
-    let first = Gradient::new(&[white(), cyan()], 2);
-    let second = Gradient::new(&[cyan(), purple()], 8);
-    let mut spectrum = first.spectrum;
-    spectrum.extend(second.spectrum.into_iter().skip(1));
-    Gradient { spectrum }
+// ---------------------------------------------------------------------------
+// Effect
+// ---------------------------------------------------------------------------
+
+/// The beams effect.
+pub struct Beams {
+    beam_delay: u32,
+    beam_gradient_frames: u32,
+    final_gradient_frames: u32,
+    final_wipe_speed: usize,
 }
-
-/// One beam sweeping along a row or column; mirrors BeamsIterator.Group.
-struct Group {
-    /// Character ids remaining to be lit, popped from the front.
-    ids: Vec<usize>,
-    /// Scene to activate on each character ("beam_row" or "beam_column").
-    scene: &'static str,
-    speed: f64,
-    counter: f64,
-}
-
-fn activate_scene_on(terminal: &mut Terminal, id: usize, scene: &str) {
-    terminal.set_character_visibility(id, true);
-    if let Some(character) = terminal
-        .get_characters_mut()
-        .iter_mut()
-        .find(|c| c.character_id == id)
-    {
-        character.animation.activate_scene(scene);
-    }
-}
-
-// --- effect ------------------------------------------------------------------
-
-pub struct Beams;
 
 impl Beams {
     pub fn new() -> Self {
-        Beams
+        Self {
+            beam_delay: 10,
+            beam_gradient_frames: 2,
+            final_gradient_frames: 5,
+            final_wipe_speed: 1,
+        }
     }
 }
 
 impl Default for Beams {
     fn default() -> Self {
-        Beams::new()
+        Self::new()
     }
 }
 
@@ -163,58 +146,79 @@ impl Effect for Beams {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let mut rng = Rng::new();
-        let height = terminal.canvas.height as i32;
+        let mut rng = Rng::new(0x5eed_beef_cafe_f00d);
 
-        // -- build (mirrors BeamsIterator.build) --
+        // Config defaults from the Python original.
+        let beam_row_symbols: [char; 3] = ['▂', '▁', '_'];
+        let beam_column_symbols: [char; 4] = ['▌', '▍', '▎', '▏'];
+        let white = Color::from_hex("ffffff").expect("valid hex");
+        let cyan = Color::from_hex("00D1FF").expect("valid hex");
+        let purple = Color::from_hex("8A008A").expect("valid hex");
 
-        // Final gradient, mapped vertically: purple at the bottom, white on top.
-        let final_gradient = Gradient::new(&[purple(), cyan(), white()], 12);
-        let mut final_colors: HashMap<usize, Color> = HashMap::new();
-        for character in terminal.get_characters() {
-            let fraction = if height > 1 {
+        let beam_gradient = Gradient::new(&[white, cyan, purple], 4);
+        let final_gradient = Gradient::new(&[purple, cyan, white], 12);
+        let beam_end_color = *beam_gradient.spectrum.last().unwrap_or(&purple);
+
+        let height = terminal.canvas.height;
+
+        // -- build: scenes for every character ------------------------------
+        for character in terminal.get_characters_mut() {
+            // Final color: vertical gradient across the canvas (bottom -> top).
+            let t = if height > 1 {
                 (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
-                1.0
+                0.0
             };
-            let color = final_gradient
-                .get_color_at_fraction(fraction)
-                .unwrap_or_else(white);
-            final_colors.insert(character.character_id, color);
-        }
-
-        let beam_gradient = beam_gradient();
-
-        // Per-character scenes: beam_row, beam_column, brighten.
-        for character in terminal.get_characters_mut() {
-            let final_color = final_colors
-                .get(&character.character_id)
-                .copied()
-                .unwrap_or_else(white);
+            let final_color = final_gradient.get_color_at_fraction(t).unwrap_or(white);
             let faded_color = adjust_brightness(final_color, 0.3);
-            let fade_gradient = Gradient::new(&[purple(), faded_color], 10);
-            let brighten_gradient = Gradient::new(&[faded_color, final_color], 10);
-            let input_symbol = character.input_symbol;
+            let symbol = character.input_symbol;
 
+            let fade_gradient = Gradient::new(&[beam_end_color, faded_color], 10);
+
+            // Row beam scene: beam symbols wiping through the beam gradient,
+            // then the input symbol fading down to the dim final color.
             {
                 let scene = character.animation.new_scene("beam_row", false);
-                apply_gradient_to_symbols(scene, BEAM_ROW_SYMBOLS, BEAM_GRADIENT_FRAMES, &beam_gradient);
-                apply_gradient_to_symbols(scene, &[input_symbol], 5, &fade_gradient);
+                add_gradient_symbols(
+                    scene,
+                    &beam_gradient,
+                    &beam_row_symbols,
+                    self.beam_gradient_frames,
+                );
+                for color in &fade_gradient.spectrum {
+                    scene.add_frame(symbol, 5, Some(ColorPair::fg_only(*color)));
+                }
             }
+            // Column beam scene: same, with the column symbols.
             {
                 let scene = character.animation.new_scene("beam_column", false);
-                apply_gradient_to_symbols(scene, BEAM_COLUMN_SYMBOLS, BEAM_GRADIENT_FRAMES, &beam_gradient);
-                apply_gradient_to_symbols(scene, &[input_symbol], 5, &fade_gradient);
+                add_gradient_symbols(
+                    scene,
+                    &beam_gradient,
+                    &beam_column_symbols,
+                    self.beam_gradient_frames,
+                );
+                for color in &fade_gradient.spectrum {
+                    scene.add_frame(symbol, 5, Some(ColorPair::fg_only(*color)));
+                }
             }
+            // Brighten scene: dim final color up to the full final color.
             {
+                let brighten_gradient = Gradient::new(&[faded_color, final_color], 10);
                 let scene = character.animation.new_scene("brighten", false);
-                apply_gradient_to_symbols(scene, &[input_symbol], FINAL_GRADIENT_FRAMES, &brighten_gradient);
+                for color in &brighten_gradient.spectrum {
+                    scene.add_frame(
+                        symbol,
+                        self.final_gradient_frames,
+                        Some(ColorPair::fg_only(*color)),
+                    );
+                }
             }
         }
 
-        // Group characters by row (top to bottom) and column (left to right).
-        let mut rows: BTreeMap<i32, Vec<(i32, usize)>> = BTreeMap::new();
-        let mut columns: BTreeMap<i32, Vec<(i32, usize)>> = BTreeMap::new();
+        // -- build: row and column groups -----------------------------------
+        let mut rows: BTreeMap<i32, Vec<(i32, u32)>> = BTreeMap::new();
+        let mut columns: BTreeMap<i32, Vec<(i32, u32)>> = BTreeMap::new();
         for character in terminal.get_characters() {
             rows.entry(character.input_coord.row)
                 .or_default()
@@ -225,113 +229,109 @@ impl Effect for Beams {
                 .push((character.input_coord.row, character.character_id));
         }
 
-        // Final wipe groups: rows from the top down.
-        let wipe_groups_src: Vec<Vec<usize>> = rows
-            .iter()
-            .rev()
-            .map(|(_, members)| {
-                let mut members = members.clone();
-                members.sort();
-                members.into_iter().map(|(_, id)| id).collect()
-            })
+        let mut pending: Vec<Group> = Vec::new();
+        for members in rows.values() {
+            let mut members = members.clone();
+            members.sort_by_key(|(column, _)| *column); // beam sweeps left -> right
+            pending.push(Group {
+                char_ids: members.into_iter().map(|(_, id)| id).collect(),
+                scene_id: "beam_row",
+                next_index: 0,
+                counter: 0.0,
+                speed: rng.uniform(1.0, 4.0), // row speed range (10, 40) / 10
+            });
+        }
+        for members in columns.values() {
+            let mut members = members.clone();
+            members.sort_by_key(|(row, _)| -*row); // beam falls top -> bottom
+            pending.push(Group {
+                char_ids: members.into_iter().map(|(_, id)| id).collect(),
+                scene_id: "beam_column",
+                next_index: 0,
+                counter: 0.0,
+                speed: rng.uniform(0.6, 1.0), // column speed range (6, 10) / 10
+            });
+        }
+        shuffle(&mut pending, &mut rng);
+
+        // Final wipe: rows of character ids, wiped top -> bottom.
+        // Keys ascend, so pop() yields the topmost remaining row.
+        let mut wipe_rows: Vec<Vec<u32>> = rows
+            .values()
+            .map(|members| members.iter().map(|(_, id)| *id).collect())
             .collect();
-        let mut wipe_groups = wipe_groups_src;
 
-        let mut groups: Vec<Group> = Vec::new();
-        for (_, mut members) in rows.into_iter().rev() {
-            members.sort();
-            let mut ids: Vec<usize> = members.into_iter().map(|(_, id)| id).collect();
-            if rng.coin() {
-                ids.reverse();
-            }
-            let speed = rng.randint(BEAM_ROW_SPEED_RANGE.0, BEAM_ROW_SPEED_RANGE.1) as f64 * 0.1;
-            groups.push(Group {
-                ids,
-                scene: "beam_row",
-                speed,
-                counter: 0.0,
-            });
-        }
-        for (_, mut members) in columns {
-            members.sort();
-            let mut ids: Vec<usize> = members.into_iter().map(|(_, id)| id).collect();
-            if rng.coin() {
-                ids.reverse();
-            }
-            let speed = rng.randint(BEAM_COLUMN_SPEED_RANGE.0, BEAM_COLUMN_SPEED_RANGE.1) as f64 * 0.1;
-            groups.push(Group {
-                ids,
-                scene: "beam_column",
-                speed,
-                counter: 0.0,
-            });
-        }
-        rng.shuffle(&mut groups);
+        // -- run -------------------------------------------------------------
+        const PHASE_BEAMS: u8 = 0;
+        const PHASE_WAIT: u8 = 1;
+        const PHASE_WIPE: u8 = 2;
 
-        // -- run (mirrors BeamsIterator.__next__) --
-
-        let mut active_groups = groups;
-        let mut current_groups: Vec<Group> = Vec::new();
+        let mut phase = PHASE_BEAMS;
+        let mut active: Vec<Group> = Vec::new();
         let mut delay: u32 = 0;
-        let mut phase_beams = true;
-        let mut frames_out: Vec<String> = Vec::new();
+        let max_frames: usize = 4000;
 
-        loop {
-            if phase_beams {
-                if delay == 0 {
-                    if !active_groups.is_empty() {
-                        let count = rng.randint(1, 5) as usize;
-                        for _ in 0..count {
-                            if active_groups.is_empty() {
-                                break;
+        let mut frames_out = Vec::new();
+        frames_out.push(terminal.render_frame());
+
+        while frames_out.len() < max_frames {
+            match phase {
+                PHASE_BEAMS => {
+                    if delay == 0 {
+                        if let Some(group) = pending.pop() {
+                            active.push(group);
+                        }
+                        delay = self.beam_delay;
+                    } else {
+                        delay -= 1;
+                    }
+                    for group in active.iter_mut() {
+                        group.tick(&mut terminal);
+                    }
+                    active.retain(|g| !g.complete());
+                    if pending.is_empty() && active.is_empty() {
+                        phase = PHASE_WAIT;
+                    }
+                }
+                PHASE_WAIT => {
+                    // Let the fade scenes play out before the final wipe.
+                    if terminal
+                        .get_characters()
+                        .iter()
+                        .all(|c| c.animation.active_scene_is_complete())
+                    {
+                        phase = PHASE_WIPE;
+                    }
+                }
+                PHASE_WIPE => {
+                    for _ in 0..self.final_wipe_speed.max(1) {
+                        if let Some(row_ids) = wipe_rows.pop() {
+                            for id in row_ids {
+                                if let Some(character) = terminal
+                                    .get_characters_mut()
+                                    .iter_mut()
+                                    .find(|c| c.character_id == id)
+                                {
+                                    character.is_visible = true;
+                                    character.animation.activate_scene("brighten");
+                                }
                             }
-                            current_groups.push(active_groups.remove(0));
                         }
                     }
-                    delay = BEAM_DELAY;
-                } else {
-                    delay -= 1;
                 }
-
-                for group in current_groups.iter_mut() {
-                    group.counter += group.speed;
-                    let releases = group.counter as i64;
-                    if releases > 1 {
-                        for _ in 0..releases {
-                            if group.ids.is_empty() {
-                                break;
-                            }
-                            group.counter -= 1.0;
-                            let id = group.ids.remove(0);
-                            activate_scene_on(&mut terminal, id, group.scene);
-                        }
-                    }
-                }
-                current_groups.retain(|group| !group.ids.is_empty());
-            } else if !wipe_groups.is_empty() {
-                for _ in 0..FINAL_WIPE_SPEED {
-                    if wipe_groups.is_empty() {
-                        break;
-                    }
-                    let ids = wipe_groups.remove(0);
-                    for id in ids {
-                        activate_scene_on(&mut terminal, id, "brighten");
-                    }
-                }
+                _ => {}
             }
 
-            let active = terminal.tick();
-            frames_out.push(terminal.get_formatted_output_string());
+            terminal.tick();
+            frames_out.push(terminal.render_frame());
 
-            if phase_beams {
-                if current_groups.is_empty() && active_groups.is_empty() && active == 0 {
-                    phase_beams = false;
-                }
-            } else if wipe_groups.is_empty() && active == 0 {
-                break;
-            }
-
-            if frames_out.len() >= MAX_FRAMES {
+            if phase == PHASE_WIPE
+                && wipe_rows.is_empty()
+                && terminal
+                    .get_characters()
+                    .iter()
+                    .all(|c| c.animation.active_scene_is_complete())
+            {
                 break;
             }
         }

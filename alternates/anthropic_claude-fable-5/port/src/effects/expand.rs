@@ -1,34 +1,39 @@
-//! Expand effect: every character starts at the canvas center and travels
-//! outward to its input coordinate while a color gradient plays over it.
-//!
-//! Port of terminaltexteffects/effects/effect_expand.py:
-//!   - final_gradient_stops: ("8A008A", "00D1FF", "FFFFFF"), steps=12,
-//!     direction=vertical, final_gradient_frames=5
-//!   - movement_speed: 0.35
-//!   - expand_easing: in_out_quart upstream; the closest easing available in
-//!     this port is in_out_cubic.
+//! Expand effect: characters begin at the canvas center and expand outward
+//! to their input coordinates, colored by a gradient synced over the motion.
+//! Port of terminaltexteffects/effects/effect_expand.py.
 
 use super::Effect;
 use crate::engine::terminal::{Terminal, TerminalConfig};
 use crate::utils::easing;
 use crate::utils::graphics::{Color, ColorPair, Gradient};
 
-const MOVEMENT_SPEED: f64 = 0.35;
-const FINAL_GRADIENT_STEPS: usize = 12;
-const FINAL_GRADIENT_FRAMES: u32 = 5;
-const CHARACTER_GRADIENT_STEPS: usize = 10;
-
-pub struct Expand;
+/// Expands the text from a single point at the canvas center.
+pub struct Expand {
+    movement_speed: f64,
+    final_gradient_stops: Vec<Color>,
+    final_gradient_steps: usize,
+    final_gradient_frames: u32,
+}
 
 impl Expand {
     pub fn new() -> Self {
-        Expand
+        Self {
+            // Defaults mirror ExpandConfig in the Python original.
+            movement_speed: 0.35,
+            final_gradient_stops: vec![
+                Color::from_hex("8A008A").expect("valid hex"),
+                Color::from_hex("00D1FF").expect("valid hex"),
+                Color::from_hex("FFFFFF").expect("valid hex"),
+            ],
+            final_gradient_steps: 12,
+            final_gradient_frames: 5,
+        }
     }
 }
 
 impl Default for Expand {
     fn default() -> Self {
-        Expand::new()
+        Self::new()
     }
 }
 
@@ -39,19 +44,23 @@ impl Effect for Expand {
 
     fn frames(&self, input: &str) -> Vec<String> {
         let mut terminal = Terminal::new(input, TerminalConfig::default());
-        let center = terminal.canvas.center();
-        let height = terminal.canvas.height;
 
-        // Final gradient (vertical direction: color determined by row).
-        let stops = [
-            Color::from_hex("8A008A").expect("valid hex"),
-            Color::from_hex("00D1FF").expect("valid hex"),
-            Color::from_hex("FFFFFF").expect("valid hex"),
-        ];
-        let final_gradient = Gradient::new(&stops, FINAL_GRADIENT_STEPS);
+        // Build the final gradient and map each character's final color by
+        // its row (vertical gradient direction, as upstream does).
+        let final_gradient = Gradient::new(&self.final_gradient_stops, self.final_gradient_steps);
+        let start_color = final_gradient
+            .spectrum
+            .first()
+            .copied()
+            .unwrap_or(Color::new(255, 255, 255));
+
+        let height = terminal.config.height.max(1);
+        let center = terminal.canvas.center();
+        let gradient_frames = self.final_gradient_frames;
+        let movement_speed = self.movement_speed;
 
         for character in terminal.get_characters_mut() {
-            // Final color mapped by the character's input row (vertical direction).
+            // Vertical fraction of this character's home row on the canvas.
             let fraction = if height > 1 {
                 (character.input_coord.row - 1) as f64 / (height - 1) as f64
             } else {
@@ -59,44 +68,43 @@ impl Effect for Expand {
             };
             let final_color = final_gradient
                 .get_color_at_fraction(fraction)
-                .unwrap_or(stops[stops.len() - 1]);
+                .unwrap_or(start_color);
 
-            // Start at the canvas center and build a path back to the
-            // input coordinate. The origin waypoint stands in for the
-            // implicit origin segment of the Python engine.
-            let input_coord = character.input_coord;
+            // Start every character at the canvas center and send it home.
             character.motion.current_coord = center;
-            let path = character.motion.new_path(
-                "input_coord",
-                MOVEMENT_SPEED,
-                Some(easing::in_out_cubic),
-            );
-            path.add_waypoint(center);
-            path.add_waypoint(input_coord);
-
-            // Gradient scene: from the first gradient stop to this
-            // character's final color.
-            let symbol = character.input_symbol;
-            let char_gradient = Gradient::new(&[stops[0], final_color], CHARACTER_GRADIENT_STEPS);
-            let scene = character.animation.new_scene("gradient", false);
-            for color in &char_gradient.spectrum {
-                scene.add_frame(symbol, FINAL_GRADIENT_FRAMES, ColorPair::fg(*color), false);
+            {
+                let input_coord_path = character.motion.new_path(
+                    "input_coord",
+                    movement_speed,
+                    Some(easing::in_out_quad),
+                );
+                input_coord_path.new_waypoint("input_coord", character.input_coord);
             }
-
-            character.animation.activate_scene("gradient");
             character.motion.activate_path("input_coord");
+
+            // Gradient scene: ramp from the gradient's first stop to this
+            // character's final color while it travels.
+            {
+                let gradient_scn = character.animation.new_scene("expand_gradient", false);
+                let ramp = Gradient::new(&[start_color, final_color], 10);
+                for color in &ramp.spectrum {
+                    gradient_scn.add_frame(
+                        character.input_symbol,
+                        gradient_frames,
+                        Some(ColorPair::fg_only(*color)),
+                    );
+                }
+            }
+            character.animation.activate_scene("expand_gradient");
+
+            // Ensure the very first rendered frame is already styled.
+            character
+                .animation
+                .set_appearance(character.input_symbol, Some(ColorPair::fg_only(start_color)));
+
             character.is_visible = true;
         }
 
-        // Run the simulation until every character has finished its
-        // animation and movement, collecting one frame per tick.
-        let mut frames = Vec::new();
-        frames.push(terminal.get_formatted_output_string());
-        while terminal.tick() > 0 {
-            frames.push(terminal.get_formatted_output_string());
-        }
-        // Capture the settled final state.
-        frames.push(terminal.get_formatted_output_string());
-        frames
+        terminal.run(2000)
     }
 }
